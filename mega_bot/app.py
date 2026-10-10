@@ -30,6 +30,10 @@ class MegaBot:
         self.offset: int | None = None
         self.states: dict[int, dict[str, Any]] = {}
         self.game_cache: dict[str, dict[str, Any]] = {}
+        # Strong refs so update tasks are not GC'd under load (esp. after admin promotion).
+        self._bg_tasks: set[asyncio.Task] = set()
+        self._bot_member_status: dict[int, str] = {}
+        self._update_sem = asyncio.Semaphore(8)
 
     async def safe_send(self, chat_id: int, text: str, keyboard: dict | None = None, reply_to: int | None = None, parse_mode: str | None = 'Markdown') -> dict | None:
         """Send with progressive fallbacks. Prefer no-reply first for reliability in groups.

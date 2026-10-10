@@ -6,6 +6,9 @@ from .bale_api import BaleAPI, BaleAPIError
 from .database import Database
 from .media_tools import convert_media, MAX_INPUT_BYTES
 from .keyboards import USER_KEYBOARD, inline, menu_page, main_admin_menu, user_actions, url_button, merge_inline
+from . import prices as price_mod
+from . import fun_content
+from .profanity import contains_profanity
 from config import OWNER_ID, BOT_VERSION, SUPPORT_TEXT, DONATION_TEXT
 
 log = logging.getLogger(__name__)
@@ -262,8 +265,14 @@ class MegaBot:
 
         # Pure service events — do not run the full pipeline (critical after bot is
         # promoted to group admin: Bale then delivers many status messages).
+        if msg.get('left_chat_member'):
+            try:
+                await self.db.record_member_left(int(chat.get('id') or 0), 1)
+            except Exception:
+                pass
+            return
         service_keys = (
-            'left_chat_member', 'new_chat_title', 'new_chat_photo', 'delete_chat_photo',
+            'new_chat_title', 'new_chat_photo', 'delete_chat_photo',
             'group_chat_created', 'supergroup_chat_created', 'channel_chat_created',
             'migrate_to_chat_id', 'migrate_from_chat_id', 'pinned_message',
             'message_auto_delete_timer_changed', 'connected_website',
@@ -386,8 +395,15 @@ class MegaBot:
                     f'برای استفاده از دستور «{_norm_cmd}» روی پیام کاربر هدف *ریپلای* کن و بعد دستور را بفرست.',
                 )
                 return
-            if not await self._is_chat_admin(chat_id, uid):
-                await self.safe_send(chat_id, '⛔ فقط ادمین گروه می‌تواند از این دستور استفاده کند.')
+            is_admin = await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID
+            is_vip_user = False
+            if not is_admin:
+                try:
+                    is_vip_user = await self.db.is_vip(chat_id, uid)
+                except Exception:
+                    is_vip_user = False
+            if not is_admin and not is_vip_user:
+                await self.safe_send(chat_id, '⛔ فقط ادمین گروه یا کاربر ویژه می‌تواند از این دستور استفاده کند.')
                 return
             target_user = replied.get('from') or replied.get('sender') or {}
             target_uid = int(target_user.get('id', 0) or 0)
@@ -460,6 +476,23 @@ class MegaBot:
             await asyncio.wait_for(self.db.record_usage(uid, chat, 'message'), timeout=2.0)
         except Exception:
             log.warning('record_usage skipped')
+
+        # Per-group daily stats (best-effort)
+        if is_group and uid:
+            try:
+                await self.db.record_group_message(chat_id, uid, msg)
+            except Exception:
+                pass
+
+        # Security filters (groups only; admins/owner exempt)
+        if is_group and uid and uid != OWNER_ID:
+            try:
+                if not await self._is_chat_admin(chat_id, uid):
+                    blocked = await self._apply_security_filters(chat_id, uid, msg, text)
+                    if blocked:
+                        return
+            except Exception:
+                log.exception('security filter error chat=%s', chat_id)
 
         # User restrictions apply in private and group chats, while keeping case tracking accessible.
         try:
@@ -611,8 +644,145 @@ class MegaBot:
         if re.fullmatch(r'هرکی تک بیاره+', text) or re.fullmatch(r'هرکی تک+ بیاره+', text):
             await self.start_one_game(chat_id, uid, user.get('first_name') or 'بازیکن')
             return
-        if text == 'لیست ویژه ها' and self._is_group_chat(chat) and await self._is_chat_admin(chat_id, uid):
-            await self.safe_send(chat_id, 'فهرست ویژه‌ها در این نسخه از پنل مالک مدیریت می‌شود؛ بخش دسترسی‌ها را باز کن.', inline([[('🛡️ پنل مالک','owner:open')], [('↩️ برگشت','home'),('✖️ بستن','close')]]))
+        # ── Group VIP list / management commands
+        if is_group and text in ('لیست ویژه ها', 'لیست ویژه‌ها', 'لیست ویژه'):
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ فقط ادمین گروه.', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            await self._show_vip_list(chat_id, 0)
+            return
+        if is_group and text in ('ویژه',) and msg.get('reply_to_message'):
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ فقط ادمین گروه می‌تواند ویژه اضافه کند.', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            target = (msg.get('reply_to_message') or {}).get('from') or {}
+            tid = int(target.get('id') or 0)
+            if not tid or target.get('is_bot'):
+                await self.safe_send(chat_id, 'کاربر هدف معتبر نیست.', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            await self.db.add_vip(chat_id, tid, uid)
+            await self.db.log(uid, 'vip_add', 'user', tid, {'chat_id': chat_id})
+            tname = target.get('first_name') or str(tid)
+            await self.safe_send(chat_id, f'⭐ کاربر {tname} به ویژه‌های این گروه اضافه شد.', reply_to=msg.get('message_id'), parse_mode=None)
+            return
+        if is_group and text in ('حذف ویژه',) and msg.get('reply_to_message'):
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ فقط ادمین گروه.', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            target = (msg.get('reply_to_message') or {}).get('from') or {}
+            tid = int(target.get('id') or 0)
+            if not tid:
+                await self.safe_send(chat_id, 'کاربر هدف معتبر نیست.', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            ok = await self.db.remove_vip(chat_id, tid)
+            await self.db.log(uid, 'vip_remove', 'user', tid, {'chat_id': chat_id})
+            await self.safe_send(
+                chat_id,
+                '✅ دسترسی ویژه حذف شد.' if ok else 'این کاربر در فهرست ویژه این گروه نبود.',
+                reply_to=msg.get('message_id'), parse_mode=None,
+            )
+            return
+        if is_group and (text.startswith('ویژه ') or text.startswith('افزودن ویژه ')):
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ فقط ادمین گروه.', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            term = text.split(None, 1)[1].strip().lstrip('@')
+            if term.isdigit() or (term.startswith('-') and term[1:].isdigit()):
+                tid = int(term)
+            else:
+                found = await self.db.search_target(term, 'user')
+                tid = int(found[0]['id']) if found else 0
+            if not tid:
+                await self.safe_send(chat_id, 'کاربر پیدا نشد. شناسه عددی بفرست یا قبلاً با ربات چت کرده باشد.', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            await self.db.add_vip(chat_id, tid, uid)
+            await self.safe_send(chat_id, f'⭐ کاربر `{tid}` ویژه این گروه شد.', reply_to=msg.get('message_id'), parse_mode=None)
+            return
+
+        # ── Group settings panel
+        if is_group and text in ('تنظیمات گروه', 'پنل گروه', 'امنیت گروه'):
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ فقط ادمین گروه.', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            await self._show_group_panel(chat_id, uid)
+            return
+        if is_group and text.startswith('خوشامدگویی '):
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ فقط ادمین گروه.', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            body = text[len('خوشامدگویی '):].strip()
+            if body in ('خاموش', 'off', 'غیرفعال'):
+                await self.db.set_group_setting_fields(chat_id, welcome_enabled=False)
+                await self.safe_send(chat_id, '🔴 خوشامدگویی خاموش شد.', reply_to=msg.get('message_id'), parse_mode=None)
+            elif body in ('روشن', 'on', 'فعال'):
+                await self.db.set_group_setting_fields(chat_id, welcome_enabled=True)
+                await self.safe_send(chat_id, '🟢 خوشامدگویی روشن شد.', reply_to=msg.get('message_id'), parse_mode=None)
+            elif body in ('پیش‌فرض', 'پیشفرض', 'default'):
+                await self.db.set_group_setting_fields(chat_id, welcome_text=None, welcome_enabled=True)
+                await self.safe_send(chat_id, 'متن خوشامد به پیش‌فرض برگشت.', reply_to=msg.get('message_id'), parse_mode=None)
+            else:
+                await self.db.set_group_setting_fields(chat_id, welcome_text=body, welcome_enabled=True)
+                await self.safe_send(chat_id, f'✅ متن خوشامدگویی ذخیره شد.\nپیش‌نمایش:\n{body}', reply_to=msg.get('message_id'), parse_mode=None)
+            return
+
+        # ── Group stats
+        if is_group and text in ('آمار', 'آمار گروه', 'آمارگروه'):
+            await self._send_group_stats(chat_id, chat)
+            return
+
+        # ── Fun commands
+        _fun_key = text.replace('‌', '').replace('ـ', '').strip()
+        if _fun_key in ('چالش', 'فکت', 'حقیقت', 'جرئت', 'جرأت'):
+            await self._handle_fun(chat_id, _fun_key if _fun_key != 'جرأت' else 'جرئت', msg)
+            return
+
+        # ── Prices
+        if text in ('دلار',):
+            data = await price_mod.get_usd_toman()
+            if not data:
+                await self.safe_send(chat_id, '⚠️ دریافت قیمت دلار ممکن نشد. بعداً دوباره تلاش کن.', reply_to=msg.get('message_id'), parse_mode=None)
+            else:
+                await self.safe_send(chat_id, price_mod.format_usd_message(data), reply_to=msg.get('message_id'))
+            return
+        if text in ('ارز', 'ارزها'):
+            rows = await price_mod.get_currencies()
+            if not rows:
+                await self.safe_send(chat_id, '⚠️ دریافت قیمت ارزها ممکن نشد.', reply_to=msg.get('message_id'), parse_mode=None)
+            else:
+                await self.safe_send(chat_id, price_mod.format_currencies_message(rows), reply_to=msg.get('message_id'))
+            return
+        if text.replace('‌', '') in ('بیتکوین', 'بیت‌کوین', 'bitcoin', 'btc'):
+            data = await price_mod.get_bitcoin()
+            if not data:
+                await self.safe_send(chat_id, '⚠️ دریافت قیمت بیت‌کوین ممکن نشد.', reply_to=msg.get('message_id'), parse_mode=None)
+            else:
+                await self.safe_send(chat_id, price_mod.format_btc_message(data), reply_to=msg.get('message_id'))
+            return
+        if text in ('طلا',):
+            data = await price_mod.get_gold()
+            if not data:
+                await self.safe_send(chat_id, '⚠️ دریافت قیمت طلا ممکن نشد.', reply_to=msg.get('message_id'), parse_mode=None)
+            else:
+                await self.safe_send(chat_id, price_mod.format_gold_message(data), reply_to=msg.get('message_id'))
+            return
+
+        # ── Learned list / delete
+        if text in ('لیست یادگیری', '🧠 لیست یادگیری'):
+            scope_type, scope_id = ('group', chat_id) if is_group else ('private', uid)
+            await self._show_learned_list(chat_id, scope_type, scope_id, 0)
+            return
+        if text.startswith('حذف کلمه '):
+            phrase = text[len('حذف کلمه '):].strip()
+            if not phrase:
+                await self.safe_send(chat_id, 'عبارت را بعد از «حذف کلمه» بنویس.', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            scope_type, scope_id = ('group', chat_id) if is_group else ('private', uid)
+            ok = await self.db.delete_learned(scope_type, scope_id, self._normalize_trigger(phrase))
+            await self.safe_send(
+                chat_id,
+                f'🗑 عبارت «{phrase}» از حافظه این محیط حذف شد.' if ok else f'عبارت «{phrase}» در حافظه این محیط پیدا نشد.',
+                reply_to=msg.get('message_id'), parse_mode=None,
+            )
             return
 
         # Social / emoji reactions (groups + private). Bot messages already skipped above.
@@ -971,6 +1141,11 @@ class MegaBot:
             await self.handle_permission_callback(uid, chat_id, message_id, data)
             return
 
+        # Group panel / security / VIP / learn / fun callbacks
+        if data.startswith('grp:') or data.startswith('learn:') or data.startswith('fun:'):
+            await self._handle_group_callbacks(uid, chat_id, message_id, data, chat)
+            return
+
         # Unknown callback — always visible feedback
         log.warning('Unhandled callback data=%r uid=%s', data, uid)
         await self.safe_edit(
@@ -1215,14 +1390,38 @@ class MegaBot:
 
     async def welcome_new_members(self, msg: dict, chat: dict) -> None:
         members = msg.get('new_chat_members') or []
-        rules = await self.db.get_setting(f"rules:{chat.get('id')}")
+        chat_id = int(chat.get('id') or 0)
+        if not chat_id or not members:
+            return
+        try:
+            await self.db.record_member_join(chat_id, len(members[:10]))
+        except Exception:
+            pass
+        gs = await self.db.get_group_settings(chat_id)
+        if not gs.get('welcome_enabled', True):
+            for member in members[:10]:
+                try:
+                    await self.db.upsert_user(member)
+                except Exception:
+                    pass
+            return
+        rules = await self.db.get_setting(f'rules:{chat_id}')
+        custom = (gs.get('welcome_text') or '').strip()
+        title = chat.get('title') or 'گروه'
         for member in members[:10]:
             await self.db.upsert_user(member)
             name = member.get('first_name') or 'دوست'
             uid = member.get('id')
-            text = f"سلام [{name}](uid:{uid}) عزیز⛱️\nخیلی خوش اومدی به گروه *{chat.get('title','گروه')}*\nفقط یادت باشه اگه تونستی یه سر به قوانین گروه بزنی ✨️"
-            keyboard = inline([[('📜 قوانین گروه','rules:show')]]) if rules else None
-            await self.safe_send(int(chat['id']), text, keyboard)
+            if custom:
+                text = custom.replace('{name}', name).replace('{group}', title).replace('{uid}', str(uid or ''))
+            else:
+                text = (
+                    f"سلام [{name}](uid:{uid}) عزیز⛱️\n"
+                    f"خیلی خوش اومدی به گروه *{title}*\n"
+                    f"فقط یادت باشه اگه تونستی یه سر به قوانین گروه بزنی ✨️"
+                )
+            keyboard = inline([[('📜 قوانین گروه', 'rules:show')]]) if rules else None
+            await self.safe_send(chat_id, text, keyboard)
 
     GUIDE_ENTRIES = [
         ('📌 دستورات عمومی',
@@ -1236,55 +1435,68 @@ class MegaBot:
          '• سلام / خوبی / چخبر / شب خوش / خدافظ\n'
          '• `مگا` یا `بات` یا `مگا بات` — پاسخ‌های متنوع\n'
          '• `سازنده` — @darkknight_studio\n'
-         '• پیام فقط‌ایموجی → یک ایموجی واکنش (بدون متن)\n'
+         '• پیام فقط‌ایموجی → یک ایموجی واکنش\n'
          'دسترسی: همه کاربران'),
+        ('🧠 یادگیری کلمات',
+         '• `یاد بگیر عبارت = پاسخ` یا `یاد بگیر عبارت پاسخ`\n'
+         '• حافظه هر گروه و هر کاربر خصوصی کاملاً جداست\n'
+         '• `لیست یادگیری` — مشاهده حافظه همین محیط\n'
+         '• `حذف کلمه عبارت` — حذف از حافظه همین محیط\n'
+         'دسترسی: همه در همان چت/گروه'),
+        ('🎲 سرگرمی',
+         '• `چالش` — مأموریت/سؤال سرگرم‌کننده\n'
+         '• `فکت` — حقیقت جالب\n'
+         '• `حقیقت` — سؤال حقیقت (قابل رد)\n'
+         '• `جرئت` — مأموریت امن و قابل انجام\n'
+         'دسترسی: همه (ترجیحاً گروه)'),
+        ('💱 قیمت‌ها (زنده)',
+         '• `دلار` — نرخ بازار آزاد دلار به تومان\n'
+         '• `ارز` — چند ارز منتخب\n'
+         '• `بیتکوین` / `بیت‌کوین`\n'
+         '• `طلا` — طلا و سکه\n'
+         'منبع: api.priceto.day — در صورت خطا پیام خطا نشان داده می‌شود'),
         ('🎮 بازی‌ها (گروه)',
          '• `دوز` / `بازی دوز`\n'
          '• `شیر یا خط`\n'
          '• `هرکی تک بیاره`\n'
-         'روش: در گروه دستور را بفرست.\n'
          'دسترسی: همه اعضای گروه'),
         ('🖼 تبدیل به گیف',
          'روی عکس/ویدئو ریپلای کن:\n'
          '• `گیف` — بدون متن\n'
-         '• `گیف متن دلخواه` — با نوشته\n'
-         'بدون ریپلای فقط راهنما نشان داده می‌شود.\n'
+         '• `گیف متن دلخواه` — با نوشته روی تصویر\n'
          'دسترسی: همه کاربران'),
-        ('📌 پین و قوانین',
-         '• `پین` — ریپلای + پین (ادمین گروه)\n'
-         '• `تنظیم قوانین متن...` — ذخیره قوانین (ادمین)\n'
-         '• `قوانین` — نمایش قوانین\n'
-         'دسترسی: ادمین گروه برای تنظیم؛ همه برای دیدن'),
-        ('🔇 سکوت (گروه)',
-         'سطح: محدودیت در همان گروه با API بله.\n\n'
-         'سکوت: ریپلای روی پیام کاربر + `سکوت`\n'
-         'حذف سکوت: ریپلای + `حذف سکوت`\n'
-         'بدون ریپلای اجرا نمی‌شود.\n'
-         'مالک ربات هدف قرار نمی‌گیرد.\n'
-         'دسترسی: ادمین گروه + دسترسی Restrict Members برای ربات'),
-        ('⛔ بن و آن‌بن (گروه)',
-         'سطح: بن در همان گروه.\n\n'
-         'بن: ریپلای + `بن`\n'
-         'حذف بن / انبن / آنبن: ریپلای + همان دستور\n'
-         'کیک: ریپلای + `کیک` (اخراج موقت)\n'
-         'مالک ربات قابل بن نیست.\n'
-         'بن پنل ادمین ربات جدا از بن گروه است.\n'
-         'دسترسی: ادمین گروه'),
-        ('🛡️ پنل ادمین و مالک',
+        ('📌 پین، قوانین، خوشامد',
+         '• `پین` — ریپلای + پین (ادمین)\n'
+         '• `تنظیم قوانین متن...` / `قوانین`\n'
+         '• `تنظیمات گروه` — پنل مدیر گروه (خوشامد، امنیت، ویژه)\n'
+         '• `خوشامدگویی متن...` — متن اختصاصی گروه\n'
+         'دسترسی: ادمین همان گروه'),
+        ('🛡 امنیت گروه',
+         'از `تنظیمات گروه` → تنظیمات امنیت:\n'
+         'ضداسپم، ضدلینک، ضدتبلیغ، ضدتکرار، ضد Flood، ضد فحش،\n'
+         'ضد عکس/ویدئو/ویس/آهنگ/GIF/استیکر/فایل\n'
+         'هر گروه تنظیم مستقل دارد. نیاز به دسترسی حذف پیام برای ربات.'),
+        ('📊 آمار گروه',
+         '• `آمار` در گروه — آمار امروز همان گروه (ورود/خروج، انواع پیام، ۳ کاربر فعال)\n'
+         '• آمار سراسری ربات: دکمه 📊 آمار و اطلاعات\n'
+         'توجه: فقط از زمان ثبت رویدادها توسط ربات شمارش می‌شود'),
+        ('⭐ کاربر ویژه',
+         '• ریپلای + `ویژه` — افزودن ویژه (ادمین گروه)\n'
+         '• ریپلای + `حذف ویژه` — حذف\n'
+         '• `لیست ویژه‌ها` — فهرست همان گروه\n'
+         'ویژه می‌تواند از ابزارهای مدیریتی ربات (بن/کیک/سکوت) استفاده کند؛ ادمین واقعی بله نمی‌شود'),
+        ('🔇 مدیریت با Reply',
+         'ریپلای روی پیام کاربر + یکی از:\n'
+         '`سکوت` / `حذف سکوت` / `بن` / `حذف بن` / `کیک`\n'
+         'دسترسی: ادمین گروه یا کاربر ویژه همان گروه'),
+        ('🛡️ پنل ادمین و مالک ربات',
          '• `/admin` — پنل ادمین ربات\n'
          '• `/owner` — فقط مالک\n'
-         'بن پنل: محدودیت قابلیت‌های ربات + کد ۴ رقمی (ماندگار در دیتابیس).\n'
+         '• تبلیغات و پیام همگانی فقط در پنل مالک/مجاز\n'
          'دسترسی: ادمین ربات / مالک'),
         ('💚 حمایت مالی',
-         'دکمه 💚 حمایت مالی\n'
-         'مراحل: معرفی → مبلغ → پرداخت → نام/ناشناس → تأیید مالک → اعلام\n'
-         'اعلام فقط به پیوی کاربران Start‌کرده.\n'
+         'دکمه 💚 حمایت مالی — درخواست و تأیید توسط مالک\n'
          'دسترسی: همه برای درخواست؛ مالک برای تأیید'),
-        ('📊 آمار و پیگیری',
-         '• 📊 آمار و اطلاعات\n'
-         '• تیم من — پرونده شخصی\n'
-         '• پنل ادمین → کد پیگیری ۴ رقمی\n'
-         'دسترسی: آمار برای همه؛ جست‌وجو برای ادمین'),
     ]
 
     async def show_guide(self, chat_id: int, page: int, edit_id: int | None = None) -> None:
@@ -2029,6 +2241,315 @@ class MegaBot:
         if len(trigger) > 200 or len(response) > 2000:
             return None
         return trigger, response
+
+    # ── Group security / fun / stats helpers ─────────────────────────────
+
+    _FLOOD_WINDOW: dict[tuple[int, int], list[float]] = {}
+
+    async def _apply_security_filters(self, chat_id: int, uid: int, msg: dict, text: str) -> bool:
+        """Return True if message was blocked (caller should stop processing)."""
+        gs = await self.db.get_group_settings(chat_id)
+        sec = gs.get('security') or {}
+        mid = msg.get('message_id')
+        reason = None
+
+        if sec.get('antiphoto') and msg.get('photo'):
+            reason = 'عکس'
+        elif sec.get('antivideo') and msg.get('video'):
+            reason = 'ویدئو'
+        elif sec.get('antivoice') and msg.get('voice'):
+            reason = 'ویس'
+        elif sec.get('antiaudio') and msg.get('audio'):
+            reason = 'فایل صوتی'
+        elif sec.get('antigif') and msg.get('animation'):
+            reason = 'GIF'
+        elif sec.get('antisticker') and msg.get('sticker'):
+            reason = 'استیکر'
+        elif sec.get('antidoc') and msg.get('document'):
+            reason = 'فایل'
+        elif sec.get('anticontact') and msg.get('contact'):
+            reason = 'مخاطب'
+
+        body = text or (msg.get('caption') or '')
+        if not reason and sec.get('antilink'):
+            if re.search(r'(https?://|ble\.ir/|t\.me/|telegram\.me/)', body, re.I):
+                reason = 'لینک'
+        if not reason and sec.get('antiad'):
+            if re.search(r'(تبلیغ|کانال ما|عضویت|فالو|follow|subscribe)', body, re.I):
+                reason = 'تبلیغ'
+        if not reason and sec.get('antiprofane'):
+            extra = await self.db.get_profanity_words(chat_id)
+            if contains_profanity(body, extra):
+                reason = 'فحش'
+        if not reason and sec.get('antiflood'):
+            key = (chat_id, uid)
+            now = time.time()
+            bucket = self._FLOOD_WINDOW.setdefault(key, [])
+            bucket.append(now)
+            self._FLOOD_WINDOW[key] = [t for t in bucket if now - t < 8]
+            if len(self._FLOOD_WINDOW[key]) >= 6:
+                reason = 'ارسال سریع (Flood)'
+        if not reason and sec.get('antirepeat') and body:
+            rk = f'repeat:{chat_id}:{uid}'
+            prev = self.game_cache.get(rk)
+            if prev and prev.get('text') == body and (time.time() - prev.get('ts', 0)) < 30:
+                reason = 'تکرار پیام'
+            self.game_cache[rk] = {'text': body, 'ts': time.time()}
+        if not reason and sec.get('antispam') and body:
+            if len(body) > 800 or body.count('\n') > 12:
+                reason = 'اسپم'
+
+        if not reason:
+            return False
+
+        deleted = False
+        try:
+            await self.api.delete_message(chat_id, int(mid))
+            deleted = True
+            try:
+                await self.db.record_bot_delete(chat_id)
+            except Exception:
+                pass
+        except Exception as exc:
+            log.info('security delete failed chat=%s: %s', chat_id, type(exc).__name__)
+
+        warns = await self.db.add_warn(chat_id, uid)
+        limit = int(gs.get('warn_limit') or 3)
+        note = f'🛡 پیام به‌خاطر «{reason}» {"حذف شد" if deleted else "شناسایی شد (حذف ممکن نشد — دسترسی ربات را بررسی کن)"}.'
+        note += f'\nاخطار: {warns}/{limit}'
+        await self.safe_send(chat_id, note, parse_mode=None)
+        await self.db.log(0, 'security_action', 'user', uid, {'chat_id': chat_id, 'reason': reason, 'deleted': deleted, 'warns': warns})
+        if warns >= limit:
+            try:
+                await self.api.restrict_chat_member(
+                    chat_id, uid,
+                    {'can_send_messages': False, 'can_send_media_messages': False,
+                     'can_send_other_messages': False, 'can_add_web_page_previews': False},
+                )
+                await self.safe_send(chat_id, '🔇 کاربر به‌خاطر اخطارهای مکرر محدود شد.', parse_mode=None)
+            except Exception as exc:
+                log.info('security mute failed: %s', type(exc).__name__)
+        return True
+
+    async def _handle_fun(self, chat_id: int, kind: str, msg: dict) -> None:
+        import hashlib
+        pool_map = {
+            'چالش': fun_content.CHALLENGES,
+            'فکت': fun_content.FACTS,
+            'حقیقت': fun_content.TRUTHS,
+            'جرئت': fun_content.DARES,
+        }
+        pool = pool_map.get(kind) or fun_content.CHALLENGES
+        recent_hashes = await self.db.recent_fun_hashes(chat_id, kind)
+        candidates = [x for x in pool if hashlib.sha256(x.encode()).hexdigest()[:24] not in recent_hashes]
+        if not candidates:
+            candidates = list(pool)
+        item = random.choice(candidates)
+        await self.db.push_recent_fun(chat_id, kind, item)
+        prefix = {'چالش': '🎯 *چالش*', 'فکت': '', 'حقیقت': '🤔 *حقیقت*', 'جرئت': '🔥 *جرئت*'}
+        body = item if kind == 'فکت' else f"{prefix.get(kind, '')}\n{item}"
+        kb = None
+        if kind in ('حقیقت', 'جرئت'):
+            kb = inline([[('🎲 یکی دیگه', f'fun:again:{kind}'), ('⏭ رد کن', 'fun:skip')]])
+        await self.safe_send(chat_id, body, kb, reply_to=msg.get('message_id'))
+
+    async def _send_group_stats(self, chat_id: int, chat: dict) -> None:
+        data = await self.db.group_stats_today(chat_id)
+        c = data['counts']
+        top_lines = []
+        for i, u in enumerate(data.get('top_users') or [], 1):
+            name = u.get('first_name') or u.get('username') or str(u.get('user_id'))
+            top_lines.append(f"{i}. {name} — {u.get('msg_count', 0)} پیام")
+        top_txt = '\n'.join(top_lines) if top_lines else 'هنوز داده‌ای ثبت نشده'
+        title = chat.get('title') or 'گروه'
+        text = (
+            f"📊 *آمار گروه امروز*\n"
+            f"گروه: *{title}*\n"
+            f"شناسه: `{chat_id}`\n"
+            f"بازه: `{data['day']}` (تقویم سرور)\n\n"
+            f"➕ ورود امروز: {c['joined']}\n"
+            f"➖ خروج امروز: {c['left_count']}\n\n"
+            f"📝 متن: {c['text_count']} | 🖼 عکس: {c['photo_count']}\n"
+            f"🎬 ویدئو: {c['video_count']} | 🎤 ویس: {c['voice_count']}\n"
+            f"🎵 آهنگ: {c['audio_count']} | 🎞 GIF: {c['animation_count']}\n"
+            f"استیکر: {c['sticker_count']} | 📎 فایل: {c['document_count']}\n"
+            f"🗑 حذف‌شده توسط ربات: {c['deleted_by_bot']}\n\n"
+            f"*۳ کاربر فعال‌تر امروز:*\n{top_txt}\n\n"
+            f"_فقط از زمان ثبت رویدادها توسط ربات شمارش می‌شود._"
+        )
+        try:
+            cnt = await asyncio.wait_for(self.api.call('getChatMembersCount', {'chat_id': chat_id}, retries=0), timeout=5.0)
+            if isinstance(cnt, int):
+                n = cnt
+            elif isinstance(cnt, dict):
+                n = cnt.get('result', cnt)
+            else:
+                n = None
+            if n is not None:
+                text = text.replace(f"شناسه: `{chat_id}`\n", f"شناسه: `{chat_id}`\nاعضای فعلی (API): `{n}`\n")
+        except Exception:
+            pass
+        await self.safe_send(chat_id, text)
+
+    async def _show_group_panel(self, chat_id: int, uid: int) -> None:
+        gs = await self.db.get_group_settings(chat_id)
+        wel = '🟢' if gs.get('welcome_enabled', True) else '🔴'
+        await self.safe_send(
+            chat_id,
+            f"*⚙️ تنظیمات گروه*\nخوشامدگویی: {wel}\n"
+            f"متن سفارشی: {'دارد' if gs.get('welcome_text') else 'پیش‌فرض'}\n"
+            f"سقف اخطار: {gs.get('warn_limit', 3)}",
+            inline([
+                [('🛡 تنظیمات امنیت', 'grp:sec'), ('⭐ لیست ویژه‌ها', 'grp:vips:0')],
+                [('🟢/🔴 خوشامد', 'grp:welcome_toggle'), ('📝 راهنمای خوشامد', 'grp:welcome_help')],
+                [('🧠 لیست یادگیری', 'learn:list:0'), ('✖️ بستن', 'close')],
+            ]),
+        )
+
+    async def _show_vip_list(self, chat_id: int, page: int) -> None:
+        page = max(0, page)
+        total = await self.db.count_vips(chat_id)
+        rows_data = await self.db.list_vips(chat_id, limit=5, offset=page * 5)
+        lines = [f'⭐ *لیست ویژه‌ها* ({total} نفر)\n']
+        buttons = []
+        for v in rows_data:
+            name = v.get('first_name') or v.get('username') or str(v['user_id'])
+            lines.append(f"• {name} (`{v['user_id']}`)")
+            buttons.append([(f'🗑 حذف {str(name)[:12]}', f'grp:vipdel:{v["user_id"]}')])
+        if page > 0:
+            buttons.append([('⬅️ قبلی', f'grp:vips:{page-1}')])
+        if (page + 1) * 5 < total:
+            buttons.append([('بعدی ➡️', f'grp:vips:{page+1}')])
+        buttons.append([('✖️ بستن', 'close')])
+        await self.safe_send(chat_id, '\n'.join(lines) if rows_data else 'هنوز ویژه‌ای ثبت نشده.', inline(buttons))
+
+    async def _show_learned_list(self, chat_id: int, scope_type: str, scope_id: int, page: int, search: str | None = None) -> None:
+        page = max(0, page)
+        total = await self.db.count_learned(scope_type, scope_id, search)
+        rows = await self.db.list_learned(scope_type, scope_id, limit=5, offset=page * 5, search=search)
+        label = 'گروه' if scope_type == 'group' else 'خصوصی'
+        lines = [f'🧠 *لیست یادگیری ({label})* — کل: {total}\n']
+        buttons = []
+        for r in rows:
+            tr = (r.get('trigger_raw') or '')[:40]
+            resp = (r.get('response') or '')[:40]
+            lines.append(f'• «{tr}» → «{resp}»')
+            norm = self._normalize_trigger(tr)[:60]
+            buttons.append([(f'🗑 {tr[:16]}', f'learn:del:{scope_type}:{scope_id}:{norm}')])
+        nav = []
+        if page > 0:
+            nav.append(('⬅️ قبلی', f'learn:list:{page-1}'))
+        if (page + 1) * 5 < total:
+            nav.append(('بعدی ➡️', f'learn:list:{page+1}'))
+        if nav:
+            buttons.append(nav)
+        buttons.append([('✖️ بستن', 'close')])
+        await self.safe_send(chat_id, '\n'.join(lines) if rows else f'حافظه‌ی {label} خالی است.', inline(buttons))
+
+
+    async def _handle_group_callbacks(self, uid: int, chat_id: int, message_id: int, data: str, chat: dict) -> None:
+        is_group = self._is_group_chat(chat)
+        if data.startswith('fun:'):
+            if data == 'fun:skip':
+                await self.safe_edit(chat_id, message_id, 'رد شد 🌱', None)
+                return
+            if data.startswith('fun:again:'):
+                kind = data.split(':', 2)[2]
+                fake_msg = {'message_id': message_id}
+                await self._handle_fun(chat_id, kind, fake_msg)
+                return
+            return
+        if data.startswith('learn:list:'):
+            try:
+                page = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                page = 0
+            scope_type, scope_id = ('group', chat_id) if is_group else ('private', uid)
+            await self._show_learned_list(chat_id, scope_type, scope_id, page)
+            return
+        if data.startswith('learn:del:'):
+            # learn:del:scope_type:scope_id:trigger_norm
+            parts = data.split(':', 4)
+            if len(parts) < 5:
+                await self.safe_send(chat_id, 'داده نامعتبر.', parse_mode=None)
+                return
+            _, _, scope_type, scope_id_s, trigger_norm = parts
+            # Only allow deleting own private scope or group scope of this chat
+            if scope_type == 'private' and int(scope_id_s) != uid:
+                await self.safe_send(chat_id, '⛔ فقط حافظه خودت.', parse_mode=None)
+                return
+            if scope_type == 'group' and int(scope_id_s) != chat_id:
+                await self.safe_send(chat_id, '⛔ فقط حافظه همین گروه.', parse_mode=None)
+                return
+            ok = await self.db.delete_learned(scope_type, int(scope_id_s), trigger_norm)
+            await self.safe_send(chat_id, '🗑 حذف شد.' if ok else 'پیدا نشد.', parse_mode=None)
+            return
+        # grp:* requires group admin
+        if not is_group:
+            await self.safe_send(chat_id, 'این بخش فقط در گروه است.', parse_mode=None)
+            return
+        if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+            await self.safe_send(chat_id, '⛔ فقط ادمین گروه.', parse_mode=None)
+            return
+        if data == 'grp:panel':
+            await self._show_group_panel(chat_id, uid)
+            return
+        if data == 'grp:sec':
+            await self.safe_edit(chat_id, message_id, '*🛡 تنظیمات امنیت گروه*\n🟢 روشن / 🔴 خاموش — روی هر مورد بزن تا عوض شود.', await self._security_keyboard(chat_id))
+            return
+        if data.startswith('grp:sectog:'):
+            key = data.split(':', 2)[2]
+            new_state = await self.db.toggle_security(chat_id, key)
+            mark = '🟢 روشن' if new_state else '🔴 خاموش'
+            await self.safe_edit(chat_id, message_id, f'*🛡 تنظیمات امنیت*\n«{key}» الان {mark} است.', await self._security_keyboard(chat_id))
+            return
+        if data == 'grp:welcome_toggle':
+            gs = await self.db.get_group_settings(chat_id)
+            new_v = not gs.get('welcome_enabled', True)
+            await self.db.set_group_setting_fields(chat_id, welcome_enabled=new_v)
+            await self.safe_send(chat_id, '🟢 خوشامدگویی روشن شد.' if new_v else '🔴 خوشامدگویی خاموش شد.', parse_mode=None)
+            return
+        if data == 'grp:welcome_help':
+            await self.safe_send(
+                chat_id,
+                'برای تنظیم متن:\n`خوشامدگویی متن دلخواه`\nمتغیرها: {name} {group} {uid}\n'
+                'روشن/خاموش: `خوشامدگویی روشن` / `خوشامدگویی خاموش`\n'
+                'بازگشت به پیش‌فرض: `خوشامدگویی پیش‌فرض`',
+                parse_mode=None,
+            )
+            return
+        if data.startswith('grp:vips:'):
+            try:
+                page = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                page = 0
+            await self._show_vip_list(chat_id, page)
+            return
+        if data.startswith('grp:vipdel:'):
+            tid = int(data.rsplit(':', 1)[1])
+            ok = await self.db.remove_vip(chat_id, tid)
+            await self.safe_send(chat_id, 'حذف شد.' if ok else 'پیدا نشد.', parse_mode=None)
+            await self._show_vip_list(chat_id, 0)
+            return
+
+    async def _security_keyboard(self, chat_id: int) -> dict:
+
+        gs = await self.db.get_group_settings(chat_id)
+        sec = gs.get('security') or {}
+        labels = [
+            ('antispam', 'ضداسپم'), ('antilink', 'ضدلینک'), ('antiad', 'ضدتبلیغ'),
+            ('antirepeat', 'ضدتکرار'), ('antiflood', 'ضد Flood'), ('antiprofane', 'ضد فحش'),
+            ('antiphoto', 'ضد عکس'), ('antivideo', 'ضد ویدئو'), ('antivoice', 'ضد ویس'),
+            ('antiaudio', 'ضد آهنگ'), ('antigif', 'ضد GIF'), ('antisticker', 'ضد استیکر'),
+            ('antidoc', 'ضد فایل'), ('anticontact', 'ضد مخاطب'),
+        ]
+        rows = []
+        for key, title in labels:
+            on = bool(sec.get(key))
+            mark = '🟢' if on else '🔴'
+            rows.append([(f'{mark} {title}', f'grp:sectog:{key}')])
+        rows.append([('↩️ برگشت', 'grp:panel'), ('✖️ بستن', 'close')])
+        return inline(rows)
 
     async def handle_state(self, chat_id: int, uid: int, user: dict, text: str, state: dict, msg: dict) -> bool:
         step=state.get('step')

@@ -76,6 +76,67 @@ CREATE TABLE IF NOT EXISTS learned_phrases (
 );
 CREATE INDEX IF NOT EXISTS learned_phrases_lookup_idx
   ON learned_phrases (scope_type, scope_id, trigger_norm);
+CREATE TABLE IF NOT EXISTS group_settings (
+  chat_id BIGINT PRIMARY KEY,
+  welcome_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  welcome_text TEXT,
+  security JSONB NOT NULL DEFAULT '{}'::jsonb,
+  warn_limit INTEGER NOT NULL DEFAULT 3,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS group_vips (
+  chat_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  added_by BIGINT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (chat_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS group_vips_user_idx ON group_vips(user_id);
+CREATE TABLE IF NOT EXISTS group_stats_daily (
+  chat_id BIGINT NOT NULL,
+  day DATE NOT NULL,
+  joined INTEGER NOT NULL DEFAULT 0,
+  left_count INTEGER NOT NULL DEFAULT 0,
+  text_count INTEGER NOT NULL DEFAULT 0,
+  photo_count INTEGER NOT NULL DEFAULT 0,
+  video_count INTEGER NOT NULL DEFAULT 0,
+  voice_count INTEGER NOT NULL DEFAULT 0,
+  audio_count INTEGER NOT NULL DEFAULT 0,
+  animation_count INTEGER NOT NULL DEFAULT 0,
+  sticker_count INTEGER NOT NULL DEFAULT 0,
+  document_count INTEGER NOT NULL DEFAULT 0,
+  deleted_by_bot INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (chat_id, day)
+);
+CREATE TABLE IF NOT EXISTS group_user_msgs (
+  chat_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  day DATE NOT NULL,
+  msg_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (chat_id, user_id, day)
+);
+CREATE INDEX IF NOT EXISTS group_user_msgs_top_idx ON group_user_msgs(chat_id, day, msg_count DESC);
+CREATE TABLE IF NOT EXISTS group_warns (
+  chat_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  warn_count INTEGER NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (chat_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS recent_fun (
+  chat_id BIGINT NOT NULL,
+  kind TEXT NOT NULL,
+  item_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (chat_id, kind, item_hash)
+);
+CREATE TABLE IF NOT EXISTS group_profanity_words (
+  chat_id BIGINT NOT NULL,
+  word TEXT NOT NULL,
+  added_by BIGINT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (chat_id, word)
+);
 """
 
 class Database:
@@ -323,3 +384,273 @@ class Database:
             result = await c.execute('DELETE FROM team_members WHERE id=$1', member_id)
         await self.log(actor, 'team_member_deleted', target_type='team_member', target_id=member_id)
         return result.endswith('1')
+
+    # ── Learned phrases management ──────────────────────────────────────
+
+    async def list_learned(self, scope_type: str, scope_id: int, limit: int = 10, offset: int = 0, search: str | None = None) -> list[dict]:
+        async with self._pool().acquire() as c:
+            if search:
+                q = f'%{search.strip()}%'
+                rows = await c.fetch(
+                    """SELECT trigger_raw, response, updated_at FROM learned_phrases
+                       WHERE scope_type=$1 AND scope_id=$2 AND (trigger_raw ILIKE $3 OR response ILIKE $3)
+                       ORDER BY updated_at DESC LIMIT $4 OFFSET $5""",
+                    scope_type, int(scope_id), q, limit, offset,
+                )
+            else:
+                rows = await c.fetch(
+                    """SELECT trigger_raw, response, updated_at FROM learned_phrases
+                       WHERE scope_type=$1 AND scope_id=$2
+                       ORDER BY updated_at DESC LIMIT $3 OFFSET $4""",
+                    scope_type, int(scope_id), limit, offset,
+                )
+        return [dict(r) for r in rows]
+
+    async def count_learned(self, scope_type: str, scope_id: int, search: str | None = None) -> int:
+        async with self._pool().acquire() as c:
+            if search:
+                q = f'%{search.strip()}%'
+                return int(await c.fetchval(
+                    """SELECT COUNT(*) FROM learned_phrases
+                       WHERE scope_type=$1 AND scope_id=$2 AND (trigger_raw ILIKE $3 OR response ILIKE $3)""",
+                    scope_type, int(scope_id), q,
+                ) or 0)
+            return int(await c.fetchval(
+                'SELECT COUNT(*) FROM learned_phrases WHERE scope_type=$1 AND scope_id=$2',
+                scope_type, int(scope_id),
+            ) or 0)
+
+    # ── Group settings / welcome / security ─────────────────────────────
+
+    DEFAULT_SECURITY = {
+        'antispam': False, 'antilink': False, 'antiad': False, 'antirepeat': False,
+        'antiflood': False, 'antiprofane': False, 'antiphoto': False, 'antivideo': False,
+        'antivoice': False, 'antiaudio': False, 'antigif': False, 'antisticker': False,
+        'antidoc': False, 'anticontact': False,
+    }
+
+    async def get_group_settings(self, chat_id: int) -> dict:
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow('SELECT * FROM group_settings WHERE chat_id=$1', int(chat_id))
+        if not row:
+            return {
+                'chat_id': int(chat_id),
+                'welcome_enabled': True,
+                'welcome_text': None,
+                'security': dict(self.DEFAULT_SECURITY),
+                'warn_limit': 3,
+            }
+        d = dict(row)
+        sec = d.get('security') or {}
+        if not isinstance(sec, dict):
+            sec = {}
+        merged = dict(self.DEFAULT_SECURITY)
+        merged.update(sec)
+        d['security'] = merged
+        return d
+
+    async def set_group_setting_fields(self, chat_id: int, **fields) -> None:
+        gs = await self.get_group_settings(chat_id)
+        welcome_enabled = fields.get('welcome_enabled', gs['welcome_enabled'])
+        welcome_text = fields.get('welcome_text', gs.get('welcome_text'))
+        security = fields.get('security', gs.get('security') or self.DEFAULT_SECURITY)
+        warn_limit = fields.get('warn_limit', gs.get('warn_limit', 3))
+        async with self._pool().acquire() as c:
+            await c.execute(
+                """INSERT INTO group_settings(chat_id,welcome_enabled,welcome_text,security,warn_limit,updated_at)
+                   VALUES($1,$2,$3,$4,$5,NOW())
+                   ON CONFLICT(chat_id) DO UPDATE SET
+                     welcome_enabled=EXCLUDED.welcome_enabled,
+                     welcome_text=EXCLUDED.welcome_text,
+                     security=EXCLUDED.security,
+                     warn_limit=EXCLUDED.warn_limit,
+                     updated_at=NOW()""",
+                int(chat_id), bool(welcome_enabled), welcome_text, security, int(warn_limit),
+            )
+
+    async def toggle_security(self, chat_id: int, key: str) -> bool:
+        gs = await self.get_group_settings(chat_id)
+        sec = dict(gs.get('security') or self.DEFAULT_SECURITY)
+        if key not in self.DEFAULT_SECURITY:
+            return False
+        sec[key] = not bool(sec.get(key))
+        await self.set_group_setting_fields(chat_id, security=sec)
+        return bool(sec[key])
+
+    # ── VIP ─────────────────────────────────────────────────────────────
+
+    async def add_vip(self, chat_id: int, user_id: int, added_by: int) -> bool:
+        async with self._pool().acquire() as c:
+            try:
+                await c.execute(
+                    'INSERT INTO group_vips(chat_id,user_id,added_by) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',
+                    int(chat_id), int(user_id), int(added_by),
+                )
+            except Exception:
+                return False
+        return True
+
+    async def remove_vip(self, chat_id: int, user_id: int) -> bool:
+        async with self._pool().acquire() as c:
+            result = await c.execute(
+                'DELETE FROM group_vips WHERE chat_id=$1 AND user_id=$2',
+                int(chat_id), int(user_id),
+            )
+        return result.endswith('1') or (result.split()[-1].isdigit() and int(result.split()[-1]) > 0)
+
+    async def is_vip(self, chat_id: int, user_id: int) -> bool:
+        async with self._pool().acquire() as c:
+            return bool(await c.fetchval(
+                'SELECT 1 FROM group_vips WHERE chat_id=$1 AND user_id=$2',
+                int(chat_id), int(user_id),
+            ))
+
+    async def list_vips(self, chat_id: int, limit: int = 20, offset: int = 0) -> list[dict]:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                """SELECT v.user_id, v.added_by, v.created_at, u.first_name, u.username
+                   FROM group_vips v LEFT JOIN users u ON u.user_id=v.user_id
+                   WHERE v.chat_id=$1 ORDER BY v.created_at DESC LIMIT $2 OFFSET $3""",
+                int(chat_id), limit, offset,
+            )
+        return [dict(r) for r in rows]
+
+    async def count_vips(self, chat_id: int) -> int:
+        async with self._pool().acquire() as c:
+            return int(await c.fetchval('SELECT COUNT(*) FROM group_vips WHERE chat_id=$1', int(chat_id)) or 0)
+
+    # ── Group stats ─────────────────────────────────────────────────────
+
+    async def record_group_message(self, chat_id: int, user_id: int | None, msg: dict) -> None:
+        """Increment daily counters based on message content type."""
+        from datetime import date
+        day = date.today()
+        col = 'text_count'
+        if msg.get('photo'):
+            col = 'photo_count'
+        elif msg.get('video'):
+            col = 'video_count'
+        elif msg.get('voice'):
+            col = 'voice_count'
+        elif msg.get('audio'):
+            col = 'audio_count'
+        elif msg.get('animation'):
+            col = 'animation_count'
+        elif msg.get('sticker'):
+            col = 'sticker_count'
+        elif msg.get('document'):
+            col = 'document_count'
+        elif not (msg.get('text') or msg.get('caption')):
+            return
+        async with self._pool().acquire() as c:
+            await c.execute(
+                f"""INSERT INTO group_stats_daily(chat_id,day,{col}) VALUES($1,$2,1)
+                    ON CONFLICT(chat_id,day) DO UPDATE SET {col}=group_stats_daily.{col}+1""",
+                int(chat_id), day,
+            )
+            if user_id:
+                await c.execute(
+                    """INSERT INTO group_user_msgs(chat_id,user_id,day,msg_count) VALUES($1,$2,$3,1)
+                       ON CONFLICT(chat_id,user_id,day) DO UPDATE SET msg_count=group_user_msgs.msg_count+1""",
+                    int(chat_id), int(user_id), day,
+                )
+
+    async def record_member_join(self, chat_id: int, count: int = 1) -> None:
+        from datetime import date
+        async with self._pool().acquire() as c:
+            await c.execute(
+                """INSERT INTO group_stats_daily(chat_id,day,joined) VALUES($1,$2,$3)
+                   ON CONFLICT(chat_id,day) DO UPDATE SET joined=group_stats_daily.joined+EXCLUDED.joined""",
+                int(chat_id), date.today(), count,
+            )
+
+    async def record_member_left(self, chat_id: int, count: int = 1) -> None:
+        from datetime import date
+        async with self._pool().acquire() as c:
+            await c.execute(
+                """INSERT INTO group_stats_daily(chat_id,day,left_count) VALUES($1,$2,$3)
+                   ON CONFLICT(chat_id,day) DO UPDATE SET left_count=group_stats_daily.left_count+EXCLUDED.left_count""",
+                int(chat_id), date.today(), count,
+            )
+
+    async def record_bot_delete(self, chat_id: int) -> None:
+        from datetime import date
+        async with self._pool().acquire() as c:
+            await c.execute(
+                """INSERT INTO group_stats_daily(chat_id,day,deleted_by_bot) VALUES($1,$2,1)
+                   ON CONFLICT(chat_id,day) DO UPDATE SET deleted_by_bot=group_stats_daily.deleted_by_bot+1""",
+                int(chat_id), date.today(),
+            )
+
+    async def group_stats_today(self, chat_id: int) -> dict:
+        from datetime import date
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow(
+                'SELECT * FROM group_stats_daily WHERE chat_id=$1 AND day=$2',
+                int(chat_id), date.today(),
+            )
+            top = await c.fetch(
+                """SELECT m.user_id, m.msg_count, u.first_name, u.username
+                   FROM group_user_msgs m LEFT JOIN users u ON u.user_id=m.user_id
+                   WHERE m.chat_id=$1 AND m.day=$2 ORDER BY m.msg_count DESC LIMIT 3""",
+                int(chat_id), date.today(),
+            )
+        base = {
+            'joined': 0, 'left_count': 0, 'text_count': 0, 'photo_count': 0, 'video_count': 0,
+            'voice_count': 0, 'audio_count': 0, 'animation_count': 0, 'sticker_count': 0,
+            'document_count': 0, 'deleted_by_bot': 0,
+        }
+        if row:
+            base.update({k: int(row[k] or 0) for k in base})
+        return {'day': str(date.today()), 'counts': base, 'top_users': [dict(r) for r in top]}
+
+    # ── Warns ───────────────────────────────────────────────────────────
+
+    async def add_warn(self, chat_id: int, user_id: int) -> int:
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow(
+                """INSERT INTO group_warns(chat_id,user_id,warn_count,updated_at) VALUES($1,$2,1,NOW())
+                   ON CONFLICT(chat_id,user_id) DO UPDATE SET warn_count=group_warns.warn_count+1, updated_at=NOW()
+                   RETURNING warn_count""",
+                int(chat_id), int(user_id),
+            )
+        return int(row['warn_count']) if row else 1
+
+    async def get_warns(self, chat_id: int, user_id: int) -> int:
+        async with self._pool().acquire() as c:
+            return int(await c.fetchval(
+                'SELECT warn_count FROM group_warns WHERE chat_id=$1 AND user_id=$2',
+                int(chat_id), int(user_id),
+            ) or 0)
+
+    # ── Recent fun items (anti-repeat) ──────────────────────────────────
+
+    async def push_recent_fun(self, chat_id: int, kind: str, item: str, keep: int = 8) -> None:
+        import hashlib
+        h = hashlib.sha256(item.encode('utf-8')).hexdigest()[:24]
+        async with self._pool().acquire() as c:
+            await c.execute(
+                """INSERT INTO recent_fun(chat_id,kind,item_hash) VALUES($1,$2,$3)
+                   ON CONFLICT DO NOTHING""",
+                int(chat_id), kind, h,
+            )
+            await c.execute(
+                """DELETE FROM recent_fun WHERE chat_id=$1 AND kind=$2 AND item_hash NOT IN (
+                     SELECT item_hash FROM recent_fun WHERE chat_id=$1 AND kind=$2
+                     ORDER BY created_at DESC LIMIT $3
+                   )""",
+                int(chat_id), kind, keep,
+            )
+
+    async def recent_fun_hashes(self, chat_id: int, kind: str) -> list[str]:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                'SELECT item_hash FROM recent_fun WHERE chat_id=$1 AND kind=$2 ORDER BY created_at DESC LIMIT 12',
+                int(chat_id), kind,
+            )
+        return [r['item_hash'] for r in rows]
+
+    async def get_profanity_words(self, chat_id: int) -> list[str]:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch('SELECT word FROM group_profanity_words WHERE chat_id=$1', int(chat_id))
+        return [r['word'] for r in rows]

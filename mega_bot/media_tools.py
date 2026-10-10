@@ -17,19 +17,29 @@ def _font(size: int):
 
 
 def _overlay(image: Image.Image, text: str) -> Image.Image:
+    """Draw overlay text ~30% lower and ~20% larger than the previous layout.
+
+    Previous baseline used y≈0.58 of image height and size≈0.12 of height.
+    New layout: size≈0.144, vertical center near 0.75 so text sits lower
+    without leaving the frame on typical phone aspect ratios.
+    """
     if not text:
         return image
     image = image.convert('RGBA')
     draw = ImageDraw.Draw(image)
     max_width = int(image.width * .92)
-    size = max(12, int(image.height * .12))
+    # ~20% larger than previous (0.12 * 1.2 = 0.144)
+    size = max(14, int(image.height * .144))
     font = _font(size)
     while size > 10 and draw.textbbox((0, 0), text, font=font, stroke_width=2)[2] > max_width:
         size -= 2
         font = _font(size)
     box = draw.textbbox((0, 0), text, font=font, stroke_width=2)
-    x = (image.width - (box[2] - box[0])) // 2
-    y = int(image.height * .58) - (box[3] - box[1]) // 2
+    tw, th = box[2] - box[0], box[3] - box[1]
+    x = (image.width - tw) // 2
+    # ~30% lower than 0.58 → target center near 0.75; clamp so text stays in frame
+    y_center = int(image.height * .75)
+    y = max(0, min(image.height - th - 4, y_center - th // 2))
     draw.text((x, y), text, font=font, fill='white', stroke_width=max(1, size // 18), stroke_fill='black')
     return image.convert('RGB')
 
@@ -65,7 +75,8 @@ def video_to_gif(raw: bytes, suffix: str = '.mp4', text: str = '') -> bytes:
             # Pillow handles Persian shaping more reliably for image frames; video overlay uses drawtext.
             safe = text.replace('\\', '\\\\').replace(':', '\\:').replace("'", "\\'").replace('%', '\\%')
             font = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
-            vf += f",drawtext=fontfile={font}:text='{safe}':fontcolor=white:borderw=2:bordercolor=black:fontsize=h/12:x=(w-text_w)/2:y=h*0.58"
+            # ~20% larger (h/10 vs h/12) and ~30% lower (y=h*0.75 vs h*0.58)
+            vf += f",drawtext=fontfile={font}:text='{safe}':fontcolor=white:borderw=2:bordercolor=black:fontsize=h/10:x=(w-text_w)/2:y=h*0.75-text_h/2"
         palette = Path(tmp)/'palette.png'
         cmd1 = ['ffmpeg','-nostdin','-v','error','-y','-i',str(src),'-t',str(MAX_VIDEO_SECONDS),'-vf',vf+',palettegen',str(palette)]
         cmd2 = ['ffmpeg','-nostdin','-v','error','-y','-i',str(src),'-i',str(palette),'-t',str(MAX_VIDEO_SECONDS),'-filter_complex',f'{vf}[x];[x][1:v]paletteuse','-loop','0',str(dst)]

@@ -5,7 +5,7 @@ from typing import Any
 from .bale_api import BaleAPI, BaleAPIError
 from .database import Database
 from .media_tools import convert_media, MAX_INPUT_BYTES
-from .keyboards import USER_KEYBOARD, inline, menu_page, main_admin_menu, user_actions
+from .keyboards import USER_KEYBOARD, inline, menu_page, main_admin_menu, user_actions, url_button, merge_inline
 from config import OWNER_ID, BOT_VERSION, SUPPORT_TEXT, DONATION_TEXT
 
 log = logging.getLogger(__name__)
@@ -34,13 +34,60 @@ class MegaBot:
         self._bg_tasks: set[asyncio.Task] = set()
         self._bot_member_status: dict[int, str] = {}
         self._update_sem = asyncio.Semaphore(8)
+        # Ad button cache: (enabled, url, title) — refreshed from DB
+        self._ad_cache: tuple[bool, str, str] | None = None
+        self._ad_cache_ts: float = 0.0
+        # Broadcast campaign control (in-memory; cancelled on restart)
+        self._broadcast_cancel: set[int] = set()  # admin uids who requested cancel
+        self._broadcast_running: bool = False
 
-    async def safe_send(self, chat_id: int, text: str, keyboard: dict | None = None, reply_to: int | None = None, parse_mode: str | None = 'Markdown') -> dict | None:
+    async def _get_ad_config(self) -> tuple[bool, str, str]:
+        """Return (enabled, url, title). Cached for 30s to avoid DB hit on every send."""
+        now = time.time()
+        if self._ad_cache is not None and (now - self._ad_cache_ts) < 30:
+            return self._ad_cache
+        try:
+            enabled = bool(await self.db.get_setting('ad_enabled', False))
+            url = str(await self.db.get_setting('ad_url', '') or '')
+            title = str(await self.db.get_setting('ad_title', '') or '')
+        except Exception:
+            enabled, url, title = False, '', ''
+        self._ad_cache = (enabled, url, title)
+        self._ad_cache_ts = now
+        return self._ad_cache
+
+    def _invalidate_ad_cache(self) -> None:
+        self._ad_cache = None
+        self._ad_cache_ts = 0.0
+
+    async def _with_ad_keyboard(self, keyboard: dict | None, *, skip_ad: bool = False) -> dict | None:
+        """Attach ad URL button to an inline keyboard when ads are enabled.
+
+        - Never mutates the original keyboard.
+        - Skips reply keyboards (groups strip them anyway via _group_keyboard).
+        - skip_ad=True for GIF sends and internal probes.
+        """
+        if skip_ad:
+            return keyboard
+        enabled, url, title = await self._get_ad_config()
+        if not enabled or not url or not title:
+            return keyboard
+        ad_btn = {'text': title, 'url': url}
+        if keyboard and 'inline_keyboard' in keyboard:
+            return merge_inline(keyboard, [ad_btn])
+        if keyboard and 'keyboard' in keyboard:
+            # Reply keyboard: keep as-is; ad only on inline
+            return keyboard
+        return {'inline_keyboard': [[ad_btn]]}
+
+    async def safe_send(self, chat_id: int, text: str, keyboard: dict | None = None, reply_to: int | None = None, parse_mode: str | None = 'Markdown', *, skip_ad: bool = False) -> dict | None:
         """Send with progressive fallbacks. Prefer no-reply first for reliability in groups.
 
         Logs every attempt outcome. Uses fast=True (no long retries) so group handlers
         cannot burn the 15s update budget on a single stuck TCP connect.
+        When ads are enabled, attaches the ad URL button to inline keyboards.
         """
+        keyboard = await self._with_ad_keyboard(keyboard, skip_ad=skip_ad)
         plain = (text or '').replace('*', '').replace('`', '').replace('_', '')
         # IMPORTANT: try WITHOUT reply_to first — reply_to is a common Bale failure mode
         # and previously caused the whole handler to sit on a long timeout before fallback.
@@ -51,13 +98,11 @@ class MegaBot:
             (plain, None, None, None),
         ]
         if reply_to is not None:
-            # Optional reply attempt only after a plain send already succeeded path isn't needed;
-            # still try once with reply if plain-with-keyboard works better for UX — as last of rich attempts.
-            attempts.insert(0, (text, keyboard, reply_to, parse_mode))
-            # Actually put no-reply FIRST:
+            # Prefer reply when requested (group UX), but keep no-reply fallbacks.
             attempts = [
-                (text, keyboard, None, parse_mode),
                 (text, keyboard, reply_to, parse_mode),
+                (text, keyboard, None, parse_mode),
+                (text, keyboard, reply_to, None),
                 (text, keyboard, None, None),
                 (text, None, None, None),
                 (plain, None, None, None),
@@ -369,7 +414,8 @@ class MegaBot:
                             'can_add_web_page_previews': False,
                         },
                     )
-                    await self.safe_send(chat_id, f'🔇 کاربر {target_name} سکوت شد.')
+                    _rt = msg.get('message_id')
+                    await self.safe_send(chat_id, f'🔇 کاربر {target_name} سکوت شد.', reply_to=_rt, parse_mode=None)
                     await self.db.log(uid, 'group_mute', 'user', target_uid, {'chat_id': chat_id})
                 elif action == 'unmute':
                     await self.api.restrict_chat_member(
@@ -382,25 +428,27 @@ class MegaBot:
                             'can_add_web_page_previews': True,
                         },
                     )
-                    await self.safe_send(chat_id, f'🔊 سکوت کاربر {target_name} برداشته شد.')
+                    await self.safe_send(chat_id, f'🔊 سکوت کاربر {target_name} برداشته شد.', reply_to=msg.get('message_id'), parse_mode=None)
                     await self.db.log(uid, 'group_unmute', 'user', target_uid, {'chat_id': chat_id})
                 elif action == 'ban':
                     await self.api.ban_chat_member(chat_id, target_uid)
-                    await self.safe_send(chat_id, f'⛔ کاربر {target_name} از گروه بن شد.')
+                    await self.safe_send(chat_id, f'⛔ کاربر {target_name} از گروه بن شد.', reply_to=msg.get('message_id'), parse_mode=None)
                     await self.db.log(uid, 'group_ban', 'user', target_uid, {'chat_id': chat_id})
                 elif action == 'unban':
                     await self.api.unban_chat_member(chat_id, target_uid)
-                    await self.safe_send(chat_id, f'✅ بن کاربر {target_name} برداشته شد؛ می‌تواند دوباره به گروه بپیوندد.')
+                    await self.safe_send(chat_id, f'✅ بن کاربر {target_name} برداشته شد؛ می‌تواند دوباره به گروه بپیوندد.', reply_to=msg.get('message_id'), parse_mode=None)
                     await self.db.log(uid, 'group_unban', 'user', target_uid, {'chat_id': chat_id})
                 elif action == 'kick':
                     await self.api.ban_chat_member(chat_id, target_uid, int(time.time()) + 45)
                     await self.api.unban_chat_member(chat_id, target_uid)
-                    await self.safe_send(chat_id, f'👢 کاربر {target_name} از گروه اخراج شد.')
+                    await self.safe_send(chat_id, f'👢 کاربر {target_name} از گروه اخراج شد.', reply_to=msg.get('message_id'), parse_mode=None)
                     await self.db.log(uid, 'group_kick', 'user', target_uid, {'chat_id': chat_id})
             except Exception as exc:
                 await self.safe_send(
                     chat_id,
                     f'عملیات انجام نشد؛ دسترسی ربات در گروه (Restrict/Ban Members) را بررسی کن. {self._short(exc)}',
+                    reply_to=msg.get('message_id'),
+                    parse_mode=None,
                 )
             return
         if self._is_group_chat(chat):
@@ -570,6 +618,45 @@ class MegaBot:
         # Social / emoji reactions (groups + private). Bot messages already skipped above.
         if not text:
             return
+
+        # ── Learn command: «یاد بگیر X = Y» or «یاد بگیر X Y»
+        learned_pair = self._parse_learn_command(text)
+        if learned_pair:
+            trigger_raw, response = learned_pair
+            trigger_norm = self._normalize_trigger(trigger_raw)
+            if not trigger_norm or not response.strip():
+                await self.safe_send(chat_id, 'عبارت یا پاسخ خالی قابل ذخیره نیست.', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            if is_group:
+                scope_type, scope_id = 'group', chat_id
+            else:
+                scope_type, scope_id = 'private', uid
+            try:
+                await self.db.upsert_learned(scope_type, scope_id, trigger_norm, trigger_raw, response, uid)
+            except Exception:
+                log.exception('upsert_learned failed scope=%s id=%s', scope_type, scope_id)
+                await self.safe_send(chat_id, 'خطا در ذخیره. بعداً دوباره تلاش کن.', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            await self.safe_send(
+                chat_id,
+                f'یاد گرفتم! از این به بعد اگه بگی «{trigger_raw}»، جواب می‌دم «{response}».',
+                reply_to=msg.get('message_id'),
+                parse_mode=None,
+            )
+            return
+
+        # ── Auto-reply from learned memory (after all built-in commands)
+        try:
+            if is_group:
+                learned = await self.db.get_learned('group', chat_id, self._normalize_trigger(text))
+            else:
+                learned = await self.db.get_learned('private', uid, self._normalize_trigger(text))
+            if learned:
+                await self.safe_send(chat_id, learned, reply_to=msg.get('message_id'), parse_mode=None)
+                return
+        except Exception:
+            log.warning('learned lookup failed chat=%s', chat_id)
+
         # Emoji-only: single emoji reply, no text. Rate-limited per user.
         if self._is_emoji_only(text):
             last = self._emoji_last.get(uid, 0)
@@ -1447,12 +1534,16 @@ class MegaBot:
             if perms.get('ban_group') or perms.get('unban_group'): items.append(('👥 محدودیت گروه‌ها','adm:search:group'))
             if perms.get('edit_about'): items.append(('📝 ویرایش درباره ما','own:about'))
             if perms.get('edit_team'): items.append(('👨‍💻 تیم توسعه','own:team'))
+            if perms.get('settings'):
+                items += [('📢 افزودن دکمه تبلیغ','adm:ad'),('📨 پیام همگانی','adm:broadcast')]
             if not items: items = [('📊 آمار و گزارش‌ها','adm:stats')]
         else:
             items = [
                 ('📊 آمار و گزارش‌ها','adm:stats'),('👤 جست‌وجوی کاربر','adm:search:user'),('👥 جست‌وجوی گروه','adm:search:group'),
                 ('🎫 بررسی کد پیگیری','adm:case'),('🧾 گزارش فعالیت‌ها','adm:logs'),('🛡️ مدیریت ادمین‌ها','own:admins'),
-                ('📝 ویرایش درباره ما','own:about'),('👨‍💻 تیم توسعه‌دهنده','own:team'),('💚 تنظیمات حمایت مالی','own:donations'),('⚙️ تنظیمات مالک','own:settings')]
+                ('📝 ویرایش درباره ما','own:about'),('👨‍💻 تیم توسعه‌دهنده','own:team'),('💚 تنظیمات حمایت مالی','own:donations'),
+                ('📢 افزودن دکمه تبلیغ','adm:ad'),('📨 پیام همگانی','adm:broadcast'),
+                ('⚙️ تنظیمات مالک','own:settings')]
         # Exactly three content items per page, plus optional previous/next and back/close.
         start = page*2
         rows = [[(label,data)] for label,data in items[start:start+2]]
@@ -1474,6 +1565,14 @@ class MegaBot:
         owner = uid == OWNER_ID
         if not owner and not await self.db.is_admin(uid):
             await self.safe_send(chat_id,'⛔ دسترسی مدیریت نداری.')
+            return
+        # --- Ad button management ---
+        if data == 'adm:ad' or data.startswith('adm:ad:'):
+            await self._handle_ad_callback(uid, chat_id, message_id, data)
+            return
+        # --- Broadcast ---
+        if data == 'adm:broadcast' or data.startswith('adm:bc:'):
+            await self._handle_broadcast_callback(uid, chat_id, message_id, data)
             return
         if data == 'adm:stats':
             if not await self.has_perm(uid,'stats'): return await self.safe_send(chat_id,'⛔ مجوز مشاهده آمار نداری.')
@@ -1618,8 +1717,395 @@ class MegaBot:
         self.states[uid]={'step':'ban_reason','target_type':target_type,'target_id':target_id,'chat_id':chat_id,'message_id':message_id}
         await self.safe_edit(chat_id,message_id,'دلیل محدودیت را بفرست.',inline([[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]]))
 
+    # ─── Ad button system ───────────────────────────────────────────────
+
+    _BALE_LINK_RE = re.compile(
+        r'^(?:https?://)?(?:ble\.ir|bale\.ai)/(?:join/)?([A-Za-z0-9_]+)/?$',
+        re.IGNORECASE,
+    )
+
+    def _validate_bale_link(self, raw: str) -> str | None:
+        """Return normalized https://ble.ir/... URL or None if invalid."""
+        text = (raw or '').strip()
+        if not text or len(text) > 200:
+            return None
+        # Accept ble.ir/... with or without scheme
+        m = self._BALE_LINK_RE.match(text)
+        if not m:
+            # Also accept plain ble.ir/xxx pasted with extra spaces
+            low = text.lower().replace('https://', '').replace('http://', '')
+            if low.startswith('ble.ir/') or low.startswith('bale.ai/'):
+                m = self._BALE_LINK_RE.match(low)
+            if not m:
+                return None
+        slug = m.group(1)
+        if not slug or len(slug) < 2:
+            return None
+        return f'https://ble.ir/{slug}'
+
+    async def _handle_ad_callback(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
+        if uid != OWNER_ID and not await self.has_perm(uid, 'settings'):
+            await self.safe_send(chat_id, '⛔ فقط مالک یا ادمین با مجوز تنظیمات می‌تواند تبلیغ را مدیریت کند.')
+            return
+        enabled, url, title = await self._get_ad_config()
+        if data == 'adm:ad':
+            status = '🟢 فعال' if enabled and url and title else '🔴 غیرفعال'
+            body = (
+                f'*📢 مدیریت دکمه تبلیغ*\n\n'
+                f'وضعیت: {status}\n'
+                f'عنوان: `{title or "—"}`\n'
+                f'لینک: `{url or "—"}`\n\n'
+                f'با فعال‌بودن، دکمه زیر پیام‌های معمولی ربات (به‌جز GIF) نمایش داده می‌شود.'
+            )
+            rows = []
+            if enabled and url and title:
+                rows.append([('🔴 خاموش کردن', 'adm:ad:off')])
+                rows.append([('✏️ تغییر لینک', 'adm:ad:set_url'), ('✏️ تغییر عنوان', 'adm:ad:set_title')])
+            else:
+                rows.append([('🟢 فعال‌سازی / تنظیم', 'adm:ad:setup')])
+            if url and title and not enabled:
+                rows.append([('🟢 روشن کردن', 'adm:ad:on')])
+            rows.append([('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')])
+            await self.safe_edit(chat_id, message_id, body, inline(rows))
+            return
+        if data == 'adm:ad:off':
+            await self.db.set_setting('ad_enabled', False, uid)
+            self._invalidate_ad_cache()
+            await self.db.log(uid, 'ad_disabled')
+            await self.safe_edit(chat_id, message_id, '🔴 تبلیغ خاموش شد. پیام‌های جدید دکمه تبلیغ نخواهند داشت.',
+                                 inline([[('↩️ برگشت', 'adm:ad'), ('✖️ بستن', 'close')]]))
+            return
+        if data == 'adm:ad:on':
+            if not url or not title:
+                await self.safe_edit(chat_id, message_id, 'ابتدا لینک و عنوان را تنظیم کن.',
+                                     inline([[('🟢 فعال‌سازی', 'adm:ad:setup'), ('↩️ برگشت', 'adm:ad')]]))
+                return
+            await self.db.set_setting('ad_enabled', True, uid)
+            self._invalidate_ad_cache()
+            await self.db.log(uid, 'ad_enabled')
+            preview = url_button(title, url)
+            await self.safe_edit(chat_id, message_id, '🟢 تبلیغ فعال شد.\nپیش‌نمایش دکمه:', preview)
+            await self.safe_send(chat_id, 'برای بازگشت:', inline([[('↩️ مدیریت تبلیغ', 'adm:ad'), ('✖️ بستن', 'close')]]), skip_ad=True)
+            return
+        if data in ('adm:ad:setup', 'adm:ad:set_url'):
+            self.states[uid] = {'step': 'ad_url', 'chat_id': chat_id, 'message_id': message_id}
+            await self.safe_edit(
+                chat_id, message_id,
+                'لینک کانال، گروه یا ربات موردنظرت رو بفرست. لینک باید با "ble.ir/..." شروع بشه.',
+                inline([[('↩️ لغو', 'adm:ad'), ('✖️ بستن', 'close')]]),
+            )
+            return
+        if data == 'adm:ad:set_title':
+            if not url:
+                await self.safe_edit(chat_id, message_id, 'ابتدا لینک را تنظیم کن.',
+                                     inline([[('✏️ تنظیم لینک', 'adm:ad:set_url'), ('↩️ برگشت', 'adm:ad')]]))
+                return
+            self.states[uid] = {'step': 'ad_title', 'chat_id': chat_id, 'message_id': message_id, 'ad_url': url}
+            await self.safe_edit(
+                chat_id, message_id,
+                'عنوان دکمه‌ی تبلیغ رو وارد کن؛ این متن روی دکمه نمایش داده می‌شه.',
+                inline([[('↩️ لغو', 'adm:ad'), ('✖️ بستن', 'close')]]),
+            )
+            return
+
+    # ─── Broadcast system ───────────────────────────────────────────────
+
+    async def _handle_broadcast_callback(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
+        if uid != OWNER_ID and not await self.has_perm(uid, 'settings'):
+            await self.safe_send(chat_id, '⛔ فقط مالک یا ادمین با مجوز تنظیمات می‌تواند پیام همگانی بفرستد.')
+            return
+        if data == 'adm:broadcast':
+            if self._broadcast_running:
+                await self.safe_edit(
+                    chat_id, message_id,
+                    '⏳ یک کمپین ارسال هم‌اکنون در حال اجراست.\nمی‌توانی آن را لغو کنی یا صبر کنی.',
+                    inline([[('🛑 لغو کمپین', 'adm:bc:cancel'), ('↩️ برگشت', 'admin:page:0')]]),
+                )
+                return
+            await self.safe_edit(
+                chat_id, message_id,
+                '*📨 پیام همگانی*\nمخاطبان هدف را انتخاب کن:',
+                inline([
+                    [('👤 کاربران خصوصی', 'adm:bc:users')],
+                    [('👥 گروه‌ها', 'adm:bc:groups')],
+                    [('🌐 همه (کاربران + گروه‌ها)', 'adm:bc:all')],
+                    [('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')],
+                ]),
+            )
+            return
+        if data == 'adm:bc:cancel':
+            self._broadcast_cancel.add(uid)
+            await self.safe_edit(chat_id, message_id, 'درخواست لغو ثبت شد. کمپین پس از اتمام مقصد فعلی متوقف می‌شود.',
+                                 inline([[('↩️ برگشت', 'admin:page:0')]]))
+            return
+        if data in ('adm:bc:users', 'adm:bc:groups', 'adm:bc:all'):
+            target = data.rsplit(':', 1)[1]
+            self.states[uid] = {
+                'step': 'broadcast_await_msg',
+                'chat_id': chat_id,
+                'message_id': message_id,
+                'bc_target': target,
+            }
+            label = {'users': 'کاربران خصوصی', 'groups': 'گروه‌ها', 'all': 'همه مخاطبان'}[target]
+            await self.safe_edit(
+                chat_id, message_id,
+                f'*📨 ارسال به: {label}*\n\nپیام موردنظر را بفرست (متن، عکس، ویدئو، فایل یا GIF با کپشن).',
+                inline([[('↩️ لغو', 'adm:broadcast'), ('✖️ بستن', 'close')]]),
+            )
+            return
+        if data == 'adm:bc:confirm':
+            state = self.states.get(uid)
+            if not state or state.get('step') != 'broadcast_confirm':
+                await self.safe_edit(chat_id, message_id, 'جلسه ارسال منقضی شده. دوباره شروع کن.',
+                                     inline([[('↩️ برگشت', 'adm:broadcast')]]))
+                return
+            if self._broadcast_running:
+                await self.safe_edit(chat_id, message_id, 'کمپین دیگری در حال اجراست.',
+                                     inline([[('↩️ برگشت', 'admin:page:0')]]))
+                return
+            self.states.pop(uid, None)
+            task = asyncio.create_task(self._run_broadcast(uid, chat_id, state), name=f'bc-{uid}')
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+            await self.safe_edit(chat_id, message_id, '🚀 ارسال آغاز شد. گزارش در پایان ارسال می‌شود.',
+                                 inline([[('🛑 لغو', 'adm:bc:cancel')]]))
+            return
+        if data == 'adm:bc:abort':
+            self.states.pop(uid, None)
+            await self.safe_edit(chat_id, message_id, 'ارسال لغو شد.',
+                                 inline([[('↩️ برگشت', 'adm:broadcast'), ('✖️ بستن', 'close')]]))
+            return
+
+    async def _run_broadcast(self, admin_uid: int, report_chat: int, state: dict) -> None:
+        self._broadcast_running = True
+        self._broadcast_cancel.discard(admin_uid)
+        target = state.get('bc_target', 'users')
+        payload = state.get('bc_payload') or {}
+        try:
+            if target == 'users':
+                ids = await self.db.private_user_ids()
+            elif target == 'groups':
+                ids = await self.db.group_chat_ids()
+            else:
+                ids = list(dict.fromkeys(
+                    (await self.db.private_user_ids()) + (await self.db.group_chat_ids())
+                ))
+            # Exclude the admin and the bot itself
+            bot_id = getattr(self, 'bot_id', None)
+            ids = [i for i in ids if i != admin_uid and i != bot_id]
+            total = len(ids)
+            sent = failed = blocked = 0
+            kind = payload.get('kind', 'text')
+            for idx, dest in enumerate(ids):
+                if admin_uid in self._broadcast_cancel:
+                    remaining = total - idx
+                    await self.safe_send(
+                        report_chat,
+                        f'🛑 کمپین لغو شد.\n✅ موفق: {sent}\n❌ ناموفق: {failed}\n🚫 مسدود/غیرقابل‌دسترسی: {blocked}\n⏭ باقی‌مانده: {remaining}',
+                        skip_ad=True,
+                    )
+                    return
+                try:
+                    ok = await self._broadcast_one(dest, payload)
+                    if ok:
+                        sent += 1
+                    else:
+                        failed += 1
+                except Exception as exc:
+                    failed += 1
+                    err = str(exc).lower()
+                    if 'blocked' in err or 'forbidden' in err or 'chat not found' in err or 'have no rights' in err:
+                        blocked += 1
+                    log.warning('broadcast dest=%s err=%s', dest, type(exc).__name__)
+                # Rate limit: ~15 msg/sec max, stay conservative
+                if idx % 10 == 9:
+                    await asyncio.sleep(1.0)
+                else:
+                    await asyncio.sleep(0.08)
+            await self.safe_send(
+                report_chat,
+                f'✅ *گزارش پیام همگانی*\nمخاطبان هدف: {total}\nموفق: {sent}\nناموفق: {failed}\nمسدود/غیرقابل‌دسترسی: {blocked}\nباقی‌مانده: 0',
+                skip_ad=True,
+            )
+            await self.db.log(admin_uid, 'broadcast_done', details={
+                'target': target, 'total': total, 'sent': sent, 'failed': failed, 'blocked': blocked, 'kind': kind,
+            })
+        except Exception:
+            log.exception('broadcast campaign crashed')
+            try:
+                await self.safe_send(report_chat, '⚠️ کمپین با خطا متوقف شد. جزئیات در لاگ سرور.', skip_ad=True)
+            except Exception:
+                pass
+        finally:
+            self._broadcast_running = False
+            self._broadcast_cancel.discard(admin_uid)
+
+    async def _broadcast_one(self, dest: int, payload: dict) -> bool:
+        kind = payload.get('kind', 'text')
+        kb = None
+        # Attach ad unless GIF
+        if kind != 'animation':
+            kb = await self._with_ad_keyboard(None)
+        try:
+            if kind == 'text':
+                result = await self.api.send_message(dest, payload['text'], kb, None, payload.get('parse_mode'), fast=True)
+            elif kind == 'photo':
+                result = await self.api.send_photo(dest, payload['file_id'], payload.get('caption'), kb, payload.get('parse_mode'))
+            elif kind == 'video':
+                result = await self.api.send_video(dest, payload['file_id'], payload.get('caption'), kb, payload.get('parse_mode'))
+            elif kind == 'document':
+                result = await self.api.send_document(dest, payload['file_id'], payload.get('caption'), kb, payload.get('parse_mode'))
+            elif kind == 'animation':
+                result = await self.api.send_animation_file_id(dest, payload['file_id'], payload.get('caption'), None, payload.get('parse_mode'))
+            elif kind == 'copy':
+                result = await self.api.copy_message(dest, payload['from_chat_id'], payload['message_id'], kb)
+            else:
+                return False
+            return result is not None
+        except BaleAPIError as exc:
+            err = str(exc).lower()
+            if any(x in err for x in ('blocked', 'forbidden', 'chat not found', 'have no rights', 'bot was kicked', 'user is deactivated')):
+                return False
+            raise
+
+    # ─── Learned phrases helpers ────────────────────────────────────────
+
+    def _extract_broadcast_payload(self, msg: dict, text: str) -> dict | None:
+        """Build a serialisable payload from an admin message for later re-send."""
+        caption = (msg.get('caption') or '').strip() or None
+        if msg.get('photo'):
+            photos = msg['photo']
+            best = photos[-1] if isinstance(photos, list) else photos
+            fid = best.get('file_id')
+            if fid:
+                return {'kind': 'photo', 'file_id': fid, 'caption': caption or text or None, 'parse_mode': None}
+        if msg.get('video'):
+            fid = msg['video'].get('file_id')
+            if fid:
+                return {'kind': 'video', 'file_id': fid, 'caption': caption or text or None, 'parse_mode': None}
+        if msg.get('animation'):
+            fid = msg['animation'].get('file_id')
+            if fid:
+                return {'kind': 'animation', 'file_id': fid, 'caption': caption or text or None, 'parse_mode': None}
+        if msg.get('document'):
+            fid = msg['document'].get('file_id')
+            if fid:
+                return {'kind': 'document', 'file_id': fid, 'caption': caption or text or None, 'parse_mode': None}
+        if text and text.strip():
+            return {'kind': 'text', 'text': text.strip(), 'parse_mode': None}
+        # Fallback: copy original message
+        mid = msg.get('message_id')
+        from_chat = (msg.get('chat') or {}).get('id')
+        if mid and from_chat:
+            return {'kind': 'copy', 'from_chat_id': int(from_chat), 'message_id': int(mid)}
+        return None
+
+    @staticmethod
+    def _normalize_trigger(text: str) -> str:
+        """Normalize Persian letters and whitespace for stable lookup."""
+        t = (text or '').strip()
+        t = t.replace('ي', 'ی').replace('ك', 'ک')
+        t = re.sub(r'\s+', ' ', t)
+        return t.lower()
+
+    def _parse_learn_command(self, text: str) -> tuple[str, str] | None:
+        """Parse 'یاد بگیر X = Y' or 'یاد بگیر X Y'. Returns (trigger, response) or None."""
+        t = (text or '').strip()
+        if not t.startswith('یاد بگیر'):
+            return None
+        rest = t[len('یاد بگیر'):].strip()
+        if not rest:
+            return None
+        if '=' in rest:
+            left, _, right = rest.partition('=')
+            trigger, response = left.strip(), right.strip()
+        else:
+            parts = rest.split(None, 1)
+            if len(parts) < 2:
+                return None
+            trigger, response = parts[0].strip(), parts[1].strip()
+        if not trigger or not response:
+            return None
+        if len(trigger) > 200 or len(response) > 2000:
+            return None
+        return trigger, response
+
     async def handle_state(self, chat_id: int, uid: int, user: dict, text: str, state: dict, msg: dict) -> bool:
         step=state.get('step')
+        if step == 'ad_url':
+            normalized = self._validate_bale_link(text)
+            if not normalized:
+                await self.safe_send(
+                    chat_id,
+                    'لینک نامعتبر است. فقط لینک‌های ble.ir/... پذیرفته می‌شوند.\nمثال: `https://ble.ir/channelname`',
+                    inline([[('↩️ لغو', 'adm:ad'), ('✖️ بستن', 'close')]]),
+                    skip_ad=True,
+                )
+                return True
+            # Bale API has no reliable resolveUsername for arbitrary links; inform admin.
+            self.states[uid] = {
+                'step': 'ad_title', 'chat_id': chat_id, 'message_id': state.get('message_id'),
+                'ad_url': normalized,
+            }
+            await self.safe_send(
+                chat_id,
+                f'لینک پذیرفته شد: `{normalized}`\n\n'
+                '⚠️ API بله امکان تأیید خودکار وجود مقصد را ندارد؛ صحت لینک بر عهده توست.\n\n'
+                'عنوان دکمه‌ی تبلیغ رو وارد کن؛ این متن روی دکمه نمایش داده می‌شه.',
+                inline([[('↩️ لغو', 'adm:ad'), ('✖️ بستن', 'close')]]),
+                skip_ad=True,
+            )
+            return True
+        if step == 'ad_title':
+            title = (text or '').strip()
+            if not title or len(title) > 64:
+                await self.safe_send(chat_id, 'عنوان باید بین ۱ تا ۶۴ کاراکتر باشد. دوباره بفرست.', skip_ad=True)
+                return True
+            url = state.get('ad_url') or str(await self.db.get_setting('ad_url', '') or '')
+            if not url:
+                self.states.pop(uid, None)
+                await self.safe_send(chat_id, 'لینک پیدا نشد؛ از ابتدا شروع کن.', inline([[('↩️ مدیریت تبلیغ', 'adm:ad')]]), skip_ad=True)
+                return True
+            await self.db.set_setting('ad_url', url, uid)
+            await self.db.set_setting('ad_title', title, uid)
+            await self.db.set_setting('ad_enabled', True, uid)
+            self._invalidate_ad_cache()
+            await self.db.log(uid, 'ad_configured', details={'url': url, 'title': title})
+            self.states.pop(uid, None)
+            preview = url_button(title, url)
+            await self.safe_send(chat_id, 'تبلیغ با موفقیت فعال شد.\nپیش‌نمایش دکمه:', preview, skip_ad=True)
+            await self.safe_send(chat_id, 'مدیریت بیشتر:', inline([[('📢 مدیریت تبلیغ', 'adm:ad'), ('✖️ بستن', 'close')]]), skip_ad=True)
+            return True
+        if step == 'broadcast_await_msg':
+            payload = self._extract_broadcast_payload(msg, text)
+            if not payload:
+                await self.safe_send(chat_id, 'پیام قابل ارسال تشخیص داده نشد. متن، عکس، ویدئو، فایل یا GIF بفرست.', skip_ad=True)
+                return True
+            target = state.get('bc_target', 'users')
+            if target == 'users':
+                count = len(await self.db.private_user_ids())
+            elif target == 'groups':
+                count = len(await self.db.group_chat_ids())
+            else:
+                count = len(await self.db.private_user_ids()) + len(await self.db.group_chat_ids())
+            label = {'users': 'کاربران خصوصی', 'groups': 'گروه‌ها', 'all': 'همه مخاطبان'}[target]
+            preview_text = payload.get('text') or payload.get('caption') or f'[{payload.get("kind", "media")}]'
+            self.states[uid] = {
+                'step': 'broadcast_confirm',
+                'chat_id': chat_id,
+                'bc_target': target,
+                'bc_payload': payload,
+            }
+            await self.safe_send(
+                chat_id,
+                f'*پیش‌نمایش پیام همگانی*\nهدف: {label}\nتعداد تقریبی مخاطبان: `{count}`\nنوع: `{payload.get("kind")}`\nمحتوا:\n{preview_text[:500]}',
+                inline([
+                    [('✅ تأیید ارسال', 'adm:bc:confirm')],
+                    [('✖️ لغو', 'adm:bc:abort'), ('↩️ برگشت', 'adm:broadcast')],
+                ]),
+                skip_ad=True,
+            )
+            return True
         if step == 'search':
             results=await self.db.search_target(text,state['target_type'])
             if not results:

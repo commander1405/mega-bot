@@ -279,6 +279,52 @@ class BaleAPI:
                 raise BaleAPIError(f"sendAnimation: HTTP {response.status}: {result.get('description', result)}")
             return result.get('result', result)
 
+    async def send_photo(self, chat_id: int, photo: str, caption: str | None = None, reply_markup: dict | None = None, parse_mode: str | None = None) -> dict:
+        payload: dict[str, Any] = {'chat_id': chat_id, 'photo': photo}
+        if caption:
+            payload['caption'] = caption
+        if reply_markup is not None:
+            payload['reply_markup'] = reply_markup
+        if parse_mode:
+            payload['parse_mode'] = parse_mode
+        return await self.call('sendPhoto', payload, retries=0)
+
+    async def send_video(self, chat_id: int, video: str, caption: str | None = None, reply_markup: dict | None = None, parse_mode: str | None = None) -> dict:
+        payload: dict[str, Any] = {'chat_id': chat_id, 'video': video}
+        if caption:
+            payload['caption'] = caption
+        if reply_markup is not None:
+            payload['reply_markup'] = reply_markup
+        if parse_mode:
+            payload['parse_mode'] = parse_mode
+        return await self.call('sendVideo', payload, retries=0)
+
+    async def send_document(self, chat_id: int, document: str, caption: str | None = None, reply_markup: dict | None = None, parse_mode: str | None = None) -> dict:
+        payload: dict[str, Any] = {'chat_id': chat_id, 'document': document}
+        if caption:
+            payload['caption'] = caption
+        if reply_markup is not None:
+            payload['reply_markup'] = reply_markup
+        if parse_mode:
+            payload['parse_mode'] = parse_mode
+        return await self.call('sendDocument', payload, retries=0)
+
+    async def send_animation_file_id(self, chat_id: int, animation: str, caption: str | None = None, reply_markup: dict | None = None, parse_mode: str | None = None) -> dict:
+        payload: dict[str, Any] = {'chat_id': chat_id, 'animation': animation}
+        if caption:
+            payload['caption'] = caption
+        if reply_markup is not None:
+            payload['reply_markup'] = reply_markup
+        if parse_mode:
+            payload['parse_mode'] = parse_mode
+        return await self.call('sendAnimation', payload, retries=0)
+
+    async def copy_message(self, chat_id: int, from_chat_id: int, message_id: int, reply_markup: dict | None = None) -> dict:
+        payload: dict[str, Any] = {'chat_id': chat_id, 'from_chat_id': from_chat_id, 'message_id': message_id}
+        if reply_markup is not None:
+            payload['reply_markup'] = reply_markup
+        return await self.call('copyMessage', payload, retries=0)
+
     async def ban_chat_member(self, chat_id: int, user_id: int, until_date: int | None = None) -> dict:
         payload: dict[str, Any] = {'chat_id': chat_id, 'user_id': user_id}
         if until_date is not None:

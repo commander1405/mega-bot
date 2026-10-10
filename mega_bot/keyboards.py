@@ -17,6 +17,20 @@ def inline(rows: list[list[tuple[str, str]]]) -> dict:
     return {'inline_keyboard': [[{'text': label, 'callback_data': data} for label, data in row] for row in rows]}
 
 
+def url_button(label: str, url: str) -> dict:
+    """Single-row inline keyboard with one URL button (Bale-compatible)."""
+    return {'inline_keyboard': [[{'text': label, 'url': url}]]}
+
+
+def merge_inline(base: dict | None, extra_row: list[dict]) -> dict:
+    """Append a row of button dicts to an existing inline keyboard without mutating base."""
+    if not base or 'inline_keyboard' not in base:
+        return {'inline_keyboard': [extra_row]}
+    rows = [list(r) for r in base['inline_keyboard']]
+    rows.append(extra_row)
+    return {'inline_keyboard': rows}
+
+
 def menu_page(items: list[tuple[str, str]], page: int, prefix: str, back: str = 'home', page_size: int = 3) -> dict:
     """At most 6 buttons per page including navigation and back/close controls."""
     start = page * page_size

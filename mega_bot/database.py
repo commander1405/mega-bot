@@ -62,6 +62,20 @@ CREATE TABLE IF NOT EXISTS donations (
   broadcast_sent INTEGER NOT NULL DEFAULT 0, broadcast_failed INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS donations_status_idx ON donations(status, created_at DESC);
+CREATE TABLE IF NOT EXISTS learned_phrases (
+  id BIGSERIAL PRIMARY KEY,
+  scope_type TEXT NOT NULL CHECK (scope_type IN ('group','private')),
+  scope_id BIGINT NOT NULL,
+  trigger_norm TEXT NOT NULL,
+  trigger_raw TEXT NOT NULL,
+  response TEXT NOT NULL,
+  created_by BIGINT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (scope_type, scope_id, trigger_norm)
+);
+CREATE INDEX IF NOT EXISTS learned_phrases_lookup_idx
+  ON learned_phrases (scope_type, scope_id, trigger_norm);
 """
 
 class Database:
@@ -202,6 +216,38 @@ class Database:
         async with self._pool().acquire() as c:
             rows = await c.fetch('SELECT user_id FROM users ORDER BY user_id')
         return [int(r['user_id']) for r in rows]
+
+    async def group_chat_ids(self) -> list[int]:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch('SELECT chat_id FROM groups_seen ORDER BY chat_id')
+        return [int(r['chat_id']) for r in rows]
+
+    async def upsert_learned(self, scope_type: str, scope_id: int, trigger_norm: str, trigger_raw: str, response: str, created_by: int | None) -> None:
+        async with self._pool().acquire() as c:
+            await c.execute(
+                """INSERT INTO learned_phrases(scope_type,scope_id,trigger_norm,trigger_raw,response,created_by)
+                   VALUES($1,$2,$3,$4,$5,$6)
+                   ON CONFLICT(scope_type,scope_id,trigger_norm)
+                   DO UPDATE SET response=EXCLUDED.response, trigger_raw=EXCLUDED.trigger_raw,
+                                 created_by=EXCLUDED.created_by, updated_at=NOW()""",
+                scope_type, int(scope_id), trigger_norm, trigger_raw, response, created_by,
+            )
+
+    async def get_learned(self, scope_type: str, scope_id: int, trigger_norm: str) -> str | None:
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow(
+                'SELECT response FROM learned_phrases WHERE scope_type=$1 AND scope_id=$2 AND trigger_norm=$3',
+                scope_type, int(scope_id), trigger_norm,
+            )
+        return row['response'] if row else None
+
+    async def delete_learned(self, scope_type: str, scope_id: int, trigger_norm: str) -> bool:
+        async with self._pool().acquire() as c:
+            result = await c.execute(
+                'DELETE FROM learned_phrases WHERE scope_type=$1 AND scope_id=$2 AND trigger_norm=$3',
+                scope_type, int(scope_id), trigger_norm,
+            )
+        return result.endswith('1') or (result.split()[-1].isdigit() and int(result.split()[-1]) > 0)
 
     async def set_donation_broadcast_counts(self, donation_id: int, sent: int, failed: int) -> None:
         async with self._pool().acquire() as c:

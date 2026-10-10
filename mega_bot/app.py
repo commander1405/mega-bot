@@ -789,6 +789,11 @@ class MegaBot:
         if not text:
             return
 
+        # ── Group learn: «گروهی یاد بگیر» + pairs on separate lines
+        if text.strip().startswith('گروهی یاد بگیر'):
+            await self._handle_group_learn(chat_id, uid, is_group, text, msg)
+            return
+
         # ── Learn command: «یاد بگیر X = Y» or «یاد بگیر X Y»
         learned_pair = self._parse_learn_command(text)
         if learned_pair:
@@ -805,7 +810,7 @@ class MegaBot:
                 await self.db.upsert_learned(scope_type, scope_id, trigger_norm, trigger_raw, response, uid)
             except Exception:
                 log.exception('upsert_learned failed scope=%s id=%s', scope_type, scope_id)
-                await self.safe_send(chat_id, 'خطا در ذخیره. بعداً دوباره تلاش کن.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.safe_send(chat_id, '❌ انجام نشد به دلیل: ذخیره اطلاعات در دیتابیس ناموفق بود.', reply_to=msg.get('message_id'), parse_mode=None)
                 return
             await self.safe_send(
                 chat_id,
@@ -2223,7 +2228,7 @@ class MegaBot:
     def _parse_learn_command(self, text: str) -> tuple[str, str] | None:
         """Parse 'یاد بگیر X = Y' or 'یاد بگیر X Y'. Returns (trigger, response) or None."""
         t = (text or '').strip()
-        if not t.startswith('یاد بگیر'):
+        if not t.startswith('یاد بگیر') or t.startswith('گروهی یاد بگیر'):
             return None
         rest = t[len('یاد بگیر'):].strip()
         if not rest:
@@ -2241,6 +2246,92 @@ class MegaBot:
         if len(trigger) > 200 or len(response) > 2000:
             return None
         return trigger, response
+
+    def _parse_group_learn_pairs(self, text: str) -> tuple[list[tuple[str, str]] | None, str | None]:
+        """Parse multi-line group learn.
+        Expected format:
+          گروهی یاد بگیر
+          trigger1
+          response1
+          trigger2
+          response2
+          ...
+        Returns (pairs, error_message). pairs is None on validation error.
+        """
+        raw = (text or '').replace('\r\n', '\n').replace('\r', '\n')
+        lines = [ln.strip() for ln in raw.split('\n')]
+        # Drop empty lines at start/end but keep internal empties for strict pairing
+        while lines and lines[0] == '':
+            lines.pop(0)
+        while lines and lines[-1] == '':
+            lines.pop()
+        if not lines:
+            return None, '❌ انجام نشد به دلیل: فرمت ورودی معتبر نیست.'
+        first = lines[0]
+        if not first.startswith('گروهی یاد بگیر'):
+            return None, '❌ انجام نشد به دلیل: فرمت ورودی معتبر نیست.'
+        # Anything after the command on the same line is ignored / treated as invalid start
+        body = lines[1:]
+        # Remove pure empty lines from body so they don't shift pairs
+        body = [ln for ln in body if ln != '']
+        if not body:
+            return None, '❌ انجام نشد به دلیل: هیچ جفت کلمه و جوابی بعد از دستور نوشته نشده است.'
+        if len(body) % 2 != 0:
+            return None, '❌ انجام نشد به دلیل: تعداد خطوط ورودی زوج نیست و یک کلمه بدون جواب باقی مانده است.'
+        pairs: list[tuple[str, str]] = []
+        for i in range(0, len(body), 2):
+            trigger = body[i].strip()
+            response = body[i + 1].strip()
+            if not trigger or not response:
+                return None, '❌ انجام نشد به دلیل: یک جفت ناقص (کلمه یا جواب خالی) وجود دارد.'
+            if len(trigger) > 200 or len(response) > 2000:
+                return None, '❌ انجام نشد به دلیل: طول کلمه یا جواب بیش از حد مجاز است.'
+            pairs.append((trigger, response))
+        if not pairs:
+            return None, '❌ انجام نشد به دلیل: هیچ جفت معتبری پیدا نشد.'
+        return pairs, None
+
+    async def _handle_group_learn(self, chat_id: int, uid: int, is_group: bool, text: str, msg: dict) -> None:
+        """Handle «گروهی یاد بگیر» multi-pair learning."""
+        pairs, err = self._parse_group_learn_pairs(text)
+        if err or pairs is None:
+            await self.safe_send(chat_id, err or '❌ انجام نشد به دلیل: فرمت ورودی معتبر نیست.', reply_to=msg.get('message_id'), parse_mode=None)
+            return
+        if is_group:
+            scope_type, scope_id = 'group', chat_id
+        else:
+            scope_type, scope_id = 'private', uid
+        saved = 0
+        try:
+            for trigger_raw, response in pairs:
+                trigger_norm = self._normalize_trigger(trigger_raw)
+                if not trigger_norm:
+                    continue
+                await self.db.upsert_learned(scope_type, scope_id, trigger_norm, trigger_raw, response, uid)
+                saved += 1
+        except Exception:
+            log.exception('group_learn upsert failed scope=%s id=%s', scope_type, scope_id)
+            await self.safe_send(
+                chat_id,
+                '❌ انجام نشد به دلیل: ذخیره اطلاعات در دیتابیس ناموفق بود.',
+                reply_to=msg.get('message_id'),
+                parse_mode=None,
+            )
+            return
+        if saved == 0:
+            await self.safe_send(
+                chat_id,
+                '❌ انجام نشد به دلیل: هیچ جفت معتبری برای ذخیره پیدا نشد.',
+                reply_to=msg.get('message_id'),
+                parse_mode=None,
+            )
+            return
+        await self.safe_send(
+            chat_id,
+            f'✅ یادگیری گروهی با موفقیت انجام شد!\n🔤 تعداد کلمات ثبت‌شده: {saved}\n📌 هر کلمه به‌صورت مستقل قابل استفاده است.',
+            reply_to=msg.get('message_id'),
+            parse_mode=None,
+        )
 
     # ── Group security / fun / stats helpers ─────────────────────────────
 

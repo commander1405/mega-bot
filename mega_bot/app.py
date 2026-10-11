@@ -58,6 +58,8 @@ class MegaBot:
         self._recent_mids: dict[int, deque] = {}
         # Pending purge confirmations: token -> {chat_id, uid, mids, expires}
         self._purge_pending: dict[str, dict[str, Any]] = {}
+        self._stats_cache: dict | None = None
+        self._stats_cache_ts: float = 0.0
 
     async def _get_ad_config(self) -> tuple[bool, str, str]:
         """Return (enabled, url, title). Cached for 30s to avoid DB hit on every send."""
@@ -77,6 +79,23 @@ class MegaBot:
     def _invalidate_ad_cache(self) -> None:
         self._ad_cache = None
         self._ad_cache_ts = 0.0
+
+    async def _cached_stats(self) -> dict:
+        """Short-lived stats cache (social replies). Invalidated on donation total change."""
+        now = time.time()
+        if self._stats_cache is not None and (now - self._stats_cache_ts) < 20:
+            return self._stats_cache
+        try:
+            self._stats_cache = await self.db.stats()
+        except Exception:
+            self._stats_cache = self._stats_cache or {}
+        self._stats_cache_ts = now
+        return self._stats_cache or {}
+
+    def _invalidate_stats_cache(self) -> None:
+        self._stats_cache = None
+        self._stats_cache_ts = 0.0
+
 
     async def _with_ad_keyboard(self, keyboard: dict | None, *, skip_ad: bool = False) -> dict | None:
         """Attach ad URL button to an inline keyboard when ads are enabled.
@@ -477,6 +496,27 @@ class MegaBot:
                 return
             await self.show_admin(chat_id, uid, owner=(uid == OWNER_ID))
             return
+        if text in ('تنظیم مبلغ حمایت', 'تنظیم مبلغ حمایت مالی', '/set_donations_total'):
+            if uid != OWNER_ID:
+                await self.safe_send(chat_id, '⛔ این دستور فقط برای مالک اصلی ربات است.', parse_mode=None)
+                return
+            try:
+                current = await self.db.get_donations_total()
+            except Exception:
+                log.exception('get_donations_total failed')
+                await self.safe_send(chat_id, '❌ خواندن مبلغ فعلی ممکن نشد.', parse_mode=None)
+                return
+            self.states[uid] = {'step': 'set_donation_total', 'chat_id': chat_id}
+            await self.safe_send(
+                chat_id,
+                f'💚 مبلغ فعلی حمایت: {current:,} تومان\n\n'
+                f'لطفاً مبلغ صحیح را به تومان وارد کن.\n'
+                f'اعداد فارسی یا انگلیسی؛ صفر مجاز است.\n'
+                f'برای لغو: لغو',
+                parse_mode=None,
+            )
+            return
+
         if text.startswith('/owner'):
             if uid != OWNER_ID:
                 await self.safe_send(chat_id, '⛔ این پنل فقط برای مالک ربات است.')
@@ -1107,6 +1147,55 @@ class MegaBot:
         if data.startswith('donation_review:'):
             await self.handle_donation_review(uid, chat_id, message_id, data)
             return
+        if data.startswith('own:don_total:'):
+            if uid != OWNER_ID:
+                await self.safe_send(chat_id, '⛔ فقط مالک اصلی ربات.', parse_mode=None)
+                return
+            if data == 'own:don_total:start':
+                try:
+                    current = await self.db.get_donations_total()
+                except Exception:
+                    current = 0
+                self.states[uid] = {'step': 'set_donation_total', 'chat_id': chat_id}
+                await self.safe_edit(
+                    chat_id, message_id,
+                    f'💚 مبلغ فعلی حمایت: {current:,} تومان\n\nلطفاً مبلغ صحیح را به تومان وارد کن.\nبرای لغو: لغو',
+                    None,
+                )
+                return
+            state = self.states.get(uid) or {}
+            if data.endswith(':no'):
+                self.states.pop(uid, None)
+                await self.safe_edit(chat_id, message_id, '❌ اصلاح مبلغ لغو شد. هیچ تغییری ذخیره نشد.', None)
+                return
+            if not data.endswith(':yes'):
+                return
+            if state.get('step') != 'set_donation_total_confirm':
+                await self.safe_edit(chat_id, message_id, 'این درخواست منقضی شده یا قبلاً انجام شده.', None)
+                return
+            new_amount = int(state.get('new_amount', -1))
+            if new_amount < 0:
+                self.states.pop(uid, None)
+                await self.safe_edit(chat_id, message_id, '❌ مبلغ نامعتبر بود.', None)
+                return
+            try:
+                prev, new_v = await self.db.set_donations_total(new_amount, uid)
+                self._invalidate_stats_cache()
+                self.states.pop(uid, None)
+            except Exception:
+                log.exception('set_donations_total failed')
+                await self.safe_edit(chat_id, message_id, '❌ ذخیره ناموفق بود. مبلغ قبلی حفظ شد.', None)
+                return
+            await self.safe_edit(
+                chat_id, message_id,
+                f'✅ مبلغ حمایت با موفقیت اصلاح شد.\n\n'
+                f'مبلغ قبلی: {prev:,} تومان\n'
+                f'مبلغ جدید: {new_v:,} تومان\n\n'
+                f'آمار عمومی و اختصاصی به‌روزرسانی شدند.',
+                None,
+            )
+            return
+
         if data.startswith('own:donation:') or data == 'own:donations':
             if uid != OWNER_ID:
                 await self.safe_send(chat_id, '⛔ فقط مالک.')
@@ -1122,6 +1211,7 @@ class MegaBot:
                         [('💳 تغییر شماره کارت', 'own:donation:card'), ('👤 نام صاحب کارت', 'own:donation:card_name')],
                         [('🔗 آیدی مالک', 'own:donation:username')],
                         [('📝 متن معرفی', 'own:donation:intro'), ('📄 توضیحات پرداخت', 'own:donation:instructions')],
+                        [('💰 اصلاح مبلغ کل حمایت', 'own:don_total:start')],
                         [('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')],
                     ]),
                 )
@@ -2163,6 +2253,7 @@ class MegaBot:
 
         try:
             await self.db.set_donation_broadcast_counts(donation_id, sent, failed)
+            self._invalidate_stats_cache()
         except Exception:
             log.exception('set_donation_broadcast_counts failed')
 
@@ -4787,6 +4878,52 @@ class MegaBot:
             if not case:
                 await self.safe_send(chat_id,'این کد پیگیری در دیتابیس پیدا نشد.'); return True
             await self.safe_send(chat_id,self.case_text(case),inline([[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]])); return True
+        if step == 'set_donation_total':
+            if uid != OWNER_ID:
+                self.states.pop(uid, None)
+                await self.safe_send(chat_id, '⛔ فقط مالک اصلی.', parse_mode=None)
+                return True
+            if text.strip() in ('لغو', 'cancel', 'انصراف'):
+                self.states.pop(uid, None)
+                await self.safe_send(chat_id, '❌ اصلاح مبلغ لغو شد.', parse_mode=None)
+                return True
+            digits = str.maketrans('۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩', '01234567890123456789')
+            normalized = text.translate(digits).replace(',', '').replace('٬', '').replace(' ', '').replace('٫', '.')
+            # allow integer only (strip thousand separators already)
+            if '.' in normalized:
+                # reject decimals for toman total
+                await self.safe_send(chat_id, '❌ فقط عدد صحیح تومان بفرست؛ مثال: `120000`', parse_mode=None)
+                return True
+            if not normalized.isdigit():
+                await self.safe_send(chat_id, '❌ ورودی نامعتبر است. فقط عدد (فارسی/انگلیسی).', parse_mode=None)
+                return True
+            amount = int(normalized)
+            if amount < 0 or amount > 10**15:
+                await self.safe_send(chat_id, '❌ مبلغ خارج از محدوده مجاز است.', parse_mode=None)
+                return True
+            try:
+                current = await self.db.get_donations_total()
+            except Exception:
+                current = 0
+            self.states[uid] = {
+                'step': 'set_donation_total_confirm',
+                'chat_id': chat_id,
+                'new_amount': amount,
+                'old_amount': current,
+            }
+            await self.safe_send(
+                chat_id,
+                f'⚠️ تأیید اصلاح مبلغ حمایت\n\n'
+                f'مبلغ قبلی: {current:,} تومان\n'
+                f'مبلغ جدید: {amount:,} تومان\n\n'
+                f'این مقدار در آمار عمومی و اختصاصی جایگزین می‌شود.',
+                inline([
+                    [('✅ تأیید و ذخیره', 'own:don_total:yes'), ('❌ لغو', 'own:don_total:no')],
+                ]),
+                parse_mode=None,
+            )
+            return True
+
         if step == 'donation_amount':
             digits = str.maketrans('۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩', '01234567890123456789')
             normalized = text.translate(digits).replace(',', '').replace('٬', '').replace(' ', '').replace('٫', '.')

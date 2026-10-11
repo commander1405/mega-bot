@@ -349,6 +349,51 @@ class Database:
                 updated = await c.fetchrow('SELECT * FROM donations WHERE id=$1', donation_id)
         return dict(updated)
 
+    async def get_donations_total(self) -> int:
+        async with self._pool().acquire() as c:
+            val = await c.fetchval(
+                "SELECT COALESCE((value #>> '{}')::bigint,0) FROM settings WHERE key='donations_total'"
+            )
+        return int(val or 0)
+
+    async def set_donations_total(self, amount: int, actor: int) -> tuple[int, int]:
+        """Atomically replace the public/private donations total.
+
+        Returns (previous_total, new_total). Raises on failure.
+        amount must be >= 0.
+        """
+        amount = int(amount)
+        if amount < 0:
+            raise ValueError('amount must be non-negative')
+        async with self._pool().acquire() as c:
+            async with c.transaction():
+                prev = await c.fetchval(
+                    "SELECT COALESCE((value #>> '{}')::bigint,0) FROM settings WHERE key='donations_total' FOR UPDATE"
+                )
+                prev_i = int(prev or 0)
+                await c.execute(
+                    """INSERT INTO settings(key, value, updated_by, updated_at)
+                       VALUES('donations_total', to_jsonb($1::bigint), $2, NOW())
+                       ON CONFLICT(key) DO UPDATE SET
+                         value=to_jsonb($1::bigint),
+                         updated_by=$2,
+                         updated_at=NOW()""",
+                    amount, int(actor),
+                )
+                await c.execute(
+                    """INSERT INTO audit_logs(actor_id, action, target_type, target_id, details)
+                       VALUES($1, 'set_donations_total', 'setting', NULL, $2)""",
+                    int(actor),
+                    {'previous': prev_i, 'new': amount},
+                )
+                new_val = await c.fetchval(
+                    "SELECT COALESCE((value #>> '{}')::bigint,0) FROM settings WHERE key='donations_total'"
+                )
+                new_i = int(new_val or 0)
+                if new_i != amount:
+                    raise RuntimeError('donations_total write verification failed')
+        return prev_i, new_i
+
     async def private_user_ids(self) -> list[int]:
         async with self._pool().acquire() as c:
             rows = await c.fetch('SELECT user_id FROM users ORDER BY user_id')

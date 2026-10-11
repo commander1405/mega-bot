@@ -228,10 +228,18 @@ class BaleAPI:
             payload['parse_mode'] = parse_mode
         return await self.call('editMessageText', payload)
 
-    async def answer_callback(self, callback_id: str, text: str = '') -> None:
+    async def answer_callback(
+        self,
+        callback_id: str,
+        text: str = '',
+        *,
+        show_alert: bool = False,
+    ) -> None:
         payload: dict[str, Any] = {'callback_query_id': callback_id}
         if text:
             payload['text'] = text
+        if show_alert:
+            payload['show_alert'] = True
         await self.call('answerCallbackQuery', payload)
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:

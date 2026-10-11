@@ -13,6 +13,12 @@ from config import OWNER_ID, BOT_VERSION, SUPPORT_TEXT, DONATION_TEXT
 
 log = logging.getLogger(__name__)
 
+# Points awarded for each newly learned phrase (not for edits/updates).
+LEARN_POINTS = 5
+# Whisper rate-limit: max sends per user in this window (seconds).
+WHISPER_RATE_LIMIT = 5
+WHISPER_RATE_WINDOW = 60.0
+
 DEFAULT_PERMS = {
     'stats': True, 'search': True, 'case_lookup': True,
     'unban_user': True, 'unban_group': True,
@@ -43,6 +49,8 @@ class MegaBot:
         # Broadcast campaign control (in-memory; cancelled on restart)
         self._broadcast_cancel: set[int] = set()  # admin uids who requested cancel
         self._broadcast_running: bool = False
+        # Whisper rate-limit: user_id -> list of send timestamps
+        self._whisper_sends: dict[int, list[float]] = {}
 
     async def _get_ad_config(self) -> tuple[bool, str, str]:
         """Return (enabled, url, title). Cached for 30s to avoid DB hit on every send."""
@@ -396,30 +404,31 @@ class MegaBot:
                 )
                 return
             is_admin = await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID
-            is_vip_user = False
             if not is_admin:
-                try:
-                    is_vip_user = await self.db.is_vip(chat_id, uid)
-                except Exception:
-                    is_vip_user = False
-            if not is_admin and not is_vip_user:
-                await self.safe_send(chat_id, '⛔ فقط ادمین گروه یا کاربر ویژه می‌تواند از این دستور استفاده کند.')
+                await self.safe_send(chat_id, '⛔ برای این کار باید مدیر گروه باشی!', reply_to=msg.get('message_id'), parse_mode=None)
                 return
             target_user = replied.get('from') or replied.get('sender') or {}
             target_uid = int(target_user.get('id', 0) or 0)
             if not target_uid:
-                await self.safe_send(chat_id, 'شناسه معتبر برای کاربر هدف پیدا نشد؛ پیام ریپلای‌شده باید از یک کاربر واقعی باشد.')
+                await self.safe_send(chat_id, '❓ دستور کامل نیست! روی پیام یک کاربر واقعی ریپلای کن.', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            if target_user.get('is_bot') or (self.bot_id and target_uid == self.bot_id):
+                await self.safe_send(
+                    chat_id,
+                    '😂 منو می‌خوای بن کنی؟! داداش من خودم رباتم و نمی‌تونم خودمو بن کنم!',
+                    reply_to=msg.get('message_id'),
+                    parse_mode=None,
+                )
                 return
             if target_uid == OWNER_ID:
-                await self.safe_send(chat_id, '⛔ مالک ربات قابل مدیریت با این دستور نیست.')
+                await self.safe_send(chat_id, '⛔ مالک ربات قابل مدیریت با این دستور نیست.', reply_to=msg.get('message_id'), parse_mode=None)
                 return
             if target_uid == uid:
-                await self.safe_send(chat_id, 'نمی‌توانی این دستور را روی خودت اجرا کنی.')
+                await self.safe_send(chat_id, '🤔 نمی‌تونم این عملیات رو روی خودت انجام بدم!', reply_to=msg.get('message_id'), parse_mode=None)
                 return
             target_name = (target_user.get('first_name') or str(target_uid)).strip()
             try:
                 if action == 'mute':
-                    # Mute: cannot send messages (Bale/Telegram ChatPermissions).
                     await self.api.restrict_chat_member(
                         chat_id,
                         target_uid,
@@ -431,7 +440,7 @@ class MegaBot:
                         },
                     )
                     _rt = msg.get('message_id')
-                    await self.safe_send(chat_id, f'🔇 کاربر {target_name} سکوت شد.', reply_to=_rt, parse_mode=None)
+                    await self.safe_send(chat_id, f'✅ انجام شد! 🔇 کاربر {target_name} سکوت شد.', reply_to=_rt, parse_mode=None)
                     await self.db.log(uid, 'group_mute', 'user', target_uid, {'chat_id': chat_id})
                 elif action == 'unmute':
                     await self.api.restrict_chat_member(
@@ -444,29 +453,37 @@ class MegaBot:
                             'can_add_web_page_previews': True,
                         },
                     )
-                    await self.safe_send(chat_id, f'🔊 سکوت کاربر {target_name} برداشته شد.', reply_to=msg.get('message_id'), parse_mode=None)
+                    await self.safe_send(chat_id, f'✅ انجام شد! 🔊 سکوت کاربر {target_name} برداشته شد.', reply_to=msg.get('message_id'), parse_mode=None)
                     await self.db.log(uid, 'group_unmute', 'user', target_uid, {'chat_id': chat_id})
                 elif action == 'ban':
                     await self.api.ban_chat_member(chat_id, target_uid)
-                    await self.safe_send(chat_id, f'⛔ کاربر {target_name} از گروه بن شد.', reply_to=msg.get('message_id'), parse_mode=None)
+                    await self.safe_send(chat_id, f'✅ انجام شد! ⛔ کاربر {target_name} از گروه بن شد.', reply_to=msg.get('message_id'), parse_mode=None)
                     await self.db.log(uid, 'group_ban', 'user', target_uid, {'chat_id': chat_id})
                 elif action == 'unban':
                     await self.api.unban_chat_member(chat_id, target_uid)
-                    await self.safe_send(chat_id, f'✅ بن کاربر {target_name} برداشته شد؛ می‌تواند دوباره به گروه بپیوندد.', reply_to=msg.get('message_id'), parse_mode=None)
+                    await self.safe_send(chat_id, f'✅ انجام شد! بن کاربر {target_name} برداشته شد.', reply_to=msg.get('message_id'), parse_mode=None)
                     await self.db.log(uid, 'group_unban', 'user', target_uid, {'chat_id': chat_id})
                 elif action == 'kick':
                     await self.api.ban_chat_member(chat_id, target_uid, int(time.time()) + 45)
                     await self.api.unban_chat_member(chat_id, target_uid)
-                    await self.safe_send(chat_id, f'👢 کاربر {target_name} از گروه اخراج شد.', reply_to=msg.get('message_id'), parse_mode=None)
+                    await self.safe_send(chat_id, f'✅ انجام شد! 👢 کاربر {target_name} از گروه اخراج شد.', reply_to=msg.get('message_id'), parse_mode=None)
                     await self.db.log(uid, 'group_kick', 'user', target_uid, {'chat_id': chat_id})
             except Exception as exc:
-                await self.safe_send(
-                    chat_id,
-                    f'عملیات انجام نشد؛ دسترسی ربات در گروه (Restrict/Ban Members) را بررسی کن. {self._short(exc)}',
-                    reply_to=msg.get('message_id'),
-                    parse_mode=None,
-                )
+                err_l = str(exc).lower()
+                if any(x in err_l for x in ('not enough rights', 'permission', 'can\'t', 'cannot', 'forbidden', 'have no rights', 'not an admin', 'chat_admin_required')):
+                    user_msg = '⚠️ برای انجام این کار، من به دسترسی مدیریتی مناسب نیاز دارم. لطفاً دسترسی‌های من رو بررسی کن.'
+                elif any(x in err_l for x in ('bot is not', 'not a member', 'kicked', 'deactivated')):
+                    user_msg = '🛡️ اول منو مدیر گروه کن و دسترسی‌های لازم رو بهم بده، بعد دوباره امتحان کن!'
+                else:
+                    user_msg = '⚠️ عملیات انجام نشد. دسترسی‌های مدیریتی ربات در گروه را بررسی کن.'
+                    log.warning('mod action failed chat=%s action=%s: %s', chat_id, action, type(exc).__name__)
+                await self.safe_send(chat_id, user_msg, reply_to=msg.get('message_id'), parse_mode=None)
             return
+        # ── Whisper (نجوا): reply + «نجوا متن»
+        if is_group and text.startswith('نجوا'):
+            await self._handle_whisper(chat_id, uid, text, msg, replied)
+            return
+
         if self._is_group_chat(chat):
             try:
                 await asyncio.wait_for(self.db.upsert_group(chat), timeout=2.0)
@@ -766,12 +783,18 @@ class MegaBot:
                 await self.safe_send(chat_id, price_mod.format_gold_message(data), reply_to=msg.get('message_id'))
             return
 
-        # ── Learned list / delete
+        # ── Learned list / delete (in groups: admin/owner only)
         if text in ('لیست یادگیری', '🧠 لیست یادگیری'):
+            if is_group and not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ این قابلیت فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
+                return
             scope_type, scope_id = ('group', chat_id) if is_group else ('private', uid)
-            await self._show_learned_list(chat_id, scope_type, scope_id, 0)
+            await self._show_learned_list(chat_id, scope_type, scope_id, 0, requester_uid=uid)
             return
         if text.startswith('حذف کلمه '):
+            if is_group and not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ این قابلیت فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
+                return
             phrase = text[len('حذف کلمه '):].strip()
             if not phrase:
                 await self.safe_send(chat_id, 'عبارت را بعد از «حذف کلمه» بنویس.', reply_to=msg.get('message_id'), parse_mode=None)
@@ -789,35 +812,47 @@ class MegaBot:
         if not text:
             return
 
-        # ── Group learn: «گروهی یاد بگیر» + pairs on separate lines
+        # ── Group learn: «گروهی یاد بگیر» + pairs on separate lines (group: admin only)
         if text.strip().startswith('گروهی یاد بگیر'):
+            if is_group and not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ این قابلیت فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
+                return
             await self._handle_group_learn(chat_id, uid, is_group, text, msg)
             return
 
-        # ── Learn command: «یاد بگیر X = Y» or «یاد بگیر X Y»
+        # ── Learn command: «یاد بگیر X = Y» or «یاد بگیر X Y» (group: admin only)
         learned_pair = self._parse_learn_command(text)
         if learned_pair:
+            if is_group and not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ این قابلیت فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
+                return
             trigger_raw, response = learned_pair
             trigger_norm = self._normalize_trigger(trigger_raw)
             if not trigger_norm or not response.strip():
-                await self.safe_send(chat_id, 'عبارت یا پاسخ خالی قابل ذخیره نیست.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.safe_send(chat_id, '❓ عبارت یا پاسخ خالی قابل ذخیره نیست.', reply_to=msg.get('message_id'), parse_mode=None)
                 return
             if is_group:
                 scope_type, scope_id = 'group', chat_id
             else:
                 scope_type, scope_id = 'private', uid
             try:
-                await self.db.upsert_learned(scope_type, scope_id, trigger_norm, trigger_raw, response, uid)
+                result = await self.db.upsert_learned(scope_type, scope_id, trigger_norm, trigger_raw, response, uid)
             except Exception:
                 log.exception('upsert_learned failed scope=%s id=%s', scope_type, scope_id)
                 await self.safe_send(chat_id, '❌ انجام نشد به دلیل: ذخیره اطلاعات در دیتابیس ناموفق بود.', reply_to=msg.get('message_id'), parse_mode=None)
                 return
-            await self.safe_send(
-                chat_id,
-                f'یاد گرفتم! از این به بعد اگه بگی «{trigger_raw}»، جواب می‌دم «{response}».',
-                reply_to=msg.get('message_id'),
-                parse_mode=None,
-            )
+            points_line = ''
+            if result == 'inserted' and is_group:
+                try:
+                    total_pts = await self.db.add_learn_points(chat_id, uid, LEARN_POINTS)
+                    points_line = f'\n🏆 {LEARN_POINTS} امتیاز به امتیازات یادگیریت اضافه شد. (مجموع: {total_pts})'
+                except Exception:
+                    log.exception('add_learn_points failed')
+            if result == 'inserted':
+                msg_ok = f'✅ یادگیری جدید با موفقیت ذخیره شد! 🧠\nاز این به بعد اگه بگی «{trigger_raw}»، جواب می‌دم «{response}».{points_line}'
+            else:
+                msg_ok = f'🧠 کلمه به‌روزرسانی شد!\nاز این به بعد اگه بگی «{trigger_raw}»، جواب می‌دم «{response}».'
+            await self.safe_send(chat_id, msg_ok, reply_to=msg.get('message_id'), parse_mode=None)
             return
 
         # ── Auto-reply from learned memory (after all built-in commands)
@@ -873,6 +908,21 @@ class MegaBot:
             'CALLBACK data=%r chat=%s type=%r uid=%s mid=%s',
             data[:64], chat_id, chat.get('type'), uid, message_id,
         )
+
+        # Whisper callbacks must answer with alert text themselves (body must not go to group).
+        if data.startswith('wh:'):
+            try:
+                handled = await self._handle_whisper_callback(uid, chat_id, message_id, data, callback_id)
+                if handled:
+                    return
+            except Exception:
+                log.exception('whisper callback failed')
+                if callback_id:
+                    try:
+                        await self.api.answer_callback(callback_id, 'خطا در پردازش نجوا.', show_alert=True)
+                    except Exception:
+                        pass
+                return
 
         # Always ack the click first so the client is not left loading.
         if callback_id:
@@ -1356,16 +1406,27 @@ class MegaBot:
         # fallback: first emoji character
         return found[0][0] if found[0] else found[0]
 
-    def social_reply(self, text: str, stats: dict) -> str | None:
-        raw = (text or '').strip()
-        low = raw.lower().replace('؟', '').replace('?', '').replace('!', '').replace('‌', ' ').strip()
-        low = re.sub(r'\s+', ' ', low)
+    @staticmethod
+    def _normalize_social(text: str) -> str:
+        t = (text or '').strip().lower()
+        t = t.replace('ي', 'ی').replace('ك', 'ک').replace('ۀ', 'ه').replace('ة', 'ه')
+        t = t.replace('‌', ' ').replace('ـ', '')
+        for ch in ('؟', '?', '!', '،', ',', '.', '…', ':', '؛'):
+            t = t.replace(ch, ' ')
+        t = re.sub(r'(.)\1{2,}', r'\1\1', t)  # سلامممم → سلامم
+        t = re.sub(r'\s+', ' ', t).strip()
+        return t
 
-        # Creator / سازنده
-        if low in ('سازنده', 'سازنده کیه', 'سازنده کیه؟', 'سازنده ربات', 'کی ساختت', 'کی ساختت؟', 'developer', 'creator'):
+    def social_reply(self, text: str, stats: dict) -> str | None:
+        low = self._normalize_social(text)
+        if not low or len(low) > 80:
+            return None
+
+        # Creator
+        if low in ('سازنده', 'سازنده کیه', 'سازنده ربات', 'کی ساختت', 'developer', 'creator'):
             return 'سازنده من: @darkknight_studio هست😊'
 
-        # Bot name mentions
+        # Bot name mentions (exact)
         bot_names = {'مگا', 'بات', 'مگا بات', 'مگابات', 'mega', 'mega bot', 'megabot', 'ربات'}
         if low in bot_names:
             return random.choice([
@@ -1376,21 +1437,99 @@ class MegaBot:
                 'آره منم، بگو چی می‌خوای؟',
             ])
 
-        responses = {
-            'سلام ربات': ['سلام🍃 چخبر؟', 'سلام سلام 😄 خوبی؟', 'درود بهت 🌿 چه خبرا؟'],
-            'سلام': ['سلاممم 🍃', 'سلام رفیق 😄', 'سلام، خوش اومدی 🌱'],
-            'شب خوش': ['شب تو هم خوش 😊', 'خوابای قشنگ ببینی 🌙', 'شب آرومی داشته باشی 🍃'],
-            'خوبی': ['مرسی، خوبم 😄 تو چطوری؟', 'خوبم، تو چه خبر؟ 🌿', 'دارم به پیام‌ها می‌رسم 😊'],
-            'چخبر': [
-                f"هیچی فقط دارم به {stats.get('groups', 0)} گروه رسیدگی میکنم⛱️",
-                'خبر خاصی نیست، تو بگو 🌱',
-                'همه‌چی آرومه فعلاً 🍃',
-            ],
-            'خدافظ': ['فعلاً، مراقب خودت باش 🌿', 'بای بای 😄', 'به امید دیدار 🍃'],
-        }
-        for key, values in responses.items():
-            if low == key or (key == 'سلام' and low.startswith('سلام')):
-                return random.choice(values)
+        # Negative boredom guard: «حوصلم سر نرفته» should not trigger boredom
+        if re.search(r'حوصله?\s*م?\s*سر\s*نرفت', low) or 'حوصله ندارم نه' in low:
+            pass  # fall through to other categories, not boredom
+        else:
+            boredom_keys = (
+                'حوصلم سر رفته', 'خیلی حوصلم سر رفته', 'حوصله ندارم', 'بیکارم',
+                'چیکار کنم', 'چی کار کنم', 'یه چیزی بگو', 'سرگرمم کن',
+                'بیا بازی کنیم', 'کسی نیست باهاش حرف بزنم', 'کسل شدم', 'خسته‌ام از بیکاری',
+            )
+            if any(k in low for k in boredom_keys) or low in ('چیکار کنم', 'چی کار کنم', 'بیکارم'):
+                return random.choice([
+                    '😎 حوصلت سر رفته؟ بیا دوز بازی کنیم!',
+                    '🎮 بیا یه بازی شروع کنیم؛ دوز، حدس کلمه یا چیستان؟',
+                    '🧠 یه معمای خفن بگم ببین می‌تونی حلش کنی؟ دستور `چالش` رو بزن!',
+                    '😂 بیا یه چالش کوتاه شروع کنیم؛ آماده‌ای؟ بنویس چالش',
+                    '🌱 حوصله نداری؟ بنویس فکت تا یه چیز جالب بگم!',
+                    '🎲 دوز یا حقیقت‌وجرئت؟ تو بگو کدوم!',
+                ])
+
+        # Exact / prefix phrase banks
+        banks: list[tuple[tuple[str, ...], list[str]]] = [
+            (
+                ('سلام ربات', 'سلام بات', 'سلام مگا'),
+                ['سلام🍃 چخبر؟', 'سلام سلام 😄 خوبی؟', 'درود بهت 🌿 چه خبرا؟'],
+            ),
+            (
+                ('سلام', 'سلامم', 'سلاممم', 'درود', 'دورد', 'درود بر تو', 'درود بر شما', 'سلام علیکم', 'سلام عرض'),
+                ['سلاممم 🍃', 'سلام رفیق 😄', 'سلام، خوش اومدی 🌱', 'درود! حالت چطوره؟', 'سلام سلام 🌟'],
+            ),
+            (
+                ('صبح بخیر', 'صبح به‌خیر', 'صبح بخیرر'),
+                ['صبح تو هم بخیر ☀️', 'صبح بخیر! روزت پرانرژی باشه 🌱', 'صبح بخیر رفیق 😄'],
+            ),
+            (
+                ('عصر بخیر', 'عصر به‌خیر'),
+                ['عصر تو هم بخیر 🌤', 'عصر بخیر! امیدوارم روزت خوب گذشته باشه', 'عصر بخیر 🍃'],
+            ),
+            (
+                ('شب بخیر', 'شب‌خوش', 'شب خوش', 'شب بخیرر'),
+                ['شب تو هم خوش 😊', 'خوابای قشنگ ببینی 🌙', 'شب آرومی داشته باشی 🍃', 'شب بخیر، رویای خوش ✨'],
+            ),
+            (
+                ('خوبی', 'خوبی تو', 'چطوری', 'چطوری تو', 'حالت چطوره', 'حالت خوبه', 'چطوره'),
+                ['مرسی، خوبم 😄 تو چطوری؟', 'خوبم، تو چه خبر؟ 🌿', 'دارم به پیام‌ها می‌رسم 😊 تو چطوری؟'],
+            ),
+            (
+                ('چه خبر', 'چخبر', 'چه خبرا', 'چهخبر', 'اوضاع چطوره'),
+                [
+                    f"هیچی فقط دارم به {stats.get('groups', 0)} گروه رسیدگی می‌کنم ⛱️",
+                    'خبر خاصی نیست، تو بگو 🌱',
+                    'همه‌چی آرومه فعلاً 🍃',
+                    'سری به گروه‌ها می‌زنم، تو چه خبر؟',
+                ],
+            ),
+            (
+                ('مرسی', 'ممنون', 'ممنونم', 'دمت گرم', 'دستت درد نکنه', 'ممنون ازت', 'مرسییی'),
+                ['خواهش می‌کنم 🌿', 'قابلی نداشت 😄', 'همیشه درخدمتم 🌱', 'قربان تو 💚'],
+            ),
+            (
+                ('خسته نباشی', 'خسته نباشید', 'خدا قوت'),
+                ['ممنون 🌱 تو هم خسته نباشی!', 'قربان انرژی‌ت 😄', 'مرسی رفیق 🍃'],
+            ),
+            (
+                ('خوش اومدی', 'خوش اومدین', 'خوش آمدی'),
+                ['مرسی که هستی 🌱', 'خوشحال می‌شم کمکت کنم 😄', 'سلام، خوش اومدی خودت! 🍃'],
+            ),
+            (
+                ('خداحافظ', 'خدافظ', 'بدرود', 'فعلا', 'فعلاً', 'بای', 'بای بای', 'می‌بینمت', 'میبینمت'),
+                ['فعلاً، مراقب خودت باش 🌿', 'بای بای 😄', 'به امید دیدار 🍃', 'خداحافظ، روز/شبت خوش ✨'],
+            ),
+            (
+                ('روزت بخیر', 'روز بخیر', 'روز خوبی داشته باشی'),
+                ['روز تو هم بخیر ☀️', 'امیدوارم روزت عالی باشه 🌱', 'روز بخیر رفیق!'],
+            ),
+            (
+                ('خسته‌ام', 'خسته ام', 'خیلی خسته‌ام'),
+                ['یه کم استراحت کن 🌿', 'انرژی‌ت برمی‌گرده، آروم باش 🍃', 'خستگی‌ت درکنه 🌱'],
+            ),
+            (
+                ('کمک', 'کمک لازم دارم', 'کمک می‌خوام', 'راهنمایی'),
+                ['بگو چی لازم داری 🌱', 'دستور `راهنما ربات` رو بزن تا بخش‌ها رو ببینی', 'اینجام، بگو چطور کمکت کنم 😄'],
+            ),
+            (
+                ('تبریک', 'موفق باشی', 'آفرین'),
+                ['مبارکه 🎉', 'دمت گرم، ادامه بده 🌱', 'آفرین! همین‌طور ادامه بده ✨'],
+            ),
+        ]
+
+        # Prefer longer keys first for better match quality
+        for keys, replies in banks:
+            for key in sorted(keys, key=len, reverse=True):
+                if low == key or (len(key) >= 3 and low.startswith(key + ' ')) or (len(key) >= 4 and key in low and len(low) <= len(key) + 8):
+                    return random.choice(replies)
         return None
 
     async def welcome_new_members(self, msg: dict, chat: dict) -> None:
@@ -1437,17 +1576,26 @@ class MegaBot:
          '• `تیم من` — پرونده محدودیت شخصی\n'
          'دسترسی: همه کاربران'),
         ('🧩 گفت‌وگو و واکنش',
-         '• سلام / خوبی / چخبر / شب خوش / خدافظ\n'
-         '• `مگا` یا `بات` یا `مگا بات` — پاسخ‌های متنوع\n'
+         '• سلام / درود / صبح‌بخیر / شب‌خوش / خدافظ / بدرود\n'
+         '• خوبی / چطوری / چه خبر / مرسی / خسته نباشی\n'
+         '• حوصلم سر رفته / چیکار کنم؟ → پیشنهاد بازی و سرگرمی\n'
+         '• `مگا` یا `بات` — پاسخ‌های متنوع\n'
          '• `سازنده` — @darkknight_studio\n'
-         '• پیام فقط‌ایموجی → یک ایموجی واکنش\n'
+         '• پیام فقط‌ایموجی → واکنش ایموجی\n'
          'دسترسی: همه کاربران'),
+        ('🤫 نجوا',
+         'ریپلای روی پیام کاربر + `نجوا متن پیام`\n'
+         'ربات پیام را حذف می‌کند و فقط به گیرنده با دکمه «دیدن نجوا» نشان می‌دهد.\n'
+         'متن نجوا در گروه دیده نمی‌شود.\n'
+         'دسترسی: همه اعضای گروه'),
         ('🧠 یادگیری کلمات',
          '• `یاد بگیر عبارت = پاسخ` یا `یاد بگیر عبارت پاسخ`\n'
+         '• `گروهی یاد بگیر` + جفت‌های خط‌به‌خط (کلمه / جواب)\n'
          '• حافظه هر گروه و هر کاربر خصوصی کاملاً جداست\n'
-         '• `لیست یادگیری` — مشاهده حافظه همین محیط\n'
+         '• `لیست یادگیری` — مشاهده / حذف تکی / ریست کامل گروه\n'
          '• `حذف کلمه عبارت` — حذف از حافظه همین محیط\n'
-         'دسترسی: همه در همان چت/گروه'),
+         '• با هر یادگیری *جدید* در گروه، امتیاز ثبت می‌شود\n'
+         'دسترسی: در گروه فقط ادمین گروه (و مالک ربات)'),
         ('🎲 سرگرمی',
          '• `چالش` — مأموریت/سؤال سرگرم‌کننده\n'
          '• `فکت` — حقیقت جالب\n'
@@ -1489,11 +1637,11 @@ class MegaBot:
          '• ریپلای + `ویژه` — افزودن ویژه (ادمین گروه)\n'
          '• ریپلای + `حذف ویژه` — حذف\n'
          '• `لیست ویژه‌ها` — فهرست همان گروه\n'
-         'ویژه می‌تواند از ابزارهای مدیریتی ربات (بن/کیک/سکوت) استفاده کند؛ ادمین واقعی بله نمی‌شود'),
+         'ویژه برای تمایز در گروه است؛ دستورات بن/کیک/سکوت فقط برای ادمین گروه است'),
         ('🔇 مدیریت با Reply',
          'ریپلای روی پیام کاربر + یکی از:\n'
          '`سکوت` / `حذف سکوت` / `بن` / `حذف بن` / `کیک`\n'
-         'دسترسی: ادمین گروه یا کاربر ویژه همان گروه'),
+         'دسترسی: فقط ادمین گروه (و مالک ربات) — ممبر عادی: «شما ادمین نیستید»'),
         ('🛡️ پنل ادمین و مالک ربات',
          '• `/admin` — پنل ادمین ربات\n'
          '• `/owner` — فقط مالک\n'
@@ -2291,6 +2439,151 @@ class MegaBot:
             return None, '❌ انجام نشد به دلیل: هیچ جفت معتبری پیدا نشد.'
         return pairs, None
 
+    def _whisper_rate_ok(self, uid: int) -> bool:
+        now = time.time()
+        bucket = self._whisper_sends.setdefault(uid, [])
+        self._whisper_sends[uid] = [t for t in bucket if now - t < WHISPER_RATE_WINDOW]
+        if len(self._whisper_sends[uid]) >= WHISPER_RATE_LIMIT:
+            return False
+        self._whisper_sends[uid].append(now)
+        return True
+
+    async def _handle_whisper(self, chat_id: int, uid: int, text: str, msg: dict, replied: dict) -> None:
+        """Private whisper via reply: «نجوا متن...»"""
+        body = text[len('نجوا'):].strip()
+        if not body:
+            await self.safe_send(
+                chat_id,
+                '❓ دستور کامل نیست! روی پیام کاربر ریپلای کن و بنویس: نجوا متن پیام',
+                reply_to=msg.get('message_id'),
+                parse_mode=None,
+            )
+            return
+        if len(body) > 1000:
+            await self.safe_send(chat_id, '❌ متن نجوا خیلی بلنده (حداکثر ۱۰۰۰ کاراکتر).', reply_to=msg.get('message_id'), parse_mode=None)
+            return
+        if not replied:
+            await self.safe_send(
+                chat_id,
+                '❓ برای نجوا باید روی پیام کاربر هدف *ریپلای* کنی.',
+                reply_to=msg.get('message_id'),
+                parse_mode=None,
+            )
+            return
+        target = replied.get('from') or replied.get('sender') or {}
+        recipient_id = int(target.get('id', 0) or 0)
+        if not recipient_id or target.get('is_bot'):
+            await self.safe_send(chat_id, '❌ فقط می‌تونی برای یک کاربر واقعی نجوا بفرستی.', reply_to=msg.get('message_id'), parse_mode=None)
+            return
+        if self.bot_id and recipient_id == self.bot_id:
+            await self.safe_send(chat_id, '😂 نمی‌تونی برای خود ربات نجوا بفرستی!', reply_to=msg.get('message_id'), parse_mode=None)
+            return
+        if recipient_id == uid:
+            await self.safe_send(chat_id, '🤔 نمی‌تونی برای خودت نجوا بفرستی!', reply_to=msg.get('message_id'), parse_mode=None)
+            return
+        if not self._whisper_rate_ok(uid):
+            await self.safe_send(chat_id, '⏳ کمی صبر کن؛ تعداد نجواهات در دقیقه زیاد شده.', reply_to=msg.get('message_id'), parse_mode=None)
+            return
+
+        try:
+            whisper_id = await self.db.create_whisper(chat_id, uid, recipient_id, body)
+        except Exception:
+            log.exception('create_whisper failed chat=%s', chat_id)
+            await self.safe_send(chat_id, '❌ انجام نشد به دلیل: ذخیره اطلاعات در دیتابیس ناموفق بود.', reply_to=msg.get('message_id'), parse_mode=None)
+            return
+
+        # Delete original message (best-effort; never leak body on failure)
+        mid = msg.get('message_id')
+        if mid:
+            try:
+                await self.api.delete_message(chat_id, int(mid))
+            except Exception as exc:
+                log.info('whisper delete_message failed chat=%s: %s', chat_id, type(exc).__name__)
+
+        # Public announcement WITHOUT whisper body
+        try:
+            await self.safe_send(
+                chat_id,
+                '🤫 یه نجوا داری!',
+                keyboard=inline([[('👁️ دیدن نجوا', f'wh:view:{whisper_id}')]]),
+                parse_mode=None,
+                skip_ad=True,
+            )
+        except Exception:
+            log.exception('whisper announce failed')
+            # Do not fall back to posting the body in the group
+            await self.safe_send(chat_id, '❌ اعلان نجوا ارسال نشد. بعداً دوباره تلاش کن.', parse_mode=None)
+
+    async def _handle_whisper_callback(
+        self, uid: int, chat_id: int, message_id: int, data: str, callback_id: str | None,
+    ) -> bool:
+        """Handle wh:view / wh:ok. Returns True if handled (caller should skip default ack)."""
+        if data.startswith('wh:view:'):
+            try:
+                wid = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                if callback_id:
+                    await self.api.answer_callback(callback_id, 'داده نامعتبر.', show_alert=True)
+                return True
+            try:
+                row = await self.db.get_whisper_for_recipient(wid, uid, chat_id)
+            except Exception:
+                log.exception('get_whisper failed')
+                if callback_id:
+                    await self.api.answer_callback(callback_id, 'خطا در دریافت نجوا.', show_alert=True)
+                return True
+            if not row:
+                if callback_id:
+                    await self.api.answer_callback(
+                        callback_id,
+                        '⛔ این نجوا برای تو نیست یا منقضی شده.',
+                        show_alert=True,
+                    )
+                return True
+            body = (row.get('body') or '')[:200]
+            # Prefer private alert so group never sees body
+            if callback_id:
+                try:
+                    await self.api.answer_callback(callback_id, body or '(خالی)', show_alert=True)
+                except Exception:
+                    # Fallback: try DM to recipient only
+                    try:
+                        await self.api.send_message(
+                            uid,
+                            f'🤫 نجوا:\n{row.get("body") or ""}',
+                            parse_mode=None,
+                        )
+                        await self.api.answer_callback(callback_id, 'نجوا در پیوی برات ارسال شد.')
+                    except Exception:
+                        await self.api.answer_callback(
+                            callback_id,
+                            'نتونستم نجوا رو نشون بدم. پیوی ربات رو باز کن و استارت بزن.',
+                            show_alert=True,
+                        )
+            # Offer dismiss on the group announcement (still no body)
+            try:
+                await self.safe_edit(
+                    chat_id,
+                    message_id,
+                    '🤫 نجوا باز شد.',
+                    inline([[('باشه 👌', f'wh:ok:{wid}')]]),
+                )
+            except Exception:
+                pass
+            return True
+        if data.startswith('wh:ok:'):
+            if callback_id:
+                try:
+                    await self.api.answer_callback(callback_id)
+                except Exception:
+                    pass
+            try:
+                await self.safe_edit(chat_id, message_id, '👌', None)
+            except Exception:
+                pass
+            return True
+        return False
+
     async def _handle_group_learn(self, chat_id: int, uid: int, is_group: bool, text: str, msg: dict) -> None:
         """Handle «گروهی یاد بگیر» multi-pair learning."""
         pairs, err = self._parse_group_learn_pairs(text)
@@ -2302,13 +2595,16 @@ class MegaBot:
         else:
             scope_type, scope_id = 'private', uid
         saved = 0
+        inserted = 0
         try:
             for trigger_raw, response in pairs:
                 trigger_norm = self._normalize_trigger(trigger_raw)
                 if not trigger_norm:
                     continue
-                await self.db.upsert_learned(scope_type, scope_id, trigger_norm, trigger_raw, response, uid)
+                result = await self.db.upsert_learned(scope_type, scope_id, trigger_norm, trigger_raw, response, uid)
                 saved += 1
+                if result == 'inserted':
+                    inserted += 1
         except Exception:
             log.exception('group_learn upsert failed scope=%s id=%s', scope_type, scope_id)
             await self.safe_send(
@@ -2326,9 +2622,17 @@ class MegaBot:
                 parse_mode=None,
             )
             return
+        points_line = ''
+        if is_group and inserted > 0:
+            try:
+                pts = inserted * LEARN_POINTS
+                total_pts = await self.db.add_learn_points(chat_id, uid, pts)
+                points_line = f'\n🏆 {pts} امتیاز اضافه شد (برای {inserted} کلمه جدید). مجموع: {total_pts}'
+            except Exception:
+                log.exception('add_learn_points failed')
         await self.safe_send(
             chat_id,
-            f'✅ یادگیری گروهی با موفقیت انجام شد!\n🔤 تعداد کلمات ثبت‌شده: {saved}\n📌 هر کلمه به‌صورت مستقل قابل استفاده است.',
+            f'✅ یادگیری گروهی با موفقیت انجام شد!\n🔤 تعداد کلمات ثبت‌شده: {saved}\n📌 هر کلمه به‌صورت مستقل قابل استفاده است.{points_line}',
             reply_to=msg.get('message_id'),
             parse_mode=None,
         )
@@ -2514,7 +2818,15 @@ class MegaBot:
         buttons.append([('✖️ بستن', 'close')])
         await self.safe_send(chat_id, '\n'.join(lines) if rows_data else 'هنوز ویژه‌ای ثبت نشده.', inline(buttons))
 
-    async def _show_learned_list(self, chat_id: int, scope_type: str, scope_id: int, page: int, search: str | None = None) -> None:
+    async def _show_learned_list(
+        self,
+        chat_id: int,
+        scope_type: str,
+        scope_id: int,
+        page: int,
+        search: str | None = None,
+        requester_uid: int | None = None,
+    ) -> None:
         page = max(0, page)
         total = await self.db.count_learned(scope_type, scope_id, search)
         rows = await self.db.list_learned(scope_type, scope_id, limit=5, offset=page * 5, search=search)
@@ -2534,6 +2846,9 @@ class MegaBot:
             nav.append(('بعدی ➡️', f'learn:list:{page+1}'))
         if nav:
             buttons.append(nav)
+        # Wipe-all only for group memory (admin-only UI; callback re-checks permission)
+        if scope_type == 'group':
+            buttons.append([('🗑️ حذف تمام کلمات یادگیری گروه', f'learn:wipe_ask:{scope_id}')])
         buttons.append([('✖️ بستن', 'close')])
         await self.safe_send(chat_id, '\n'.join(lines) if rows else f'حافظه‌ی {label} خالی است.', inline(buttons))
 
@@ -2555,8 +2870,60 @@ class MegaBot:
                 page = int(data.rsplit(':', 1)[1])
             except ValueError:
                 page = 0
+            if is_group and not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ این قابلیت فقط برای مدیران گروه فعاله!', parse_mode=None)
+                return
             scope_type, scope_id = ('group', chat_id) if is_group else ('private', uid)
-            await self._show_learned_list(chat_id, scope_type, scope_id, page)
+            await self._show_learned_list(chat_id, scope_type, scope_id, page, requester_uid=uid)
+            return
+        if data.startswith('learn:wipe_ask:'):
+            # learn:wipe_ask:<scope_id> — only valid for current group chat
+            try:
+                asked_scope = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                await self.safe_send(chat_id, '❌ داده نامعتبر.', parse_mode=None)
+                return
+            if not is_group or asked_scope != chat_id:
+                await self.safe_send(chat_id, '⛔ فقط حافظه همین گروه.', parse_mode=None)
+                return
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ این قابلیت فقط برای مدیران گروه فعاله!', parse_mode=None)
+                return
+            await self.safe_edit(
+                chat_id,
+                message_id,
+                '⚠️ مطمئنی می‌خوای تمام کلمات و پاسخ‌های یادگرفته‌شده این گروه حذف بشن؟ این کار قابل برگشت نیست.',
+                inline([
+                    [('✅ بله، همه رو حذف کن', f'learn:wipe_yes:{chat_id}'), ('❌ انصراف', 'learn:wipe_no')],
+                ]),
+            )
+            return
+        if data == 'learn:wipe_no':
+            await self.safe_edit(chat_id, message_id, '❌ عملیات حذف لغو شد.', None)
+            return
+        if data.startswith('learn:wipe_yes:'):
+            try:
+                target_scope = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                await self.safe_send(chat_id, '❌ داده نامعتبر.', parse_mode=None)
+                return
+            if not is_group or target_scope != chat_id:
+                await self.safe_send(chat_id, '⛔ فقط حافظه همین گروه.', parse_mode=None)
+                return
+            # Re-check admin on confirm (security)
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ این قابلیت فقط برای مدیران گروه فعاله!', parse_mode=None)
+                return
+            try:
+                deleted = await self.db.clear_learned('group', chat_id)
+            except Exception:
+                log.exception('clear_learned failed chat=%s', chat_id)
+                await self.safe_send(chat_id, '❌ انجام نشد به دلیل: ذخیره اطلاعات در دیتابیس ناموفق بود.', parse_mode=None)
+                return
+            if deleted == 0:
+                await self.safe_edit(chat_id, message_id, 'ℹ️ حافظه یادگیری این گروه از قبل خالی بود.', None)
+            else:
+                await self.safe_edit(chat_id, message_id, '✅ تمام کلمات و پاسخ‌های یادگیری این گروه پاک شدند. 🧹🧠', None)
             return
         if data.startswith('learn:del:'):
             # learn:del:scope_type:scope_id:trigger_norm
@@ -2572,8 +2939,11 @@ class MegaBot:
             if scope_type == 'group' and int(scope_id_s) != chat_id:
                 await self.safe_send(chat_id, '⛔ فقط حافظه همین گروه.', parse_mode=None)
                 return
+            if scope_type == 'group' and not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ این قابلیت فقط برای مدیران گروه فعاله!', parse_mode=None)
+                return
             ok = await self.db.delete_learned(scope_type, int(scope_id_s), trigger_norm)
-            await self.safe_send(chat_id, '🗑 حذف شد.' if ok else 'پیدا نشد.', parse_mode=None)
+            await self.safe_send(chat_id, '✅ انجام شد! 🗑 حذف شد.' if ok else '🔎 پیام موردنظر پیدا نشد یا امکان حذفش وجود نداره.', parse_mode=None)
             return
         # grp:* requires group admin
         if not is_group:

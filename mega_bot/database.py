@@ -137,6 +137,26 @@ CREATE TABLE IF NOT EXISTS group_profanity_words (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (chat_id, word)
 );
+CREATE TABLE IF NOT EXISTS whispers (
+  id BIGSERIAL PRIMARY KEY,
+  chat_id BIGINT NOT NULL,
+  sender_id BIGINT NOT NULL,
+  recipient_id BIGINT NOT NULL,
+  body TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours'),
+  consumed BOOLEAN NOT NULL DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS whispers_lookup_idx ON whispers (id, recipient_id);
+CREATE INDEX IF NOT EXISTS whispers_expire_idx ON whispers (expires_at) WHERE consumed = FALSE;
+CREATE TABLE IF NOT EXISTS user_group_points (
+  chat_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  points BIGINT NOT NULL DEFAULT 0,
+  learn_count INTEGER NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (chat_id, user_id)
+);
 """
 
 class Database:
@@ -283,16 +303,26 @@ class Database:
             rows = await c.fetch('SELECT chat_id FROM groups_seen ORDER BY chat_id')
         return [int(r['chat_id']) for r in rows]
 
-    async def upsert_learned(self, scope_type: str, scope_id: int, trigger_norm: str, trigger_raw: str, response: str, created_by: int | None) -> None:
+    async def upsert_learned(self, scope_type: str, scope_id: int, trigger_norm: str, trigger_raw: str, response: str, created_by: int | None) -> str:
+        """Insert or update a learned phrase. Returns 'inserted' or 'updated'."""
         async with self._pool().acquire() as c:
+            existing = await c.fetchval(
+                'SELECT id FROM learned_phrases WHERE scope_type=$1 AND scope_id=$2 AND trigger_norm=$3',
+                scope_type, int(scope_id), trigger_norm,
+            )
+            if existing:
+                await c.execute(
+                    """UPDATE learned_phrases SET response=$4, trigger_raw=$5, created_by=$6, updated_at=NOW()
+                       WHERE scope_type=$1 AND scope_id=$2 AND trigger_norm=$3""",
+                    scope_type, int(scope_id), trigger_norm, response, trigger_raw, created_by,
+                )
+                return 'updated'
             await c.execute(
                 """INSERT INTO learned_phrases(scope_type,scope_id,trigger_norm,trigger_raw,response,created_by)
-                   VALUES($1,$2,$3,$4,$5,$6)
-                   ON CONFLICT(scope_type,scope_id,trigger_norm)
-                   DO UPDATE SET response=EXCLUDED.response, trigger_raw=EXCLUDED.trigger_raw,
-                                 created_by=EXCLUDED.created_by, updated_at=NOW()""",
+                   VALUES($1,$2,$3,$4,$5,$6)""",
                 scope_type, int(scope_id), trigger_norm, trigger_raw, response, created_by,
             )
+            return 'inserted'
 
     async def get_learned(self, scope_type: str, scope_id: int, trigger_norm: str) -> str | None:
         async with self._pool().acquire() as c:
@@ -309,6 +339,71 @@ class Database:
                 scope_type, int(scope_id), trigger_norm,
             )
         return result.endswith('1') or (result.split()[-1].isdigit() and int(result.split()[-1]) > 0)
+
+    async def clear_learned(self, scope_type: str, scope_id: int) -> int:
+        """Delete all learned phrases for one scope. Returns number of deleted rows."""
+        async with self._pool().acquire() as c:
+            result = await c.execute(
+                'DELETE FROM learned_phrases WHERE scope_type=$1 AND scope_id=$2',
+                scope_type, int(scope_id),
+            )
+        # asyncpg returns e.g. "DELETE 5"
+        try:
+            n = int(result.split()[-1])
+        except (ValueError, IndexError, AttributeError):
+            n = 0
+        return n
+
+    async def add_learn_points(self, chat_id: int, user_id: int, points: int = 5) -> int:
+        """Add points for a newly learned phrase in a group. Returns new total."""
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow(
+                """INSERT INTO user_group_points(chat_id, user_id, points, learn_count, updated_at)
+                   VALUES($1, $2, $3, 1, NOW())
+                   ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                     points = user_group_points.points + EXCLUDED.points,
+                     learn_count = user_group_points.learn_count + 1,
+                     updated_at = NOW()
+                   RETURNING points""",
+                int(chat_id), int(user_id), int(points),
+            )
+        return int(row['points']) if row else int(points)
+
+    async def get_learn_points(self, chat_id: int, user_id: int) -> dict:
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow(
+                'SELECT points, learn_count FROM user_group_points WHERE chat_id=$1 AND user_id=$2',
+                int(chat_id), int(user_id),
+            )
+        if not row:
+            return {'points': 0, 'learn_count': 0}
+        return {'points': int(row['points']), 'learn_count': int(row['learn_count'])}
+
+    async def create_whisper(self, chat_id: int, sender_id: int, recipient_id: int, body: str) -> int:
+        async with self._pool().acquire() as c:
+            # opportunistic cleanup of expired whispers
+            await c.execute("DELETE FROM whispers WHERE expires_at < NOW() OR (consumed AND created_at < NOW() - INTERVAL '1 day')")
+            row = await c.fetchrow(
+                """INSERT INTO whispers(chat_id, sender_id, recipient_id, body)
+                   VALUES($1, $2, $3, $4) RETURNING id""",
+                int(chat_id), int(sender_id), int(recipient_id), body,
+            )
+        return int(row['id'])
+
+    async def get_whisper_for_recipient(self, whisper_id: int, recipient_id: int, chat_id: int) -> dict | None:
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow(
+                """SELECT id, chat_id, sender_id, recipient_id, body, expires_at, consumed
+                   FROM whispers
+                   WHERE id=$1 AND recipient_id=$2 AND chat_id=$3
+                     AND expires_at > NOW()""",
+                int(whisper_id), int(recipient_id), int(chat_id),
+            )
+        return dict(row) if row else None
+
+    async def mark_whisper_consumed(self, whisper_id: int) -> None:
+        async with self._pool().acquire() as c:
+            await c.execute('UPDATE whispers SET consumed=TRUE WHERE id=$1', int(whisper_id))
 
     async def set_donation_broadcast_counts(self, donation_id: int, sent: int, failed: int) -> None:
         async with self._pool().acquire() as c:

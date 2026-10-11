@@ -81,9 +81,32 @@ CREATE TABLE IF NOT EXISTS group_settings (
   welcome_enabled BOOLEAN NOT NULL DEFAULT TRUE,
   welcome_text TEXT,
   security JSONB NOT NULL DEFAULT '{}'::jsonb,
-  warn_limit INTEGER NOT NULL DEFAULT 3,
+  moderation JSONB NOT NULL DEFAULT '{}'::jsonb,
+  warn_limit INTEGER NOT NULL DEFAULT 5,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE TABLE IF NOT EXISTS warn_logs (
+  id BIGSERIAL PRIMARY KEY,
+  chat_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  message_id BIGINT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS warn_logs_chat_user_idx ON warn_logs (chat_id, user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS warn_logs_chat_idx ON warn_logs (chat_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS punish_logs (
+  id BIGSERIAL PRIMARY KEY,
+  chat_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  punish_type TEXT NOT NULL,
+  duration_sec INTEGER,
+  warns_at INTEGER NOT NULL DEFAULT 0,
+  success BOOLEAN NOT NULL DEFAULT FALSE,
+  detail TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS punish_logs_chat_idx ON punish_logs (chat_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS group_vips (
   chat_id BIGINT NOT NULL,
   user_id BIGINT NOT NULL,
@@ -174,6 +197,7 @@ class Database:
             await conn.execute(SCHEMA)
             # Lightweight migrations for tables created before new columns existed
             await conn.execute("ALTER TABLE whispers ADD COLUMN IF NOT EXISTS sender_name TEXT NOT NULL DEFAULT ''")
+            await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS moderation JSONB NOT NULL DEFAULT '{}'::jsonb")
             await conn.execute("INSERT INTO settings(key,value) VALUES('about', to_jsonb($1::text)) ON CONFLICT(key) DO NOTHING", "MEGA BOT یک ربات اجتماعی برای بله است.")
             await conn.execute("INSERT INTO settings(key,value) VALUES('donations_total', '0'::jsonb) ON CONFLICT(key) DO NOTHING")
             defaults = {
@@ -532,18 +556,34 @@ class Database:
         'antiflood': False, 'antiprofane': False, 'antiphoto': False, 'antivideo': False,
         'antivoice': False, 'antiaudio': False, 'antigif': False, 'antisticker': False,
         'antidoc': False, 'anticontact': False,
+        'antiforward': False, 'antimention': False, 'antipoll': False, 'antilong': False,
+    }
+
+    DEFAULT_MODERATION = {
+        'warn_limit': 5,
+        'warn_ttl_hours': 0,          # 0 = permanent until cleared
+        'punish_type': 'mute',        # mute | kick | ban | warn_only
+        'punish_duration_sec': 3600,  # for mute
+        'reset_warns_on_punish': True,
+        'auto_punish': True,
+        'flood_count': 6,
+        'flood_window_sec': 8,
+        'long_msg_chars': 800,
+        'mention_limit': 5,
     }
 
     async def get_group_settings(self, chat_id: int) -> dict:
         async with self._pool().acquire() as c:
             row = await c.fetchrow('SELECT * FROM group_settings WHERE chat_id=$1', int(chat_id))
         if not row:
+            mod = dict(self.DEFAULT_MODERATION)
             return {
                 'chat_id': int(chat_id),
                 'welcome_enabled': True,
                 'welcome_text': None,
                 'security': dict(self.DEFAULT_SECURITY),
-                'warn_limit': 3,
+                'moderation': mod,
+                'warn_limit': int(mod['warn_limit']),
             }
         d = dict(row)
         sec = d.get('security') or {}
@@ -552,6 +592,16 @@ class Database:
         merged = dict(self.DEFAULT_SECURITY)
         merged.update(sec)
         d['security'] = merged
+        mod = d.get('moderation') or {}
+        if not isinstance(mod, dict):
+            mod = {}
+        mmerged = dict(self.DEFAULT_MODERATION)
+        mmerged.update(mod)
+        # keep warn_limit column in sync as source of truth if set
+        if d.get('warn_limit') is not None:
+            mmerged['warn_limit'] = int(d['warn_limit'])
+        d['moderation'] = mmerged
+        d['warn_limit'] = int(mmerged['warn_limit'])
         return d
 
     async def set_group_setting_fields(self, chat_id: int, **fields) -> None:
@@ -559,18 +609,24 @@ class Database:
         welcome_enabled = fields.get('welcome_enabled', gs['welcome_enabled'])
         welcome_text = fields.get('welcome_text', gs.get('welcome_text'))
         security = fields.get('security', gs.get('security') or self.DEFAULT_SECURITY)
-        warn_limit = fields.get('warn_limit', gs.get('warn_limit', 3))
+        moderation = fields.get('moderation', gs.get('moderation') or self.DEFAULT_MODERATION)
+        if not isinstance(moderation, dict):
+            moderation = dict(self.DEFAULT_MODERATION)
+        warn_limit = int(fields.get('warn_limit', moderation.get('warn_limit', gs.get('warn_limit', 5))))
+        moderation = dict(moderation)
+        moderation['warn_limit'] = warn_limit
         async with self._pool().acquire() as c:
             await c.execute(
-                """INSERT INTO group_settings(chat_id,welcome_enabled,welcome_text,security,warn_limit,updated_at)
-                   VALUES($1,$2,$3,$4,$5,NOW())
+                """INSERT INTO group_settings(chat_id,welcome_enabled,welcome_text,security,moderation,warn_limit,updated_at)
+                   VALUES($1,$2,$3,$4,$5,$6,NOW())
                    ON CONFLICT(chat_id) DO UPDATE SET
                      welcome_enabled=EXCLUDED.welcome_enabled,
                      welcome_text=EXCLUDED.welcome_text,
                      security=EXCLUDED.security,
+                     moderation=EXCLUDED.moderation,
                      warn_limit=EXCLUDED.warn_limit,
                      updated_at=NOW()""",
-                int(chat_id), bool(welcome_enabled), welcome_text, security, int(warn_limit),
+                int(chat_id), bool(welcome_enabled), welcome_text, security, moderation, int(warn_limit),
             )
 
     async def toggle_security(self, chat_id: int, key: str) -> bool:
@@ -581,6 +637,16 @@ class Database:
         sec[key] = not bool(sec.get(key))
         await self.set_group_setting_fields(chat_id, security=sec)
         return bool(sec[key])
+
+    async def update_moderation(self, chat_id: int, **patch) -> dict:
+        gs = await self.get_group_settings(chat_id)
+        mod = dict(gs.get('moderation') or self.DEFAULT_MODERATION)
+        for k, v in patch.items():
+            if k in self.DEFAULT_MODERATION:
+                mod[k] = v
+        warn_limit = int(mod.get('warn_limit', 5))
+        await self.set_group_setting_fields(chat_id, moderation=mod, warn_limit=warn_limit)
+        return mod
 
     # ── VIP ─────────────────────────────────────────────────────────────
 
@@ -711,14 +777,19 @@ class Database:
 
     # ── Warns ───────────────────────────────────────────────────────────
 
-    async def add_warn(self, chat_id: int, user_id: int) -> int:
+    async def add_warn(self, chat_id: int, user_id: int, reason: str = '', message_id: int | None = None) -> int:
         async with self._pool().acquire() as c:
-            row = await c.fetchrow(
-                """INSERT INTO group_warns(chat_id,user_id,warn_count,updated_at) VALUES($1,$2,1,NOW())
-                   ON CONFLICT(chat_id,user_id) DO UPDATE SET warn_count=group_warns.warn_count+1, updated_at=NOW()
-                   RETURNING warn_count""",
-                int(chat_id), int(user_id),
-            )
+            async with c.transaction():
+                row = await c.fetchrow(
+                    """INSERT INTO group_warns(chat_id,user_id,warn_count,updated_at) VALUES($1,$2,1,NOW())
+                       ON CONFLICT(chat_id,user_id) DO UPDATE SET warn_count=group_warns.warn_count+1, updated_at=NOW()
+                       RETURNING warn_count""",
+                    int(chat_id), int(user_id),
+                )
+                await c.execute(
+                    """INSERT INTO warn_logs(chat_id,user_id,reason,message_id) VALUES($1,$2,$3,$4)""",
+                    int(chat_id), int(user_id), (reason or '')[:200], message_id,
+                )
         return int(row['warn_count']) if row else 1
 
     async def get_warns(self, chat_id: int, user_id: int) -> int:
@@ -727,6 +798,100 @@ class Database:
                 'SELECT warn_count FROM group_warns WHERE chat_id=$1 AND user_id=$2',
                 int(chat_id), int(user_id),
             ) or 0)
+
+    async def set_warns(self, chat_id: int, user_id: int, count: int) -> int:
+        count = max(0, int(count))
+        async with self._pool().acquire() as c:
+            if count == 0:
+                await c.execute('DELETE FROM group_warns WHERE chat_id=$1 AND user_id=$2', int(chat_id), int(user_id))
+                return 0
+            row = await c.fetchrow(
+                """INSERT INTO group_warns(chat_id,user_id,warn_count,updated_at) VALUES($1,$2,$3,NOW())
+                   ON CONFLICT(chat_id,user_id) DO UPDATE SET warn_count=$3, updated_at=NOW()
+                   RETURNING warn_count""",
+                int(chat_id), int(user_id), count,
+            )
+        return int(row['warn_count']) if row else count
+
+    async def clear_warns(self, chat_id: int, user_id: int) -> None:
+        await self.set_warns(chat_id, user_id, 0)
+
+    async def list_warned_users(self, chat_id: int, limit: int = 15, offset: int = 0) -> list[dict]:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                """SELECT w.user_id, w.warn_count, w.updated_at, u.first_name, u.username
+                   FROM group_warns w LEFT JOIN users u ON u.user_id=w.user_id
+                   WHERE w.chat_id=$1 AND w.warn_count>0
+                   ORDER BY w.warn_count DESC, w.updated_at DESC
+                   LIMIT $2 OFFSET $3""",
+                int(chat_id), limit, offset,
+            )
+        return [dict(r) for r in rows]
+
+    async def count_warned_users(self, chat_id: int) -> int:
+        async with self._pool().acquire() as c:
+            return int(await c.fetchval(
+                'SELECT COUNT(*) FROM group_warns WHERE chat_id=$1 AND warn_count>0', int(chat_id),
+            ) or 0)
+
+    async def list_warn_logs(self, chat_id: int, user_id: int | None = None, limit: int = 20) -> list[dict]:
+        async with self._pool().acquire() as c:
+            if user_id is not None:
+                rows = await c.fetch(
+                    """SELECT id, chat_id, user_id, reason, message_id, created_at
+                       FROM warn_logs WHERE chat_id=$1 AND user_id=$2
+                       ORDER BY created_at DESC LIMIT $3""",
+                    int(chat_id), int(user_id), limit,
+                )
+            else:
+                rows = await c.fetch(
+                    """SELECT id, chat_id, user_id, reason, message_id, created_at
+                       FROM warn_logs WHERE chat_id=$1
+                       ORDER BY created_at DESC LIMIT $2""",
+                    int(chat_id), limit,
+                )
+        return [dict(r) for r in rows]
+
+    async def expire_warns(self, chat_id: int, ttl_hours: int) -> int:
+        """Zero warn counters whose updated_at is older than ttl_hours. Returns affected rows."""
+        if ttl_hours <= 0:
+            return 0
+        async with self._pool().acquire() as c:
+            result = await c.execute(
+                """UPDATE group_warns SET warn_count=0, updated_at=NOW()
+                   WHERE chat_id=$1 AND warn_count>0
+                     AND updated_at < NOW() - ($2 || ' hours')::interval""",
+                int(chat_id), str(int(ttl_hours)),
+            )
+        try:
+            return int(result.split()[-1])
+        except Exception:
+            return 0
+
+    async def log_punish(
+        self, chat_id: int, user_id: int, punish_type: str, duration_sec: int | None,
+        warns_at: int, success: bool, detail: str = '',
+    ) -> None:
+        async with self._pool().acquire() as c:
+            await c.execute(
+                """INSERT INTO punish_logs(chat_id,user_id,punish_type,duration_sec,warns_at,success,detail)
+                   VALUES($1,$2,$3,$4,$5,$6,$7)""",
+                int(chat_id), int(user_id), punish_type, duration_sec, int(warns_at), bool(success), (detail or '')[:300],
+            )
+
+    async def list_punish_logs(self, chat_id: int, limit: int = 15) -> list[dict]:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                """SELECT p.*, u.first_name, u.username FROM punish_logs p
+                   LEFT JOIN users u ON u.user_id=p.user_id
+                   WHERE p.chat_id=$1 ORDER BY p.created_at DESC LIMIT $2""",
+                int(chat_id), limit,
+            )
+        return [dict(r) for r in rows]
+
+    async def count_warn_logs(self, chat_id: int) -> int:
+        async with self._pool().acquire() as c:
+            return int(await c.fetchval('SELECT COUNT(*) FROM warn_logs WHERE chat_id=$1', int(chat_id)) or 0)
 
     # ── Recent fun items (anti-repeat) ──────────────────────────────────
 

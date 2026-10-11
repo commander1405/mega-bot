@@ -716,10 +716,18 @@ class MegaBot:
             await self.safe_send(chat_id, f'⭐ کاربر `{tid}` ویژه این گروه شد.', reply_to=msg.get('message_id'), parse_mode=None)
             return
 
+        # ── Locks / anti-spam panel
+        if is_group and text in ('قفل', 'قفل ها', 'قفل‌ها', 'ضد اسپم', 'ضداسپم', 'پنل قفل'):
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            await self._show_locks_panel(chat_id, message_id=None)
+            return
+
         # ── Group settings panel
         if is_group and text in ('تنظیمات گروه', 'پنل گروه', 'امنیت گروه'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self.safe_send(chat_id, '⛔ فقط ادمین گروه.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
                 return
             await self._show_group_panel(chat_id, uid)
             return
@@ -1197,7 +1205,7 @@ class MegaBot:
             return
 
         # Group panel / security / VIP / learn / fun callbacks
-        if data.startswith('grp:') or data.startswith('learn:') or data.startswith('fun:'):
+        if data.startswith('grp:') or data.startswith('learn:') or data.startswith('fun:') or data.startswith('lock:'):
             await self._handle_group_callbacks(uid, chat_id, message_id, data, chat)
             return
 
@@ -1624,11 +1632,12 @@ class MegaBot:
          '• `تنظیمات گروه` — پنل مدیر گروه (خوشامد، امنیت، ویژه)\n'
          '• `خوشامدگویی متن...` — متن اختصاصی گروه\n'
          'دسترسی: ادمین همان گروه'),
-        ('🛡 امنیت گروه',
-         'از `تنظیمات گروه` → تنظیمات امنیت:\n'
-         'ضداسپم، ضدلینک، ضدتبلیغ، ضدتکرار، ضد Flood، ضد فحش،\n'
-         'ضد عکس/ویدئو/ویس/آهنگ/GIF/استیکر/فایل\n'
-         'هر گروه تنظیم مستقل دارد. نیاز به دسترسی حذف پیام برای ربات.'),
+        ('🔐 قفل‌ها و ضداسپم',
+         'دستور: `قفل` / `قفل‌ها` / `ضداسپم`\n'
+         'قفل لینک، فوروارد، رسانه، منشن انبوه، پیام بلند، Flood، اسپم و...\n'
+         'اخطار قابل تنظیم + مجازات خودکار (سکوت/اخراج/بن)\n'
+         'هر گروه تنظیم مستقل دارد. ربات باید حذف پیام و محدودسازی عضو داشته باشد.\n'
+         'دسترسی: فقط ادمین گروه'),
         ('📊 آمار گروه',
          '• `آمار` در گروه — آمار امروز همان گروه (ورود/خروج، انواع پیام، ۳ کاربر فعال)\n'
          '• آمار سراسری ربات: دکمه 📊 آمار و اطلاعات\n'
@@ -2652,13 +2661,40 @@ class MegaBot:
 
     _FLOOD_WINDOW: dict[tuple[int, int], list[float]] = {}
 
+    # Lock keys shown in panel (label, security key)
+    LOCK_LABELS: list[tuple[str, str]] = [
+        ('antispam', '🚫 ضداسپم'),
+        ('antilink', '🔗 قفل لینک'),
+        ('antirepeat', '🔁 قفل پیام تکراری'),
+        ('antimention', '📢 قفل منشن انبوه'),
+        ('antiforward', '📄 قفل فوروارد'),
+        ('antiphoto', '🖼️ قفل عکس'),
+        ('antivideo', '🎬 قفل ویدیو'),
+        ('antidoc', '📁 قفل فایل'),
+        ('antiaudio', '🎵 قفل آهنگ'),
+        ('antivoice', '🎤 قفل ویس'),
+        ('antisticker', '😀 قفل استیکر'),
+        ('antigif', '✨ قفل گیف'),
+        ('antipoll', '🗳️ قفل نظرسنجی'),
+        ('antilong', '📝 قفل پیام بلند'),
+        ('antiflood', '⚡ ضد Flood'),
+        ('antiad', '📣 ضدتبلیغ'),
+        ('antiprofane', '🤬 ضد فحش'),
+        ('anticontact', '👤 قفل مخاطب'),
+    ]
+
     async def _apply_security_filters(self, chat_id: int, uid: int, msg: dict, text: str) -> bool:
-        """Return True if message was blocked (caller should stop processing)."""
+        """Return True if message was blocked (caller should stop processing).
+
+        At most one warn is recorded per message even if multiple rules match.
+        """
         gs = await self.db.get_group_settings(chat_id)
         sec = gs.get('security') or {}
+        mod = gs.get('moderation') or {}
         mid = msg.get('message_id')
         reason = None
 
+        # Media / content locks
         if sec.get('antiphoto') and msg.get('photo'):
             reason = 'عکس'
         elif sec.get('antivideo') and msg.get('video'):
@@ -2668,74 +2704,194 @@ class MegaBot:
         elif sec.get('antiaudio') and msg.get('audio'):
             reason = 'فایل صوتی'
         elif sec.get('antigif') and msg.get('animation'):
-            reason = 'GIF'
+            reason = 'گیف'
         elif sec.get('antisticker') and msg.get('sticker'):
             reason = 'استیکر'
-        elif sec.get('antidoc') and msg.get('document'):
+        elif sec.get('antidoc') and msg.get('document') and not msg.get('animation'):
             reason = 'فایل'
         elif sec.get('anticontact') and msg.get('contact'):
             reason = 'مخاطب'
+        elif sec.get('antipoll') and msg.get('poll'):
+            reason = 'نظرسنجی'
+        elif sec.get('antiforward') and (msg.get('forward_from') or msg.get('forward_from_chat') or msg.get('forward_date') or msg.get('forward_origin')):
+            reason = 'فوروارد'
 
         body = text or (msg.get('caption') or '')
+        entities = msg.get('entities') or msg.get('caption_entities') or []
+
         if not reason and sec.get('antilink'):
-            if re.search(r'(https?://|ble\.ir/|t\.me/|telegram\.me/)', body, re.I):
+            if self._message_has_link(body, entities):
                 reason = 'لینک'
+        if not reason and sec.get('antimention'):
+            mention_limit = int(mod.get('mention_limit') or 5)
+            if self._count_mentions(body, entities) >= mention_limit:
+                reason = 'منشن انبوه'
         if not reason and sec.get('antiad'):
-            if re.search(r'(تبلیغ|کانال ما|عضویت|فالو|follow|subscribe)', body, re.I):
+            if re.search(r'(تبلیغ|کانال ما|عضویت اجباری|فالو کن|follow|subscribe)', body, re.I):
                 reason = 'تبلیغ'
         if not reason and sec.get('antiprofane'):
             extra = await self.db.get_profanity_words(chat_id)
             if contains_profanity(body, extra):
                 reason = 'فحش'
+        if not reason and sec.get('antilong'):
+            limit_chars = int(mod.get('long_msg_chars') or 800)
+            if body and len(body) > limit_chars:
+                reason = 'پیام بسیار طولانی'
         if not reason and sec.get('antiflood'):
+            window = float(mod.get('flood_window_sec') or 8)
+            limit = int(mod.get('flood_count') or 6)
             key = (chat_id, uid)
             now = time.time()
             bucket = self._FLOOD_WINDOW.setdefault(key, [])
             bucket.append(now)
-            self._FLOOD_WINDOW[key] = [t for t in bucket if now - t < 8]
-            if len(self._FLOOD_WINDOW[key]) >= 6:
+            self._FLOOD_WINDOW[key] = [t for t in bucket if now - t < window]
+            if len(self._FLOOD_WINDOW[key]) >= limit:
                 reason = 'ارسال سریع (Flood)'
         if not reason and sec.get('antirepeat') and body:
             rk = f'repeat:{chat_id}:{uid}'
             prev = self.game_cache.get(rk)
             if prev and prev.get('text') == body and (time.time() - prev.get('ts', 0)) < 30:
-                reason = 'تکرار پیام'
+                reason = 'پیام تکراری'
             self.game_cache[rk] = {'text': body, 'ts': time.time()}
         if not reason and sec.get('antispam') and body:
-            if len(body) > 800 or body.count('\n') > 12:
+            # Heavy spam heuristics (not ordinary chat)
+            if len(body) > 1200 or body.count('\n') > 20:
                 reason = 'اسپم'
+            elif len(set(body)) <= 3 and len(body) >= 30:
+                reason = 'اسپم کاراکتر تکراری'
+            elif re.search(r'(.)\1{12,}', body):
+                reason = 'اسپم کاراکتر تکراری'
 
         if not reason:
             return False
 
+        # Delete first
         deleted = False
-        try:
-            await self.api.delete_message(chat_id, int(mid))
-            deleted = True
+        if mid:
             try:
-                await self.db.record_bot_delete(chat_id)
+                await self.api.delete_message(chat_id, int(mid))
+                deleted = True
+                try:
+                    await self.db.record_bot_delete(chat_id)
+                except Exception:
+                    pass
+            except Exception as exc:
+                log.info('security delete failed chat=%s: %s', chat_id, type(exc).__name__)
+
+        # Expire old warns if TTL configured
+        ttl_h = int(mod.get('warn_ttl_hours') or 0)
+        if ttl_h > 0:
+            try:
+                await self.db.expire_warns(chat_id, ttl_h)
             except Exception:
                 pass
-        except Exception as exc:
-            log.info('security delete failed chat=%s: %s', chat_id, type(exc).__name__)
 
-        warns = await self.db.add_warn(chat_id, uid)
-        limit = int(gs.get('warn_limit') or 3)
-        note = f'🛡 پیام به‌خاطر «{reason}» {"حذف شد" if deleted else "شناسایی شد (حذف ممکن نشد — دسترسی ربات را بررسی کن)"}.'
-        note += f'\nاخطار: {warns}/{limit}'
+        warns = await self.db.add_warn(chat_id, uid, reason=reason, message_id=int(mid) if mid else None)
+        limit = int(mod.get('warn_limit') or gs.get('warn_limit') or 5)
+
+        if deleted:
+            note = f'⚠️ پیام متخلف حذف شد و یک اخطار ثبت شد.\nعلت: «{reason}»\nاخطار: {warns}/{limit}'
+        else:
+            note = (
+                f'❌ ربات اجازه حذف پیام را ندارد. لطفاً دسترسی‌های مدیریتی ربات را بررسی کنید.\n'
+                f'علت شناسایی‌شده: «{reason}»\nاخطار: {warns}/{limit}'
+            )
         await self.safe_send(chat_id, note, parse_mode=None)
-        await self.db.log(0, 'security_action', 'user', uid, {'chat_id': chat_id, 'reason': reason, 'deleted': deleted, 'warns': warns})
-        if warns >= limit:
-            try:
-                await self.api.restrict_chat_member(
-                    chat_id, uid,
-                    {'can_send_messages': False, 'can_send_media_messages': False,
-                     'can_send_other_messages': False, 'can_add_web_page_previews': False},
-                )
-                await self.safe_send(chat_id, '🔇 کاربر به‌خاطر اخطارهای مکرر محدود شد.', parse_mode=None)
-            except Exception as exc:
-                log.info('security mute failed: %s', type(exc).__name__)
+        try:
+            await self.db.log(0, 'security_action', 'user', uid, {
+                'chat_id': chat_id, 'reason': reason, 'deleted': deleted, 'warns': warns,
+            })
+        except Exception:
+            pass
+
+        if warns >= limit and mod.get('auto_punish', True):
+            await self._execute_auto_punish(chat_id, uid, warns, mod)
         return True
+
+    @staticmethod
+    def _message_has_link(body: str, entities: list | None) -> bool:
+        if entities:
+            for e in entities:
+                t = (e.get('type') or '').lower()
+                if t in ('url', 'text_link'):
+                    return True
+        if not body:
+            return False
+        # Real URL patterns — avoid treating "file.txt" as link
+        if re.search(r'(https?://|www\.)\S+', body, re.I):
+            return True
+        if re.search(r'(?:^|[\s(])(?:ble\.ir|t\.me|telegram\.me)/\S+', body, re.I):
+            return True
+        return False
+
+    @staticmethod
+    def _count_mentions(body: str, entities: list | None) -> int:
+        n = 0
+        if entities:
+            for e in entities:
+                t = (e.get('type') or '').lower()
+                if t in ('mention', 'text_mention'):
+                    n += 1
+        if body:
+            n = max(n, len(re.findall(r'(?<!\w)@[A-Za-z0-9_]{3,}', body)))
+        return n
+
+    async def _execute_auto_punish(self, chat_id: int, uid: int, warns: int, mod: dict) -> None:
+        """Apply configured punishment once when warn threshold is reached."""
+        ptype = (mod.get('punish_type') or 'mute').lower()
+        duration = int(mod.get('punish_duration_sec') or 3600)
+        success = False
+        detail = ''
+        try:
+            if ptype == 'warn_only':
+                await self.safe_send(chat_id, '🚨 تعداد اخطارهای کاربر به حد تعیین‌شده رسید.', parse_mode=None)
+                success = True
+                detail = 'warn_only'
+            elif ptype == 'mute':
+                until = int(time.time()) + max(60, duration) if duration > 0 else None
+                perms = {
+                    'can_send_messages': False,
+                    'can_send_media_messages': False,
+                    'can_send_other_messages': False,
+                    'can_add_web_page_previews': False,
+                }
+                await self.api.restrict_chat_member(chat_id, uid, perms, until_date=until)
+                mins = max(1, duration // 60)
+                await self.safe_send(
+                    chat_id,
+                    f'🚨 تعداد اخطارها به حد رسید.\n🤐 کاربر طبق تنظیمات گروه برای حدود {mins} دقیقه سکوت شد.',
+                    parse_mode=None,
+                )
+                success = True
+            elif ptype == 'kick':
+                # Temporary ban then unban = kick (can rejoin)
+                await self.api.ban_chat_member(chat_id, uid, int(time.time()) + 45)
+                await self.api.unban_chat_member(chat_id, uid)
+                await self.safe_send(chat_id, '🚨 تعداد اخطارها به حد رسید.\n👢 کاربر طبق تنظیمات گروه از گروه اخراج شد.', parse_mode=None)
+                success = True
+            elif ptype == 'ban':
+                await self.api.ban_chat_member(chat_id, uid)
+                await self.safe_send(chat_id, '🚨 تعداد اخطارها به حد رسید.\n⛔ کاربر طبق تنظیمات گروه مسدود شد.', parse_mode=None)
+                success = True
+            else:
+                detail = f'unknown type {ptype}'
+        except Exception as exc:
+            detail = type(exc).__name__
+            log.info('auto_punish failed chat=%s uid=%s type=%s: %s', chat_id, uid, ptype, detail)
+            await self.safe_send(
+                chat_id,
+                '❌ اجرای مجازات ممکن نشد؛ تنظیمات و دسترسی‌های ربات را بررسی کنید.',
+                parse_mode=None,
+            )
+        try:
+            await self.db.log_punish(chat_id, uid, ptype, duration if ptype == 'mute' else None, warns, success, detail)
+        except Exception:
+            pass
+        if success and mod.get('reset_warns_on_punish', True) and ptype != 'warn_only':
+            try:
+                await self.db.clear_warns(chat_id, uid)
+            except Exception:
+                pass
 
     async def _handle_fun(self, chat_id: int, kind: str, msg: dict) -> None:
         import hashlib
@@ -2806,7 +2962,7 @@ class MegaBot:
             f"متن سفارشی: {'دارد' if gs.get('welcome_text') else 'پیش‌فرض'}\n"
             f"سقف اخطار: {gs.get('warn_limit', 3)}",
             inline([
-                [('🛡 تنظیمات امنیت', 'grp:sec'), ('⭐ لیست ویژه‌ها', 'grp:vips:0')],
+                [('🔐 قفل‌ها و ضداسپم', 'lock:panel'), ('⭐ لیست ویژه‌ها', 'grp:vips:0')],
                 [('🟢/🔴 خوشامد', 'grp:welcome_toggle'), ('📝 راهنمای خوشامد', 'grp:welcome_help')],
                 [('🧠 لیست یادگیری', 'learn:list:0'), ('✖️ بستن', 'close')],
             ]),
@@ -2966,14 +3122,105 @@ class MegaBot:
         if data == 'grp:panel':
             await self._show_group_panel(chat_id, uid)
             return
-        if data == 'grp:sec':
-            await self.safe_edit(chat_id, message_id, '*🛡 تنظیمات امنیت گروه*\n🟢 روشن / 🔴 خاموش — روی هر مورد بزن تا عوض شود.', await self._security_keyboard(chat_id))
+        if data == 'grp:sec' or data == 'lock:panel':
+            await self._show_locks_panel(chat_id, message_id=message_id)
             return
-        if data.startswith('grp:sectog:'):
-            key = data.split(':', 2)[2]
+        if data.startswith('grp:sectog:') or data.startswith('lock:tog:'):
+            key = data.rsplit(':', 1)[-1]
+            if key not in self.db.DEFAULT_SECURITY:
+                await self.safe_send(chat_id, '❌ قفل نامعتبر.', parse_mode=None)
+                return
             new_state = await self.db.toggle_security(chat_id, key)
-            mark = '🟢 روشن' if new_state else '🔴 خاموش'
-            await self.safe_edit(chat_id, message_id, f'*🛡 تنظیمات امنیت*\n«{key}» الان {mark} است.', await self._security_keyboard(chat_id))
+            label = next((t for k, t in self.LOCK_LABELS if k == key), key)
+            mark = 'فعال شد ✅' if new_state else 'غیرفعال شد 🔓'
+            await self._show_locks_panel(
+                chat_id,
+                message_id=message_id,
+                header=f'🔐 پنل قفل‌های گروه\n{label}: {mark}',
+            )
+            return
+        if data == 'lock:refresh':
+            await self._show_locks_panel(chat_id, message_id=message_id, header='🔐 پنل قفل‌های گروه (به‌روز شد)')
+            return
+        if data == 'lock:warncfg':
+            await self._show_warn_config(chat_id, message_id)
+            return
+        if data == 'lock:punishcfg':
+            await self._show_punish_config(chat_id, message_id)
+            return
+        if data == 'lock:stats':
+            await self._show_lock_stats(chat_id, message_id)
+            return
+        if data == 'lock:warns':
+            await self._show_warned_users(chat_id, message_id, 0)
+            return
+        if data.startswith('lock:warns:'):
+            try:
+                page = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                page = 0
+            await self._show_warned_users(chat_id, message_id, page)
+            return
+        if data.startswith('lock:clearwarn:'):
+            try:
+                tid = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                return
+            await self.db.clear_warns(chat_id, tid)
+            await self.safe_send(chat_id, f'✅ اخطارهای کاربر `{tid}` صفر شد.', parse_mode=None)
+            await self._show_warned_users(chat_id, message_id, 0)
+            return
+        if data.startswith('lock:setlimit:'):
+            try:
+                n = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                return
+            if n < 1 or n > 50:
+                await self.safe_send(chat_id, '❌ عدد اخطار باید بین ۱ تا ۵۰ باشد.', parse_mode=None)
+                return
+            await self.db.update_moderation(chat_id, warn_limit=n)
+            await self._show_warn_config(chat_id, message_id)
+            return
+        if data.startswith('lock:setttl:'):
+            try:
+                h = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                return
+            if h < 0 or h > 8760:
+                await self.safe_send(chat_id, '❌ مدت اعتبار نامعتبر است.', parse_mode=None)
+                return
+            await self.db.update_moderation(chat_id, warn_ttl_hours=h)
+            await self._show_warn_config(chat_id, message_id)
+            return
+        if data.startswith('lock:ptype:'):
+            ptype = data.rsplit(':', 1)[1]
+            if ptype not in ('mute', 'kick', 'ban', 'warn_only'):
+                return
+            await self.db.update_moderation(chat_id, punish_type=ptype)
+            await self._show_punish_config(chat_id, message_id)
+            return
+        if data.startswith('lock:pdur:'):
+            try:
+                sec = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                return
+            if sec < 60 or sec > 604800:
+                await self.safe_send(chat_id, '❌ مدت سکوت باید بین ۱ دقیقه تا ۷ روز باشد.', parse_mode=None)
+                return
+            await self.db.update_moderation(chat_id, punish_duration_sec=sec)
+            await self._show_punish_config(chat_id, message_id)
+            return
+        if data == 'lock:toggle_auto':
+            gs = await self.db.get_group_settings(chat_id)
+            mod = gs.get('moderation') or {}
+            await self.db.update_moderation(chat_id, auto_punish=not mod.get('auto_punish', True))
+            await self._show_punish_config(chat_id, message_id)
+            return
+        if data == 'lock:toggle_reset':
+            gs = await self.db.get_group_settings(chat_id)
+            mod = gs.get('moderation') or {}
+            await self.db.update_moderation(chat_id, reset_warns_on_punish=not mod.get('reset_warns_on_punish', True))
+            await self._show_punish_config(chat_id, message_id)
             return
         if data == 'grp:welcome_toggle':
             gs = await self.db.get_group_settings(chat_id)
@@ -3005,23 +3252,152 @@ class MegaBot:
             return
 
     async def _security_keyboard(self, chat_id: int) -> dict:
+        """Backward-compatible alias for locks panel keyboard."""
+        return await self._locks_keyboard(chat_id)
 
+    async def _locks_keyboard(self, chat_id: int) -> dict:
         gs = await self.db.get_group_settings(chat_id)
         sec = gs.get('security') or {}
-        labels = [
-            ('antispam', 'ضداسپم'), ('antilink', 'ضدلینک'), ('antiad', 'ضدتبلیغ'),
-            ('antirepeat', 'ضدتکرار'), ('antiflood', 'ضد Flood'), ('antiprofane', 'ضد فحش'),
-            ('antiphoto', 'ضد عکس'), ('antivideo', 'ضد ویدئو'), ('antivoice', 'ضد ویس'),
-            ('antiaudio', 'ضد آهنگ'), ('antigif', 'ضد GIF'), ('antisticker', 'ضد استیکر'),
-            ('antidoc', 'ضد فایل'), ('anticontact', 'ضد مخاطب'),
-        ]
         rows = []
-        for key, title in labels:
+        # pair buttons two-per-row where possible
+        pair: list = []
+        for key, title in self.LOCK_LABELS:
             on = bool(sec.get(key))
             mark = '🟢' if on else '🔴'
-            rows.append([(f'{mark} {title}', f'grp:sectog:{key}')])
-        rows.append([('↩️ برگشت', 'grp:panel'), ('✖️ بستن', 'close')])
+            pair.append((f'{mark} {title}', f'lock:tog:{key}'))
+            if len(pair) == 2:
+                rows.append(pair)
+                pair = []
+        if pair:
+            rows.append(pair)
+        rows.append([
+            ('⚙️ تنظیمات اخطار', 'lock:warncfg'),
+            ('⚖️ تنظیم مجازات', 'lock:punishcfg'),
+        ])
+        rows.append([
+            ('📊 آمار تخلفات', 'lock:stats'),
+            ('👥 اخطار کاربران', 'lock:warns'),
+        ])
+        rows.append([
+            ('🔄 تازه‌سازی', 'lock:refresh'),
+            ('🔙 بازگشت', 'grp:panel'),
+        ])
+        rows.append([('✖️ بستن', 'close')])
         return inline(rows)
+
+    async def _show_locks_panel(self, chat_id: int, message_id: int | None = None, header: str | None = None) -> None:
+        gs = await self.db.get_group_settings(chat_id)
+        mod = gs.get('moderation') or {}
+        ptype_fa = {
+            'mute': 'سکوت', 'kick': 'اخراج', 'ban': 'مسدود', 'warn_only': 'فقط اخطار',
+        }.get(mod.get('punish_type', 'mute'), 'سکوت')
+        text = header or '🔐 مدیریت قفل‌های گروه'
+        text += (
+            f"\n\nآستانه اخطار: *{mod.get('warn_limit', 5)}*"
+            f"\nمجازات: *{ptype_fa}*"
+            f"\nخودکار: *{'روشن' if mod.get('auto_punish', True) else 'خاموش'}*"
+            f"\n\nروی هر قفل بزن تا روشن/خاموش شود."
+        )
+        kb = await self._locks_keyboard(chat_id)
+        if message_id:
+            await self.safe_edit(chat_id, message_id, text, kb)
+        else:
+            await self.safe_send(chat_id, text, kb)
+
+    async def _show_warn_config(self, chat_id: int, message_id: int) -> None:
+        gs = await self.db.get_group_settings(chat_id)
+        mod = gs.get('moderation') or {}
+        ttl = int(mod.get('warn_ttl_hours') or 0)
+        ttl_s = 'دائمی' if ttl <= 0 else f'{ttl} ساعت'
+        text = (
+            f"⚙️ *تنظیمات اخطار*\n"
+            f"آستانه مجازات: *{mod.get('warn_limit', 5)}*\n"
+            f"اعتبار اخطار: *{ttl_s}*\n\n"
+            f"آستانه را انتخاب کن:"
+        )
+        kb = inline([
+            [('۳', 'lock:setlimit:3'), ('۵', 'lock:setlimit:5'), ('۷', 'lock:setlimit:7'), ('۱۰', 'lock:setlimit:10')],
+            [('دائمی', 'lock:setttl:0'), ('۲۴س', 'lock:setttl:24'), ('۷روز', 'lock:setttl:168')],
+            [('🔙 بازگشت به قفل‌ها', 'lock:panel'), ('✖️ بستن', 'close')],
+        ])
+        await self.safe_edit(chat_id, message_id, text, kb)
+
+    async def _show_punish_config(self, chat_id: int, message_id: int) -> None:
+        gs = await self.db.get_group_settings(chat_id)
+        mod = gs.get('moderation') or {}
+        ptype = mod.get('punish_type', 'mute')
+        dur = int(mod.get('punish_duration_sec') or 3600)
+        auto = '🟢' if mod.get('auto_punish', True) else '🔴'
+        reset = '🟢' if mod.get('reset_warns_on_punish', True) else '🔴'
+        text = (
+            f"⚖️ *تنظیم مجازات*\n"
+            f"نوع فعلی: *{ptype}*\n"
+            f"مدت سکوت: *{max(1, dur // 60)} دقیقه*\n"
+            f"مجازات خودکار: {auto}\n"
+            f"صفر شدن اخطار بعد مجازات: {reset}\n\n"
+            f"نکته: Kick = اخراج موقت (می‌تواند دوباره عضو شود). Ban = مسدود دائمی."
+        )
+        kb = inline([
+            [('🤐 سکوت', 'lock:ptype:mute'), ('👢 اخراج', 'lock:ptype:kick')],
+            [('⛔ مسدود', 'lock:ptype:ban'), ('⚠️ فقط اخطار', 'lock:ptype:warn_only')],
+            [('۱۰د', 'lock:pdur:600'), ('۳۰د', 'lock:pdur:1800'), ('۱س', 'lock:pdur:3600'), ('۲۴س', 'lock:pdur:86400')],
+            [(f'{auto} مجازات خودکار', 'lock:toggle_auto'), (f'{reset} صفر اخطار', 'lock:toggle_reset')],
+            [('🔙 بازگشت به قفل‌ها', 'lock:panel'), ('✖️ بستن', 'close')],
+        ])
+        await self.safe_edit(chat_id, message_id, text, kb)
+
+    async def _show_lock_stats(self, chat_id: int, message_id: int) -> None:
+        try:
+            warned = await self.db.count_warned_users(chat_id)
+            logs_n = await self.db.count_warn_logs(chat_id)
+            recent = await self.db.list_warn_logs(chat_id, limit=8)
+            punishes = await self.db.list_punish_logs(chat_id, limit=5)
+        except Exception:
+            log.exception('lock stats failed')
+            await self.safe_edit(chat_id, message_id, '❌ دریافت آمار ممکن نشد.', inline([[('🔙 بازگشت', 'lock:panel')]]))
+            return
+        lines = [
+            f'📊 *آمار تخلفات این گروه*',
+            f'کاربران دارای اخطار: *{warned}*',
+            f'کل اخطارهای ثبت‌شده: *{logs_n}*',
+            '',
+            '*آخرین تخلفات:*',
+        ]
+        if recent:
+            for r in recent:
+                lines.append(f"• `{r['user_id']}` — {r.get('reason') or '—'} — {str(r.get('created_at') or '')[:16]}")
+        else:
+            lines.append('موردی نیست.')
+        if punishes:
+            lines.append('\n*آخرین مجازات‌ها:*')
+            for p in punishes:
+                ok = '✅' if p.get('success') else '❌'
+                lines.append(f"• {ok} `{p['user_id']}` — {p.get('punish_type')} — warns={p.get('warns_at')}")
+        await self.safe_edit(
+            chat_id, message_id, '\n'.join(lines),
+            inline([[('👥 اخطار کاربران', 'lock:warns'), ('🔙 بازگشت', 'lock:panel')]]),
+        )
+
+    async def _show_warned_users(self, chat_id: int, message_id: int, page: int) -> None:
+        page = max(0, page)
+        total = await self.db.count_warned_users(chat_id)
+        rows = await self.db.list_warned_users(chat_id, limit=8, offset=page * 8)
+        lines = [f'👥 *کاربران دارای اخطار* ({total})\n']
+        buttons = []
+        for r in rows:
+            name = r.get('first_name') or r.get('username') or str(r['user_id'])
+            lines.append(f"• {name} — `{r['user_id']}` — اخطار: *{r['warn_count']}*")
+            buttons.append([(f"🗑 صفر {str(name)[:12]}", f"lock:clearwarn:{r['user_id']}")])
+        nav = []
+        if page > 0:
+            nav.append(('⬅️ قبلی', f'lock:warns:{page-1}'))
+        if (page + 1) * 8 < total:
+            nav.append(('بعدی ➡️', f'lock:warns:{page+1}'))
+        if nav:
+            buttons.append(nav)
+        buttons.append([('🔙 بازگشت', 'lock:panel'), ('✖️ بستن', 'close')])
+        body = '\n'.join(lines) if rows else 'هیچ کاربری اخطار فعال ندارد.'
+        await self.safe_edit(chat_id, message_id, body, inline(buttons))
 
     async def handle_state(self, chat_id: int, uid: int, user: dict, text: str, state: dict, msg: dict) -> bool:
         step=state.get('step')

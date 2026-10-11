@@ -2056,27 +2056,58 @@ class MegaBot:
             return
 
     async def handle_donation_review(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
-        if uid != OWNER_ID:
+        if int(uid) != int(OWNER_ID):
             await self.safe_send(chat_id, '⛔ فقط مالک ربات می‌تواند درخواست حمایت مالی را تأیید کند.')
             return
         try:
-            action, raw_id = data.rsplit(':', 1)
-            donation_id = int(raw_id)
-        except (ValueError, TypeError):
+            # data = donation_review:approve:123  or  donation_review:reject:123
+            parts = data.split(':')
+            if len(parts) < 3:
+                await self.safe_edit(chat_id, message_id, '❌ داده دکمه نامعتبر است.', None)
+                return
+            action = parts[1]  # approve | reject
+            donation_id = int(parts[2])
+        except (ValueError, TypeError, IndexError):
+            await self.safe_edit(chat_id, message_id, '❌ شناسه درخواست نامعتبر است.', None)
             return
-        approve = action == 'donation_review:approve'
-        # Atomic: only a pending request can transition once.
-        donation = await self.db.review_donation(donation_id, approve, uid)
+        approve = action == 'approve'
+
+        # Immediate UI feedback so the first click never looks dead.
+        try:
+            await self.safe_edit(
+                chat_id, message_id,
+                '⏳ در حال پردازش درخواست حمایت… لطفاً صبر کن.',
+                None,
+            )
+        except Exception:
+            log.exception('donation_review: could not edit to processing state')
+
+        try:
+            donation = await self.db.review_donation(donation_id, approve, uid)
+        except Exception:
+            log.exception('review_donation failed id=%s', donation_id)
+            await self.safe_edit(
+                chat_id, message_id,
+                '❌ خطای دیتابیس هنگام بررسی درخواست. دوباره تلاش کن؛ اگر تکرار شد به لاگ سرور نگاه کن.',
+                None,
+            )
+            return
+
         if not donation:
             await self.safe_edit(chat_id, message_id, 'این درخواست قبلاً بررسی شده یا پیدا نشد.', None)
             return
-        await self.db.log(
-            uid,
-            'donation_' + ('approved' if approve else 'rejected'),
-            'donation',
-            donation_id,
-            {'amount': int(donation['amount']), 'show_name': bool(donation['show_name'])},
-        )
+
+        try:
+            await self.db.log(
+                uid,
+                'donation_' + ('approved' if approve else 'rejected'),
+                'donation',
+                donation_id,
+                {'amount': int(donation['amount']), 'show_name': bool(donation['show_name'])},
+            )
+        except Exception:
+            log.exception('donation review log failed')
+
         if not approve:
             await self.safe_edit(
                 chat_id,
@@ -2086,10 +2117,25 @@ class MegaBot:
             )
             return
 
+        # Approved — show intermediate status before potentially long broadcast
+        amount = int(donation['amount'])
+        await self.safe_edit(
+            chat_id,
+            message_id,
+            f'✅ حمایت `#{donation_id}` تأیید شد ({amount:,} تومان).\n⏳ در حال ارسال اعلام به کاربران…',
+            None,
+        )
+
         announcement = self.build_donation_announcement(donation)
         keyboard = self.donation_broadcast_keyboard()
         sent = failed = 0
-        for target_id in await self.db.private_user_ids():
+        try:
+            targets = await self.db.private_user_ids()
+        except Exception:
+            log.exception('private_user_ids failed')
+            targets = []
+
+        for target_id in targets:
             try:
                 await self.api.send_message(
                     target_id,
@@ -2100,14 +2146,22 @@ class MegaBot:
                 sent += 1
             except Exception as exc:
                 failed += 1
-                log.debug('Donation announcement DM failed for %s: %s', target_id, exc)
-            if (sent + failed) % 20 == 0:
-                await asyncio.sleep(0.5)
-        await self.db.set_donation_broadcast_counts(donation_id, sent, failed)
+                log.debug('Donation announcement DM failed for %s: %s', target_id, type(exc).__name__)
+            # light yield only; no long cooldown
+            if (sent + failed) % 30 == 0:
+                await asyncio.sleep(0.05)
+
+        try:
+            await self.db.set_donation_broadcast_counts(donation_id, sent, failed)
+        except Exception:
+            log.exception('set_donation_broadcast_counts failed')
+
         await self.safe_edit(
             chat_id,
             message_id,
-            f'✅ حمایت `#{donation_id}` تأیید شد.\nمبلغ {int(donation["amount"]):,} تومان به آمار اضافه شد.\nارسال خصوصی: {sent} موفق، {failed} ناموفق.',
+            f'✅ حمایت `#{donation_id}` تأیید شد.\n'
+            f'مبلغ {amount:,} تومان به آمار اضافه شد.\n'
+            f'ارسال خصوصی: {sent} موفق، {failed} ناموفق.',
             None,
         )
         # Always notify the donor on successful approval.
@@ -2118,7 +2172,7 @@ class MegaBot:
                 USER_KEYBOARD,
             )
         except Exception as exc:
-            log.debug('Donor success notice failed for %s: %s', donation.get('user_id'), exc)
+            log.debug('Donor success notice failed for %s: %s', donation.get('user_id'), type(exc).__name__)
 
     def stats_text(self, s: dict) -> str:
         return (f"*📊 آمار MEGA BOT*\n\n*👤 کل کاربران:* {s['users']}\n*🆕 کاربران جدید امروز:* {s['new_today']}\n"

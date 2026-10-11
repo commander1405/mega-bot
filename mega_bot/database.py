@@ -112,7 +112,26 @@ CREATE TABLE IF NOT EXISTS punish_logs (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS punish_logs_chat_idx ON punish_logs (chat_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS group_lock_schedules (
+  id BIGSERIAL PRIMARY KEY,
+  chat_id BIGINT NOT NULL,
+  start_hm TEXT NOT NULL,
+  end_hm TEXT NOT NULL,
+  days JSONB NOT NULL DEFAULT '[]'::jsonb,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  valid_from DATE,
+  valid_until DATE,
+  timezone TEXT NOT NULL DEFAULT 'Asia/Tehran',
+  is_active_now BOOLEAN NOT NULL DEFAULT FALSE,
+  last_action TEXT NOT NULL DEFAULT '',
+  last_action_at TIMESTAMPTZ,
+  created_by BIGINT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS group_lock_schedules_chat_idx ON group_lock_schedules (chat_id, enabled);
 CREATE TABLE IF NOT EXISTS group_vips (
+
   chat_id BIGINT NOT NULL,
   user_id BIGINT NOT NULL,
   added_by BIGINT,
@@ -587,6 +606,8 @@ class Database:
         'join_restrict_action': 'kick',    # kick | warn
         'join_window_start': 0,            # unix ts of active window (0 = none)
         'join_window_count': 0,            # joins counted in current window
+        'manual_group_lock': False,
+        'schedule_group_lock': False,
     }
 
     async def get_group_settings(self, chat_id: int) -> dict:
@@ -999,3 +1020,102 @@ class Database:
         async with self._pool().acquire() as c:
             rows = await c.fetch('SELECT word FROM group_profanity_words WHERE chat_id=$1', int(chat_id))
         return [r['word'] for r in rows]
+
+    # ── Scheduled group locks ───────────────────────────────────────────
+
+    async def create_lock_schedule(
+        self,
+        chat_id: int,
+        start_hm: str,
+        end_hm: str,
+        days: list,
+        *,
+        enabled: bool = True,
+        valid_from=None,
+        valid_until=None,
+        timezone: str = 'Asia/Tehran',
+        created_by: int | None = None,
+    ) -> dict:
+        import json
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow(
+                """INSERT INTO group_lock_schedules
+                   (chat_id, start_hm, end_hm, days, enabled, valid_from, valid_until, timezone, created_by)
+                   VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9)
+                   RETURNING *""",
+                int(chat_id), start_hm, end_hm, json.dumps(list(days)),
+                bool(enabled), valid_from, valid_until, timezone or 'Asia/Tehran', created_by,
+            )
+        return dict(row)
+
+    async def list_lock_schedules(self, chat_id: int) -> list[dict]:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                'SELECT * FROM group_lock_schedules WHERE chat_id=$1 ORDER BY id',
+                int(chat_id),
+            )
+        return [dict(r) for r in rows]
+
+    async def get_lock_schedule(self, schedule_id: int) -> dict | None:
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow('SELECT * FROM group_lock_schedules WHERE id=$1', int(schedule_id))
+        return dict(row) if row else None
+
+    async def update_lock_schedule(self, schedule_id: int, **fields) -> dict | None:
+        import json
+        allowed = {
+            'start_hm', 'end_hm', 'days', 'enabled', 'valid_from', 'valid_until',
+            'timezone', 'is_active_now', 'last_action', 'last_action_at',
+        }
+        sets = []
+        vals = []
+        i = 1
+        for k, v in fields.items():
+            if k not in allowed:
+                continue
+            if k == 'days':
+                v = json.dumps(list(v))
+                sets.append(f'{k}=${i}::jsonb')
+            else:
+                sets.append(f'{k}=${i}')
+            vals.append(v)
+            i += 1
+        if not sets:
+            return await self.get_lock_schedule(schedule_id)
+        sets.append('updated_at=NOW()')
+        vals.append(int(schedule_id))
+        sql = f"UPDATE group_lock_schedules SET {', '.join(sets)} WHERE id=${i} RETURNING *"
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow(sql, *vals)
+        return dict(row) if row else None
+
+    async def delete_lock_schedule(self, schedule_id: int, chat_id: int | None = None) -> bool:
+        async with self._pool().acquire() as c:
+            if chat_id is not None:
+                result = await c.execute(
+                    'DELETE FROM group_lock_schedules WHERE id=$1 AND chat_id=$2',
+                    int(schedule_id), int(chat_id),
+                )
+            else:
+                result = await c.execute(
+                    'DELETE FROM group_lock_schedules WHERE id=$1',
+                    int(schedule_id),
+                )
+        try:
+            return int(result.split()[-1]) > 0
+        except Exception:
+            return False
+
+    async def list_enabled_lock_schedules(self) -> list[dict]:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                'SELECT * FROM group_lock_schedules WHERE enabled=TRUE ORDER BY chat_id, id'
+            )
+        return [dict(r) for r in rows]
+
+    async def any_schedule_active_for_chat(self, chat_id: int) -> bool:
+        async with self._pool().acquire() as c:
+            return bool(await c.fetchval(
+                'SELECT 1 FROM group_lock_schedules WHERE chat_id=$1 AND enabled=TRUE AND is_active_now=TRUE LIMIT 1',
+                int(chat_id),
+            ))

@@ -1,8 +1,9 @@
 from __future__ import annotations
 import asyncio, json, logging, random, re, secrets, string, time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 from .bale_api import BaleAPI, BaleAPIError
 from .database import Database
 from .media_tools import convert_media, MAX_INPUT_BYTES
@@ -10,6 +11,7 @@ from .keyboards import USER_KEYBOARD, inline, menu_page, main_admin_menu, user_a
 from . import prices as price_mod
 from . import fun_content
 from .profanity import contains_profanity
+from . import schedule_lock as schlock
 from config import OWNER_ID, BOT_VERSION, SUPPORT_TEXT, DONATION_TEXT
 
 log = logging.getLogger(__name__)
@@ -178,6 +180,11 @@ class MegaBot:
 
     async def run(self, poll_timeout: int = 25) -> None:
         await self._startup_checks()
+        # Single background scheduler for timed group locks (not per-group tasks).
+        if not getattr(self, '_sched_task', None) or self._sched_task.done():
+            self._sched_task = asyncio.create_task(self._schedule_lock_loop(), name='group-lock-sched')
+            self._bg_tasks.add(self._sched_task)
+            self._sched_task.add_done_callback(self._bg_tasks.discard)
         log.info('MEGA BOT polling started (target host tapi.bale.ai)')
         backoff = 1.0
         while True:
@@ -1181,6 +1188,9 @@ class MegaBot:
         # Group panel / security / VIP / learn / fun callbacks
         if data.startswith('purge:'):
             await self._handle_purge_callback(uid, chat_id, message_id, data)
+            return
+        if data == 'lock:sch' or data.startswith('sch:'):
+            await self._handle_schedule_callback(uid, chat_id, message_id, data)
             return
         if (
             data.startswith('grp:') or data.startswith('learn:') or data.startswith('fun:')
@@ -3873,6 +3883,9 @@ class MegaBot:
         if data == 'lock:joincfg':
             await self._show_join_restrict_config(chat_id, message_id)
             return
+        if data == 'lock:sch' or data.startswith('sch:'):
+            await self._handle_schedule_callback(uid, chat_id, message_id, data)
+            return
         if data.startswith('lock:joinmin:'):
             try:
                 m = int(data.rsplit(':', 1)[1])
@@ -4178,9 +4191,10 @@ class MegaBot:
         ])
         rows.append([
             ('🚷 تنظیم محدودیت عضویت', 'lock:joincfg'),
-            ('📊 آمار تخلفات', 'lock:stats'),
+            ('⏰ قفل زمان‌بندی‌شده گروه', 'lock:sch'),
         ])
         rows.append([
+            ('📊 آمار تخلفات', 'lock:stats'),
             ('👥 اخطار کاربران', 'lock:warns'),
         ])
         rows.append([
@@ -4246,6 +4260,223 @@ class MegaBot:
             await self.safe_edit(chat_id, message_id, body, kb)
         else:
             await self.safe_send(chat_id, body, kb)
+
+    # ── Scheduled group lock ─────────────────────────────────────────────
+
+    async def _show_schedule_panel(self, chat_id: int, message_id: int | None = None) -> None:
+        rows = await self.db.list_lock_schedules(chat_id)
+        active_n = sum(1 for r in rows if r.get('enabled'))
+        applying = sum(1 for r in rows if r.get('is_active_now'))
+        body = (
+            f'⏰ *قفل زمان‌بندی‌شده گروه*\n\n'
+            f'می‌خوای گروه از چه ساعتی تا چه ساعتی قفل باشه؟\n\n'
+            f'تعداد برنامه: *{len(rows)}* | فعال: *{active_n}* | در حال اعمال: *{applying}*\n'
+            f'منطقه زمانی پیش‌فرض: `{schlock.DEFAULT_TZ}`\n\n'
+            f'قفل یعنی اعضای عادی نتوانند پیام بفرستند؛ مدیران همچنان می‌توانند.'
+        )
+        kb = inline([
+            [('➕ افزودن زمان‌بندی', 'sch:add'), ('📋 مشاهده زمان‌بندی‌ها', 'sch:list')],
+            [('✏️ ویرایش', 'sch:editmenu'), ('🗑 حذف', 'sch:delmenu')],
+            [('🔘 روشن/خاموش', 'sch:togmenu'), ('🔄 همگام‌سازی الان', 'sch:sync')],
+            [('🔙 بازگشت به قفل‌ها', 'lock:panel'), ('✖️ بستن', 'close')],
+        ])
+        if message_id:
+            await self.safe_edit(chat_id, message_id, body, kb)
+        else:
+            await self.safe_send(chat_id, body, kb)
+
+    async def _handle_schedule_callback(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
+        if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+            await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', parse_mode=None)
+            return
+        if data in ('lock:sch', 'sch:panel'):
+            await self._show_schedule_panel(chat_id, message_id)
+            return
+        if data == 'sch:add':
+            self.states[uid] = {'step': 'schedule_text', 'chat_id': chat_id, 'message_id': message_id}
+            guide = (
+                '⏰ زمان قفل گروه رو وارد کن.\n\n'
+                'فرمت:\n'
+                '«ساعت شروع ساعت پایان روزها»\n\n'
+                'مثال:\n'
+                '`17:00 21:00 هر روز`\n'
+                'یعنی هر روز از ساعت ۱۷:۰۰ تا ۲۱:۰۰ گروه قفل باشه.\n\n'
+                '`17:00 21:00 دو روز`\n'
+                'یعنی برای دو روز آینده (امروز و فردا).\n\n'
+                'مثال‌های دیگر:\n'
+                '`17:00 تا 21:00 هر روز`\n'
+                '`۱۷:۰۰ تا ۲۱:۰۰ دو روز`\n'
+                '`17:00 21:00 شنبه، دوشنبه، چهارشنبه`\n'
+                '`22:00 02:00 هر روز` (عبور از نیمه‌شب)\n\n'
+                'اعداد فارسی یا انگلیسی؛ «تا» اختیاری.\n'
+                'برای لغو: `لغو`'
+            )
+            await self.safe_edit(
+                chat_id, message_id, guide,
+                inline([[('❌ لغو', 'sch:panel')]]),
+            )
+            return
+        if data == 'sch:list':
+            rows = await self.db.list_lock_schedules(chat_id)
+            if not rows:
+                body = '📋 هنوز زمان‌بندی‌ای ثبت نشده.'
+            else:
+                body = '📋 *زمان‌بندی‌ها:*\n\n' + '\n'.join(schlock.format_schedule_row(r) for r in rows)
+            await self.safe_edit(
+                chat_id, message_id, body,
+                inline([[('🔙 بازگشت', 'sch:panel')]]),
+            )
+            return
+        if data in ('sch:editmenu', 'sch:delmenu', 'sch:togmenu'):
+            rows = await self.db.list_lock_schedules(chat_id)
+            if not rows:
+                await self.safe_edit(chat_id, message_id, 'ℹ️ برنامه‌ای وجود ندارد.', inline([[('🔙 بازگشت', 'sch:panel')]]))
+                return
+            action = {'sch:editmenu': 'edit', 'sch:delmenu': 'del', 'sch:togmenu': 'tog'}[data]
+            title = {'edit': '✏️ کدام را ویرایش کنم؟', 'del': '🗑 کدام را حذف کنم؟', 'tog': '🔘 روشن/خاموش کدام؟'}[action]
+            buttons = []
+            for r in rows[:20]:
+                label = schlock.format_schedule_row(r)[:40]
+                buttons.append([(label, f'sch:{action}:{r["id"]}')])
+            buttons.append([('🔙 بازگشت', 'sch:panel')])
+            await self.safe_edit(chat_id, message_id, title, inline(buttons))
+            return
+        if data.startswith('sch:del:'):
+            try:
+                sid = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                return
+            ok = await self.db.delete_lock_schedule(sid, chat_id)
+            await self.safe_send(chat_id, '✅ حذف شد.' if ok else '❌ پیدا نشد.', parse_mode=None)
+            # Recompute lock state for chat
+            await self._apply_group_lock_state(chat_id, reason='schedule_deleted')
+            await self._show_schedule_panel(chat_id, message_id)
+            return
+        if data.startswith('sch:tog:'):
+            try:
+                sid = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                return
+            row = await self.db.get_lock_schedule(sid)
+            if not row or int(row['chat_id']) != chat_id:
+                await self.safe_send(chat_id, '❌ پیدا نشد.', parse_mode=None)
+                return
+            new_en = not bool(row.get('enabled', True))
+            await self.db.update_lock_schedule(sid, enabled=new_en, is_active_now=False if not new_en else row.get('is_active_now'))
+            await self.safe_send(chat_id, '🟢 برنامه روشن شد.' if new_en else '🔴 برنامه خاموش شد.', parse_mode=None)
+            await self._apply_group_lock_state(chat_id, reason='schedule_toggle')
+            await self._show_schedule_panel(chat_id, message_id)
+            return
+        if data.startswith('sch:edit:'):
+            try:
+                sid = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                return
+            row = await self.db.get_lock_schedule(sid)
+            if not row or int(row['chat_id']) != chat_id:
+                await self.safe_send(chat_id, '❌ پیدا نشد.', parse_mode=None)
+                return
+            # Delete old + ask for new text (simple reliable edit)
+            await self.db.delete_lock_schedule(sid, chat_id)
+            self.states[uid] = {'step': 'schedule_text', 'chat_id': chat_id, 'message_id': message_id}
+            await self.safe_edit(
+                chat_id, message_id,
+                f'✏️ برنامه #{sid} حذف شد تا جایگزین شود.\nهمان فرمت افزودن را بفرست:\n`17:00 21:00 هر روز`',
+                inline([[('❌ لغو', 'sch:panel')]]),
+            )
+            return
+        if data == 'sch:sync':
+            await self._apply_group_lock_state(chat_id, reason='manual_sync')
+            await self.safe_send(chat_id, '🔄 وضعیت قفل با زمان‌بندی‌ها همگام شد.', parse_mode=None)
+            await self._show_schedule_panel(chat_id, message_id)
+            return
+
+    async def _desired_schedule_lock(self, chat_id: int) -> bool:
+        """True if any enabled schedule says the group should be locked now."""
+        rows = await self.db.list_lock_schedules(chat_id)
+        now = datetime.now(ZoneInfo(schlock.DEFAULT_TZ))
+        desired = False
+        for r in rows:
+            if not r.get('enabled', True):
+                if r.get('is_active_now'):
+                    await self.db.update_lock_schedule(int(r['id']), is_active_now=False)
+                continue
+            days = r.get('days') or []
+            if isinstance(days, str):
+                try:
+                    days = json.loads(days)
+                except Exception:
+                    days = []
+            vf = r.get('valid_from')
+            vu = r.get('valid_until')
+            should = schlock.schedule_should_lock(
+                now=now,
+                start_hm=str(r['start_hm']),
+                end_hm=str(r['end_hm']),
+                days=days,
+                valid_from=vf,
+                valid_until=vu,
+            )
+            if should != bool(r.get('is_active_now')):
+                await self.db.update_lock_schedule(
+                    int(r['id']),
+                    is_active_now=should,
+                    last_action='want_lock' if should else 'want_unlock',
+                    last_action_at=datetime.now(timezone.utc),
+                )
+            if should:
+                desired = True
+        return desired
+
+    async def _apply_group_lock_state(self, chat_id: int, reason: str = '') -> None:
+        """Compute final lock from manual + schedule; call setChatPermissions once if needed."""
+        gs = await self.db.get_group_settings(chat_id)
+        mod = dict(gs.get('moderation') or {})
+        manual = bool(mod.get('manual_group_lock'))
+        try:
+            sched = await self._desired_schedule_lock(chat_id)
+        except Exception:
+            log.exception('desired schedule lock failed chat=%s', chat_id)
+            sched = bool(mod.get('schedule_group_lock'))
+        want_lock = manual or sched
+        prev_sched = bool(mod.get('schedule_group_lock'))
+        if sched != prev_sched:
+            try:
+                await self.db.update_moderation(chat_id, schedule_group_lock=sched)
+            except Exception:
+                log.exception('update schedule_group_lock flag failed')
+
+        # If state unchanged relative to last applied schedule+manual, still try sync on manual_sync
+        try:
+            if want_lock:
+                await self.api.set_chat_permissions(chat_id, schlock.PERMS_LOCKED)
+                log.info('group LOCKED chat=%s reason=%s manual=%s sched=%s', chat_id, reason, manual, sched)
+            else:
+                await self.api.set_chat_permissions(chat_id, schlock.PERMS_OPEN)
+                log.info('group UNLOCKED chat=%s reason=%s', chat_id, reason)
+        except Exception as exc:
+            log.warning('setChatPermissions failed chat=%s reason=%s: %s', chat_id, reason, type(exc).__name__)
+            # Do not claim success
+
+    async def _schedule_lock_loop(self) -> None:
+        """One global loop: every ~30s evaluate schedules and sync permissions."""
+        await asyncio.sleep(5)
+        while True:
+            try:
+                rows = await self.db.list_enabled_lock_schedules()
+                chats = sorted({int(r['chat_id']) for r in rows})
+                # Also chats that had is_active_now but schedule disabled are handled in list_lock path
+                for cid in chats:
+                    try:
+                        await self._apply_group_lock_state(cid, reason='scheduler')
+                    except Exception:
+                        log.exception('schedule apply failed chat=%s', cid)
+                    await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception('schedule lock loop error')
+            await asyncio.sleep(30)
 
     async def _show_join_restrict_config(self, chat_id: int, message_id: int) -> None:
         gs = await self.db.get_group_settings(chat_id)
@@ -4405,6 +4636,39 @@ class MegaBot:
 
     async def handle_state(self, chat_id: int, uid: int, user: dict, text: str, state: dict, msg: dict) -> bool:
         step=state.get('step')
+        if step == 'schedule_text':
+            if text.strip() in ('لغو', 'cancel', 'انصراف'):
+                self.states.pop(uid, None)
+                await self._show_schedule_panel(chat_id, state.get('message_id'))
+                return True
+            try:
+                parsed = schlock.parse_schedule_text(text)
+            except ValueError as e:
+                await self.safe_send(chat_id, str(e), parse_mode=None)
+                return True
+            try:
+                row = await self.db.create_lock_schedule(
+                    chat_id=int(state.get('chat_id') or chat_id),
+                    start_hm=parsed['start_hm'],
+                    end_hm=parsed['end_hm'],
+                    days=parsed['days'],
+                    valid_from=parsed.get('valid_from'),
+                    valid_until=parsed.get('valid_until'),
+                    timezone=parsed.get('timezone') or schlock.DEFAULT_TZ,
+                    created_by=uid,
+                )
+                self.states.pop(uid, None)
+                await self.safe_send(
+                    chat_id,
+                    f"✅ زمان‌بندی ثبت شد.\n{schlock.format_schedule_row(row)}\n"
+                    f"منطقه زمانی: {schlock.DEFAULT_TZ}",
+                    parse_mode=None,
+                )
+                await self._show_schedule_panel(chat_id, None)
+            except Exception:
+                log.exception('create_lock_schedule failed')
+                await self.safe_send(chat_id, '❌ ذخیره زمان‌بندی ناموفق بود.', parse_mode=None)
+            return True
         if step in ('welcome_text', 'goodbye_text'):
             if text.strip() in ('لغو', 'cancel', 'انصراف'):
                 self.states.pop(uid, None)

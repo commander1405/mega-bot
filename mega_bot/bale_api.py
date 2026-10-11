@@ -348,3 +348,10 @@ class BaleAPI:
         if until_date is not None:
             payload['until_date'] = until_date
         return await self.call('restrictChatMember', payload)
+
+    async def set_chat_permissions(self, chat_id: int, permissions: dict) -> dict:
+        """Set default permissions for all non-admin members (group-wide lock/unlock)."""
+        return await self.call('setChatPermissions', {
+            'chat_id': chat_id,
+            'permissions': permissions,
+        })

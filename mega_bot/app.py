@@ -2486,10 +2486,7 @@ class MegaBot:
             return
 
         sender_user = msg.get('from') or msg.get('sender') or {}
-        sender_name = (sender_user.get('first_name') or '').strip() or str(uid)
-        if sender_user.get('username'):
-            # keep plain name for announcement; username optional in view
-            pass
+        sender_name = (sender_user.get('first_name') or '').strip() or 'ناشناس'
 
         try:
             whisper_id = await self.db.create_whisper(chat_id, uid, recipient_id, body, sender_name=sender_name)
@@ -2506,12 +2503,14 @@ class MegaBot:
             except Exception as exc:
                 log.info('whisper delete_message failed chat=%s: %s', chat_id, type(exc).__name__)
 
-        # Public announcement WITHOUT whisper body — shows sender name + id
+        # Public announcement: reply to recipient message, name only (no numeric id)
         try:
+            recipient_msg_id = replied.get('message_id')
             await self.safe_send(
                 chat_id,
-                f'🤫 یه نجوا از طرف {sender_name} (`{uid}`) داری!',
+                f'🤫 نجوا داری از طرف {sender_name}',
                 keyboard=inline([[('👁️ دیدن نجوا', f'wh:view:{whisper_id}')]]),
+                reply_to=int(recipient_msg_id) if recipient_msg_id else None,
                 parse_mode=None,
                 skip_ad=True,
             )
@@ -2547,10 +2546,10 @@ class MegaBot:
                     )
                 return True
             sender_id = row.get('sender_id')
-            sender_name = (row.get('sender_name') or '').strip() or str(sender_id)
+            sender_name = (row.get('sender_name') or '').strip() or 'ناشناس'
             body_full = row.get('body') or ''
-            # Alert text is short; include from + body
-            alert_text = f'از طرف: {sender_name} ({sender_id})\n{body_full}'
+            # Alert text is short; name only (no numeric id)
+            alert_text = f'از طرف {sender_name}:\n{body_full}'
             if len(alert_text) > 190:
                 alert_text = alert_text[:187] + '...'
             # Prefer private alert so group never sees body
@@ -2562,7 +2561,7 @@ class MegaBot:
                     try:
                         await self.api.send_message(
                             uid,
-                            f'🤫 نجوا از طرف {sender_name} (`{sender_id}`):\n{body_full}',
+                            f'🤫 نجوا از طرف {sender_name}:\n{body_full}',
                             parse_mode=None,
                         )
                         await self.api.answer_callback(callback_id, 'نجوا در پیوی برات ارسال شد.')

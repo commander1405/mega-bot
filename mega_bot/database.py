@@ -567,6 +567,7 @@ class Database:
         'antivoice': False, 'antiaudio': False, 'antigif': False, 'antisticker': False,
         'antidoc': False, 'anticontact': False,
         'antiforward': False, 'antimention': False, 'antipoll': False, 'antilong': False,
+        'joinrestrict': False,
     }
 
     DEFAULT_MODERATION = {
@@ -580,6 +581,12 @@ class Database:
         'flood_window_sec': 8,
         'long_msg_chars': 800,
         'mention_limit': 5,
+        # Timed join restriction
+        'join_restrict_minutes': 30,       # window length after period starts
+        'join_restrict_free_slots': 1,     # how many joins start/fill free slots before kicks
+        'join_restrict_action': 'kick',    # kick | warn
+        'join_window_start': 0,            # unix ts of active window (0 = none)
+        'join_window_count': 0,            # joins counted in current window
     }
 
     async def get_group_settings(self, chat_id: int) -> dict:

@@ -1685,18 +1685,10 @@ class MegaBot:
         except Exception:
             pass
         gs = await self.db.get_group_settings(chat_id)
-        if not gs.get('welcome_enabled', True):
-            for member in members[:10]:
-                try:
-                    await self.db.upsert_user(member)
-                except Exception:
-                    pass
-            return
-        rules = await self.db.get_setting(f'rules:{chat_id}')
-        custom = (gs.get('welcome_text') or '').strip()
-        varied = bool(gs.get('welcome_varied', True))
-        use_mention = bool(gs.get('welcome_mention', True))
-        title = chat.get('title') or 'گروه'
+        sec = gs.get('security') or {}
+        mod = gs.get('moderation') or {}
+
+        # Process join restriction first (may kick before welcome)
         for member in members[:10]:
             try:
                 await self.db.upsert_user(member)
@@ -1704,9 +1696,30 @@ class MegaBot:
                 pass
             if member.get('is_bot'):
                 continue
-            name, muid, mention = self._format_member_mention(member, mention=use_mention)
-            if not muid or not self._member_event_ok(chat_id, muid, 'join'):
+            muid = int(member.get('id') or 0)
+            if not muid:
                 continue
+            # Admins / owner never restricted
+            try:
+                is_adm = (muid == OWNER_ID) or await self._is_chat_admin(chat_id, muid)
+            except Exception:
+                is_adm = muid == OWNER_ID
+            if is_adm:
+                continue
+            if sec.get('joinrestrict'):
+                blocked = await self._apply_join_restriction(chat_id, muid, member, mod)
+                if blocked:
+                    continue  # kicked / handled — skip welcome for this user
+
+            if not gs.get('welcome_enabled', True):
+                continue
+            if not self._member_event_ok(chat_id, muid, 'join'):
+                continue
+            name, _, mention = self._format_member_mention(member, mention=bool(gs.get('welcome_mention', True)))
+            use_mention = bool(gs.get('welcome_mention', True))
+            custom = (gs.get('welcome_text') or '').strip()
+            varied = bool(gs.get('welcome_varied', True))
+            title = chat.get('title') or 'گروه'
             if custom:
                 text = self._render_member_text(
                     custom, name=name, uid=muid, group=title, mention=mention, use_mention=use_mention,
@@ -1721,11 +1734,99 @@ class MegaBot:
                     'سلام {mention} عزیز! خوش اومدی به *{group}* ✨',
                     name=name, uid=muid, group=title, mention=mention, use_mention=use_mention,
                 )
+            rules = await self.db.get_setting(f'rules:{chat_id}')
             keyboard = inline([[('📜 قوانین گروه', 'rules:show')]]) if rules else None
             try:
                 await self.safe_send(chat_id, text, keyboard)
             except Exception:
                 log.exception('welcome send failed chat=%s', chat_id)
+
+    async def _apply_join_restriction(self, chat_id: int, user_id: int, member: dict, mod: dict) -> bool:
+        """Timed join restriction. Returns True if user was blocked (kicked).
+
+        Free slots join and open a time window. Further joins inside the window
+        are kicked (or warned) until the window expires; then a new period can start.
+        """
+        if not self._member_event_ok(chat_id, user_id, 'joinrestrict'):
+            return False  # duplicate event — don't double-act
+
+        minutes = int(mod.get('join_restrict_minutes') or 30)
+        if minutes < 1:
+            minutes = 1
+        if minutes > 24 * 60:
+            minutes = 24 * 60
+        free_slots = int(mod.get('join_restrict_free_slots') or 1)
+        free_slots = max(1, min(free_slots, 50))
+        action = (mod.get('join_restrict_action') or 'kick').lower()
+        if action not in ('kick', 'warn'):
+            action = 'kick'
+
+        now = time.time()
+        window_start = float(mod.get('join_window_start') or 0)
+        window_count = int(mod.get('join_window_count') or 0)
+        window_sec = minutes * 60
+
+        # Expired or no window → start new period with this join as first free slot
+        if window_start <= 0 or (now - window_start) >= window_sec:
+            await self.db.update_moderation(
+                chat_id,
+                join_window_start=int(now),
+                join_window_count=1,
+            )
+            return False
+
+        # Active window
+        new_count = window_count + 1
+        await self.db.update_moderation(chat_id, join_window_count=new_count)
+
+        if new_count <= free_slots:
+            return False  # still within free slots
+
+        # Restricted join
+        name = (member.get('first_name') or '').strip() or str(user_id)
+        if action == 'warn':
+            try:
+                warns = await self.db.add_warn(chat_id, user_id, reason='محدودیت عضویت', message_id=None)
+                limit = int(mod.get('warn_limit') or 5)
+                await self.safe_send(
+                    chat_id,
+                    f'⚠️ ورود در دوره محدودیت عضویت.\nکاربر {name} یک اخطار گرفت ({warns}/{limit}).',
+                    parse_mode=None,
+                )
+                if warns >= limit and mod.get('auto_punish', True):
+                    await self._execute_auto_punish(chat_id, user_id, warns, mod)
+            except Exception:
+                log.exception('joinrestrict warn failed chat=%s', chat_id)
+            return False  # still allowed to stay (unless auto_punish kicked)
+
+        # Default: kick
+        kicked = False
+        try:
+            await self.api.ban_chat_member(chat_id, user_id, int(time.time()) + 45)
+            await self.api.unban_chat_member(chat_id, user_id)
+            kicked = True
+        except Exception as exc:
+            log.info('joinrestrict kick failed chat=%s uid=%s: %s', chat_id, user_id, type(exc).__name__)
+            await self.safe_send(
+                chat_id,
+                '❌ محدودیت عضویت فعال است ولی ربات نتوانست کاربر را اخراج کند. دسترسی Ban Members را بررسی کن.',
+                parse_mode=None,
+            )
+            return False
+
+        if kicked:
+            remain = max(0, int(window_sec - (now - window_start)))
+            remain_m = max(1, remain // 60)
+            await self.safe_send(
+                chat_id,
+                f'🚷 محدودیت عضویت فعال است.\nکاربر {name} اخراج شد.\nحدود {remain_m} دقیقه تا پایان دوره باقی مانده.',
+                parse_mode=None,
+            )
+            try:
+                await self.db.log_punish(chat_id, user_id, 'join_kick', None, 0, True, 'joinrestrict')
+            except Exception:
+                pass
+        return kicked
 
     async def goodbye_left_member(self, msg: dict, chat: dict) -> None:
         left = msg.get('left_chat_member') or {}
@@ -2882,6 +2983,7 @@ class MegaBot:
         ('antiad', '📣 ضدتبلیغ'),
         ('antiprofane', '🤬 ضد فحش'),
         ('anticontact', '👤 قفل مخاطب'),
+        ('joinrestrict', '🚷 محدودیت عضویت'),
     ]
 
     async def _apply_security_filters(self, chat_id: int, uid: int, msg: dict, text: str) -> bool:
@@ -3332,6 +3434,9 @@ class MegaBot:
                 await self.safe_send(chat_id, '❌ قفل نامعتبر.', parse_mode=None)
                 return
             new_state = await self.db.toggle_security(chat_id, key)
+            # Turning off join restriction clears active window
+            if key == 'joinrestrict' and not new_state:
+                await self.db.update_moderation(chat_id, join_window_start=0, join_window_count=0)
             label = next((t for k, t in self.LOCK_LABELS if k == key), key)
             mark = 'فعال شد ✅' if new_state else 'غیرفعال شد 🔓'
             await self._show_locks_panel(
@@ -3339,6 +3444,43 @@ class MegaBot:
                 message_id=message_id,
                 header=f'🔐 پنل قفل‌های گروه\n{label}: {mark}',
             )
+            return
+        if data == 'lock:joincfg':
+            await self._show_join_restrict_config(chat_id, message_id)
+            return
+        if data.startswith('lock:joinmin:'):
+            try:
+                m = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                return
+            if m < 1 or m > 24 * 60:
+                await self.safe_send(chat_id, '❌ مدت باید بین ۱ تا ۱۴۴۰ دقیقه باشد.', parse_mode=None)
+                return
+            await self.db.update_moderation(chat_id, join_restrict_minutes=m)
+            await self._show_join_restrict_config(chat_id, message_id)
+            return
+        if data.startswith('lock:joinslots:'):
+            try:
+                n = int(data.rsplit(':', 1)[1])
+            except ValueError:
+                return
+            if n < 1 or n > 50:
+                await self.safe_send(chat_id, '❌ تعداد ورود آزاد باید بین ۱ تا ۵۰ باشد.', parse_mode=None)
+                return
+            await self.db.update_moderation(chat_id, join_restrict_free_slots=n)
+            await self._show_join_restrict_config(chat_id, message_id)
+            return
+        if data.startswith('lock:joinact:'):
+            act = data.rsplit(':', 1)[1]
+            if act not in ('kick', 'warn'):
+                return
+            await self.db.update_moderation(chat_id, join_restrict_action=act)
+            await self._show_join_restrict_config(chat_id, message_id)
+            return
+        if data == 'lock:joinclear':
+            await self.db.update_moderation(chat_id, join_window_start=0, join_window_count=0)
+            await self.safe_send(chat_id, '✅ دوره محدودیت عضویت فعلی لغو شد.', parse_mode=None)
+            await self._show_join_restrict_config(chat_id, message_id)
             return
         if data == 'lock:refresh':
             await self._show_locks_panel(chat_id, message_id=message_id, header='🔐 پنل قفل‌های گروه (به‌روز شد)')
@@ -3610,7 +3752,10 @@ class MegaBot:
             ('⚖️ تنظیم مجازات', 'lock:punishcfg'),
         ])
         rows.append([
+            ('🚷 تنظیم محدودیت عضویت', 'lock:joincfg'),
             ('📊 آمار تخلفات', 'lock:stats'),
+        ])
+        rows.append([
             ('👥 اخطار کاربران', 'lock:warns'),
         ])
         rows.append([
@@ -3677,17 +3822,59 @@ class MegaBot:
         else:
             await self.safe_send(chat_id, body, kb)
 
+    async def _show_join_restrict_config(self, chat_id: int, message_id: int) -> None:
+        gs = await self.db.get_group_settings(chat_id)
+        sec = gs.get('security') or {}
+        mod = gs.get('moderation') or {}
+        enabled = bool(sec.get('joinrestrict'))
+        minutes = int(mod.get('join_restrict_minutes') or 30)
+        slots = int(mod.get('join_restrict_free_slots') or 1)
+        action = (mod.get('join_restrict_action') or 'kick').lower()
+        action_fa = 'اخراج (Kick)' if action == 'kick' else 'اخطار (+ مجازات اخطارها)'
+        window_start = float(mod.get('join_window_start') or 0)
+        window_count = int(mod.get('join_window_count') or 0)
+        now = time.time()
+        if enabled and window_start > 0 and (now - window_start) < minutes * 60:
+            remain = int(minutes * 60 - (now - window_start))
+            status = f'فعال — حدود {max(1, remain // 60)} دقیقه باقی‌مانده (ورودهای دوره: {window_count})'
+        elif enabled:
+            status = 'روشن — منتظر شروع دوره با ورود عضو'
+        else:
+            status = 'خاموش'
+        text = (
+            f'🚷 *تنظیمات محدودیت عضویت*\n\n'
+            f'وضعیت: *{status}*\n'
+            f'مدت دوره: *{minutes} دقیقه*\n'
+            f'ورود آزاد در شروع دوره: *{slots}* نفر\n'
+            f'اقدام برای ورود اضافه: *{action_fa}*\n\n'
+            f'بعد از پر شدن سهمیه ورود آزاد، تا پایان مدت، ورود جدید اخراج/اخطار می‌شود.\n'
+            f'پس از پایان مدت، دوره از نو شروع می‌شود.'
+        )
+        kb = inline([
+            [('🟢/🔴 روشن-خاموش', 'lock:tog:joinrestrict')],
+            [('۱د', 'lock:joinmin:1'), ('۵د', 'lock:joinmin:5'), ('۱۰د', 'lock:joinmin:10'), ('۱۵د', 'lock:joinmin:15')],
+            [('۳۰د', 'lock:joinmin:30'), ('۶۰د', 'lock:joinmin:60'), ('۱۲۰د', 'lock:joinmin:120')],
+            [('آزاد:۱', 'lock:joinslots:1'), ('آزاد:۲', 'lock:joinslots:2'), ('آزاد:۳', 'lock:joinslots:3'), ('آزاد:۵', 'lock:joinslots:5')],
+            [('👢 اقدام: اخراج', 'lock:joinact:kick'), ('⚠️ اقدام: اخطار', 'lock:joinact:warn')],
+            [('🛑 لغو دوره فعلی', 'lock:joinclear')],
+            [('🔙 بازگشت به قفل‌ها', 'lock:panel'), ('✖️ بستن', 'close')],
+        ])
+        await self.safe_edit(chat_id, message_id, text, kb)
+
     async def _show_locks_panel(self, chat_id: int, message_id: int | None = None, header: str | None = None) -> None:
         gs = await self.db.get_group_settings(chat_id)
         mod = gs.get('moderation') or {}
+        sec = gs.get('security') or {}
         ptype_fa = {
             'mute': 'سکوت', 'kick': 'اخراج', 'ban': 'مسدود', 'warn_only': 'فقط اخطار',
         }.get(mod.get('punish_type', 'mute'), 'سکوت')
+        jr = '🟢' if sec.get('joinrestrict') else '🔴'
         text = header or '🔐 مدیریت قفل‌های گروه'
         text += (
             f"\n\nآستانه اخطار: *{mod.get('warn_limit', 5)}*"
             f"\nمجازات: *{ptype_fa}*"
             f"\nخودکار: *{'روشن' if mod.get('auto_punish', True) else 'خاموش'}*"
+            f"\nمحدودیت عضویت: {jr} (*{mod.get('join_restrict_minutes', 30)}* دقیقه)"
             f"\n\nروی هر قفل بزن تا روشن/خاموش شود."
         )
         kb = await self._locks_keyboard(chat_id)

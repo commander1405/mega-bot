@@ -2485,8 +2485,14 @@ class MegaBot:
             await self.safe_send(chat_id, '⏳ کمی صبر کن؛ تعداد نجواهات در دقیقه زیاد شده.', reply_to=msg.get('message_id'), parse_mode=None)
             return
 
+        sender_user = msg.get('from') or msg.get('sender') or {}
+        sender_name = (sender_user.get('first_name') or '').strip() or str(uid)
+        if sender_user.get('username'):
+            # keep plain name for announcement; username optional in view
+            pass
+
         try:
-            whisper_id = await self.db.create_whisper(chat_id, uid, recipient_id, body)
+            whisper_id = await self.db.create_whisper(chat_id, uid, recipient_id, body, sender_name=sender_name)
         except Exception:
             log.exception('create_whisper failed chat=%s', chat_id)
             await self.safe_send(chat_id, '❌ انجام نشد به دلیل: ذخیره اطلاعات در دیتابیس ناموفق بود.', reply_to=msg.get('message_id'), parse_mode=None)
@@ -2500,11 +2506,11 @@ class MegaBot:
             except Exception as exc:
                 log.info('whisper delete_message failed chat=%s: %s', chat_id, type(exc).__name__)
 
-        # Public announcement WITHOUT whisper body
+        # Public announcement WITHOUT whisper body — shows sender name + id
         try:
             await self.safe_send(
                 chat_id,
-                '🤫 یه نجوا داری!',
+                f'🤫 یه نجوا از طرف {sender_name} (`{uid}`) داری!',
                 keyboard=inline([[('👁️ دیدن نجوا', f'wh:view:{whisper_id}')]]),
                 parse_mode=None,
                 skip_ad=True,
@@ -2540,17 +2546,23 @@ class MegaBot:
                         show_alert=True,
                     )
                 return True
-            body = (row.get('body') or '')[:200]
+            sender_id = row.get('sender_id')
+            sender_name = (row.get('sender_name') or '').strip() or str(sender_id)
+            body_full = row.get('body') or ''
+            # Alert text is short; include from + body
+            alert_text = f'از طرف: {sender_name} ({sender_id})\n{body_full}'
+            if len(alert_text) > 190:
+                alert_text = alert_text[:187] + '...'
             # Prefer private alert so group never sees body
             if callback_id:
                 try:
-                    await self.api.answer_callback(callback_id, body or '(خالی)', show_alert=True)
+                    await self.api.answer_callback(callback_id, alert_text or '(خالی)', show_alert=True)
                 except Exception:
                     # Fallback: try DM to recipient only
                     try:
                         await self.api.send_message(
                             uid,
-                            f'🤫 نجوا:\n{row.get("body") or ""}',
+                            f'🤫 نجوا از طرف {sender_name} (`{sender_id}`):\n{body_full}',
                             parse_mode=None,
                         )
                         await self.api.answer_callback(callback_id, 'نجوا در پیوی برات ارسال شد.')

@@ -141,6 +141,7 @@ CREATE TABLE IF NOT EXISTS whispers (
   id BIGSERIAL PRIMARY KEY,
   chat_id BIGINT NOT NULL,
   sender_id BIGINT NOT NULL,
+  sender_name TEXT NOT NULL DEFAULT '',
   recipient_id BIGINT NOT NULL,
   body TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -171,6 +172,8 @@ class Database:
         self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=8, command_timeout=30, init=init_connection)
         async with self.pool.acquire() as conn:
             await conn.execute(SCHEMA)
+            # Lightweight migrations for tables created before new columns existed
+            await conn.execute("ALTER TABLE whispers ADD COLUMN IF NOT EXISTS sender_name TEXT NOT NULL DEFAULT ''")
             await conn.execute("INSERT INTO settings(key,value) VALUES('about', to_jsonb($1::text)) ON CONFLICT(key) DO NOTHING", "MEGA BOT یک ربات اجتماعی برای بله است.")
             await conn.execute("INSERT INTO settings(key,value) VALUES('donations_total', '0'::jsonb) ON CONFLICT(key) DO NOTHING")
             defaults = {
@@ -379,21 +382,28 @@ class Database:
             return {'points': 0, 'learn_count': 0}
         return {'points': int(row['points']), 'learn_count': int(row['learn_count'])}
 
-    async def create_whisper(self, chat_id: int, sender_id: int, recipient_id: int, body: str) -> int:
+    async def create_whisper(
+        self,
+        chat_id: int,
+        sender_id: int,
+        recipient_id: int,
+        body: str,
+        sender_name: str = '',
+    ) -> int:
         async with self._pool().acquire() as c:
             # opportunistic cleanup of expired whispers
             await c.execute("DELETE FROM whispers WHERE expires_at < NOW() OR (consumed AND created_at < NOW() - INTERVAL '1 day')")
             row = await c.fetchrow(
-                """INSERT INTO whispers(chat_id, sender_id, recipient_id, body)
-                   VALUES($1, $2, $3, $4) RETURNING id""",
-                int(chat_id), int(sender_id), int(recipient_id), body,
+                """INSERT INTO whispers(chat_id, sender_id, sender_name, recipient_id, body)
+                   VALUES($1, $2, $3, $4, $5) RETURNING id""",
+                int(chat_id), int(sender_id), (sender_name or '')[:120], int(recipient_id), body,
             )
         return int(row['id'])
 
     async def get_whisper_for_recipient(self, whisper_id: int, recipient_id: int, chat_id: int) -> dict | None:
         async with self._pool().acquire() as c:
             row = await c.fetchrow(
-                """SELECT id, chat_id, sender_id, recipient_id, body, expires_at, consumed
+                """SELECT id, chat_id, sender_id, sender_name, recipient_id, body, expires_at, consumed
                    FROM whispers
                    WHERE id=$1 AND recipient_id=$2 AND chat_id=$3
                      AND expires_at > NOW()""",

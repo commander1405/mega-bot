@@ -2945,21 +2945,34 @@ class MegaBot:
         return mids
 
     async def _delete_mids(self, chat_id: int, mids: list[int]) -> tuple[int, int]:
-        ok, fail = 0, 0
-        for mid in mids:
-            try:
-                await self.api.delete_message(chat_id, int(mid))
-                ok += 1
-                # small yield to avoid hammering API
-                if ok % 15 == 0:
-                    await asyncio.sleep(0.15)
-            except Exception:
-                fail += 1
-        # prune deleted from buffer
+        """Delete as fast as possible. On any single failure, skip and continue.
+        No cooldown. Always returns (ok_count, fail_count).
+        """
+        if not mids:
+            return 0, 0
+        unique = sorted(set(int(m) for m in mids if m))
+        sem = asyncio.Semaphore(25)
+
+        async def _one(mid: int) -> bool:
+            async with sem:
+                try:
+                    await self.api.delete_message(chat_id, mid)
+                    return True
+                except Exception:
+                    return False  # skip and continue others
+
+        results = await asyncio.gather(*(_one(m) for m in unique), return_exceptions=True)
+        ok = sum(1 for r in results if r is True)
+        fail = len(unique) - ok
+        # prune successfully deleted from buffer; keep failed for possible retry
         buf = self._recent_mids.get(chat_id)
         if buf is not None:
-            deleted = set(mids)
-            self._recent_mids[chat_id] = deque((m for m in buf if m not in deleted), maxlen=200)
+            failed_set = {m for m, r in zip(unique, results) if r is not True}
+            attempted = set(unique)
+            self._recent_mids[chat_id] = deque(
+                (m for m in buf if m not in attempted or m in failed_set),
+                maxlen=200,
+            )
         return ok, fail
 
     async def _handle_purge_command(
@@ -3035,9 +3048,10 @@ class MegaBot:
             return True
 
         ok, fail = await self._delete_mids(chat_id, mids)
+        total = ok + fail
         await self.safe_send(
             chat_id,
-            f'✅ پاک‌سازی انجام شد.\nحذف‌شده: {ok}' + (f'\nناموفق: {fail}' if fail else ''),
+            f'✅ نتیجه پاک‌سازی\n🗑 پاک شد: {ok}\n⚠️ پاک نشد: {fail}\n📌 مجموع تلاش: {total}',
             parse_mode=None,
         )
         return True
@@ -3071,9 +3085,10 @@ class MegaBot:
         self._purge_pending.pop(token, None)
         await self.safe_edit(chat_id, message_id, '⏳ در حال پاک‌سازی...', None)
         ok, fail = await self._delete_mids(chat_id, mids)
+        total = ok + fail
         await self.safe_send(
             chat_id,
-            f'✅ پاک‌سازی انجام شد.\nحذف‌شده: {ok}' + (f'\nناموفق: {fail}' if fail else ''),
+            f'✅ نتیجه پاک‌سازی\n🗑 پاک شد: {ok}\n⚠️ پاک نشد: {fail}\n📌 مجموع تلاش: {total}',
             parse_mode=None,
         )
 

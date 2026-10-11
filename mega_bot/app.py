@@ -386,103 +386,11 @@ class MegaBot:
                 await self.safe_send(chat_id, f'ساخت GIF ناموفق بود: {self._short(exc)}')
             return
 
-        # Group moderation commands (reply required). Group-level via Bale ChatMember API.
-        # Supported: سکوت / حذف سکوت / بن / حذف بن / انبن / آنبن / کیک
-        _norm_cmd = text.replace('‌', '').replace('ـ', '').strip()
-        _norm_cmd = _norm_cmd.replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا').replace('ي', 'ی').replace('ك', 'ک')
-        _mod_cmds = {
-            'سکوت': 'mute',
-            'حذف سکوت': 'unmute',
-            'بن': 'ban',
-            'حذف بن': 'unban',
-            'انبن': 'unban',
-            'آنبن': 'unban',
-            'کیک': 'kick',
-        }
-        if self._is_group_chat(chat) and _norm_cmd in _mod_cmds:
-            action = _mod_cmds[_norm_cmd]
-            if not replied or not (replied.get('from') or replied.get('sender')):
-                await self.safe_send(
-                    chat_id,
-                    f'برای استفاده از دستور «{_norm_cmd}» روی پیام کاربر هدف *ریپلای* کن و بعد دستور را بفرست.',
-                )
+        # Group moderation + warn commands (reply or @user / numeric id)
+        if self._is_group_chat(chat) and text:
+            handled_mod = await self._handle_group_mod_text(chat_id, uid, text, msg, replied)
+            if handled_mod:
                 return
-            is_admin = await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID
-            if not is_admin:
-                await self.safe_send(chat_id, '⛔ برای این کار باید مدیر گروه باشی!', reply_to=msg.get('message_id'), parse_mode=None)
-                return
-            target_user = replied.get('from') or replied.get('sender') or {}
-            target_uid = int(target_user.get('id', 0) or 0)
-            if not target_uid:
-                await self.safe_send(chat_id, '❓ دستور کامل نیست! روی پیام یک کاربر واقعی ریپلای کن.', reply_to=msg.get('message_id'), parse_mode=None)
-                return
-            if target_user.get('is_bot') or (self.bot_id and target_uid == self.bot_id):
-                await self.safe_send(
-                    chat_id,
-                    '😂 منو می‌خوای بن کنی؟! داداش من خودم رباتم و نمی‌تونم خودمو بن کنم!',
-                    reply_to=msg.get('message_id'),
-                    parse_mode=None,
-                )
-                return
-            if target_uid == OWNER_ID:
-                await self.safe_send(chat_id, '⛔ مالک ربات قابل مدیریت با این دستور نیست.', reply_to=msg.get('message_id'), parse_mode=None)
-                return
-            if target_uid == uid:
-                await self.safe_send(chat_id, '🤔 نمی‌تونم این عملیات رو روی خودت انجام بدم!', reply_to=msg.get('message_id'), parse_mode=None)
-                return
-            target_name = (target_user.get('first_name') or str(target_uid)).strip()
-            try:
-                if action == 'mute':
-                    await self.api.restrict_chat_member(
-                        chat_id,
-                        target_uid,
-                        {
-                            'can_send_messages': False,
-                            'can_send_media_messages': False,
-                            'can_send_other_messages': False,
-                            'can_add_web_page_previews': False,
-                        },
-                    )
-                    _rt = msg.get('message_id')
-                    await self.safe_send(chat_id, f'✅ انجام شد! 🔇 کاربر {target_name} سکوت شد.', reply_to=_rt, parse_mode=None)
-                    await self.db.log(uid, 'group_mute', 'user', target_uid, {'chat_id': chat_id})
-                elif action == 'unmute':
-                    await self.api.restrict_chat_member(
-                        chat_id,
-                        target_uid,
-                        {
-                            'can_send_messages': True,
-                            'can_send_media_messages': True,
-                            'can_send_other_messages': True,
-                            'can_add_web_page_previews': True,
-                        },
-                    )
-                    await self.safe_send(chat_id, f'✅ انجام شد! 🔊 سکوت کاربر {target_name} برداشته شد.', reply_to=msg.get('message_id'), parse_mode=None)
-                    await self.db.log(uid, 'group_unmute', 'user', target_uid, {'chat_id': chat_id})
-                elif action == 'ban':
-                    await self.api.ban_chat_member(chat_id, target_uid)
-                    await self.safe_send(chat_id, f'✅ انجام شد! ⛔ کاربر {target_name} از گروه بن شد.', reply_to=msg.get('message_id'), parse_mode=None)
-                    await self.db.log(uid, 'group_ban', 'user', target_uid, {'chat_id': chat_id})
-                elif action == 'unban':
-                    await self.api.unban_chat_member(chat_id, target_uid)
-                    await self.safe_send(chat_id, f'✅ انجام شد! بن کاربر {target_name} برداشته شد.', reply_to=msg.get('message_id'), parse_mode=None)
-                    await self.db.log(uid, 'group_unban', 'user', target_uid, {'chat_id': chat_id})
-                elif action == 'kick':
-                    await self.api.ban_chat_member(chat_id, target_uid, int(time.time()) + 45)
-                    await self.api.unban_chat_member(chat_id, target_uid)
-                    await self.safe_send(chat_id, f'✅ انجام شد! 👢 کاربر {target_name} از گروه اخراج شد.', reply_to=msg.get('message_id'), parse_mode=None)
-                    await self.db.log(uid, 'group_kick', 'user', target_uid, {'chat_id': chat_id})
-            except Exception as exc:
-                err_l = str(exc).lower()
-                if any(x in err_l for x in ('not enough rights', 'permission', 'can\'t', 'cannot', 'forbidden', 'have no rights', 'not an admin', 'chat_admin_required')):
-                    user_msg = '⚠️ برای انجام این کار، من به دسترسی مدیریتی مناسب نیاز دارم. لطفاً دسترسی‌های من رو بررسی کن.'
-                elif any(x in err_l for x in ('bot is not', 'not a member', 'kicked', 'deactivated')):
-                    user_msg = '🛡️ اول منو مدیر گروه کن و دسترسی‌های لازم رو بهم بده، بعد دوباره امتحان کن!'
-                else:
-                    user_msg = '⚠️ عملیات انجام نشد. دسترسی‌های مدیریتی ربات در گروه را بررسی کن.'
-                    log.warning('mod action failed chat=%s action=%s: %s', chat_id, action, type(exc).__name__)
-                await self.safe_send(chat_id, user_msg, reply_to=msg.get('message_id'), parse_mode=None)
-            return
         # ── Whisper (نجوا): reply + «نجوا متن»
         if is_group and text.startswith('نجوا'):
             await self._handle_whisper(chat_id, uid, text, msg, replied)
@@ -2964,6 +2872,249 @@ class MegaBot:
     _FLOOD_WINDOW: dict[tuple[int, int], list[float]] = {}
 
     # Lock keys shown in panel (label, security key)
+    async def _resolve_mod_target(
+        self, chat_id: int, text_arg: str, replied: dict, entities: list | None = None,
+    ) -> tuple[int | None, str, str | None]:
+        """Resolve target from reply, @username, text_mention entity, or numeric id.
+        Returns (user_id, display_name, error_message).
+        """
+        # 1) Reply
+        if replied:
+            tu = replied.get('from') or replied.get('sender') or {}
+            tid = int(tu.get('id') or 0)
+            if tid:
+                return tid, (tu.get('first_name') or str(tid)).strip(), None
+
+        # 2) text_mention / mention entities
+        if entities:
+            for e in entities:
+                et = (e.get('type') or '').lower()
+                if et == 'text_mention' and e.get('user'):
+                    u = e['user']
+                    tid = int(u.get('id') or 0)
+                    if tid:
+                        return tid, (u.get('first_name') or str(tid)).strip(), None
+
+        arg = (text_arg or '').strip()
+        if not arg:
+            return None, '', '❓ کاربر هدف مشخص نیست. روی پیامش ریپلای کن یا با @یوزرنیم / آیدی بنویس.'
+
+        # 3) @username or bare username / numeric id
+        term = arg.lstrip('@').strip()
+        if term.isdigit() or (term.startswith('-') and term[1:].isdigit()):
+            tid = int(term)
+            try:
+                found = await self.db.search_target(str(tid), 'user')
+                name = found[0]['name'] if found else str(tid)
+            except Exception:
+                name = str(tid)
+            return tid, str(name), None
+
+        try:
+            found = await self.db.search_target(term, 'user')
+        except Exception:
+            found = []
+        if not found:
+            return None, '', f'❌ کاربر «{term}» پیدا نشد. باید قبلاً با ربات چت کرده باشه یا آیدی عددی بفرستی.'
+        tid = int(found[0]['id'])
+        name = found[0].get('name') or found[0].get('username') or str(tid)
+        return tid, str(name), None
+
+    def _parse_mod_command(self, text: str) -> tuple[str, int, str] | None:
+        """Parse moderation/warn commands.
+        Returns (action, amount, rest_arg) or None.
+        actions: mute unmute ban unban kick warn remove_warn clear_warns_all clear_warns_user
+        """
+        raw = (text or '').replace('‌', '').replace('ـ', '').strip()
+        raw = raw.replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا').replace('ي', 'ی').replace('ك', 'ک')
+        # normalize multi spaces
+        raw = re.sub(r'\s+', ' ', raw)
+        low = raw
+
+        # Clear all warns in group (no target)
+        clear_all_phrases = (
+            'حذف تمام اخطار ها', 'حذف تمام اخطارها', 'حذف همه اخطار ها', 'حذف همه اخطارها',
+            'حذف احطار ها', 'حذف احطارها', 'حذف تمام احطار ها', 'حذف تمام احطارها',
+            'پاک کردن تمام اخطارها', 'پاک کردن همه اخطارها',
+        )
+        if low in clear_all_phrases or low.startswith('حذف تمام اخطار') or low.startswith('حذف همه اخطار') or low.startswith('حذف احطار'):
+            return 'clear_warns_all', 0, ''
+
+        # remove one warn: حذف اخطار [@user]
+        if low == 'حذف اخطار' or low.startswith('حذف اخطار '):
+            rest = low[len('حذف اخطار'):].strip()
+            return 'remove_warn', 1, rest
+
+        # add warns: اخطار / اخطار ۳ / اخطار 3 @user / اخظار ۳
+        m = re.match(r'^(?:اخطار|اخظار)(?:\s+(\d+))?(?:\s+(.+))?$', low)
+        if m:
+            amount = int(m.group(1) or 1)
+            rest = (m.group(2) or '').strip()
+            amount = max(1, min(amount, 50))
+            return 'warn', amount, rest
+
+        # Classic mod: بن @user / بن / آن بن @x
+        exact_map = {
+            'سکوت': 'mute',
+            'حذف سکوت': 'unmute',
+            'بن': 'ban',
+            'حذف بن': 'unban',
+            'انبن': 'unban',
+            'آنبن': 'unban',
+            'آن بن': 'unban',
+            'ان بن': 'unban',
+            'کیک': 'kick',
+        }
+        if low in exact_map:
+            return exact_map[low], 0, ''
+        for phrase, action in sorted(exact_map.items(), key=lambda x: -len(x[0])):
+            if low.startswith(phrase + ' '):
+                return action, 0, low[len(phrase):].strip()
+        return None
+
+    async def _handle_group_mod_text(
+        self, chat_id: int, uid: int, text: str, msg: dict, replied: dict,
+    ) -> bool:
+        """Handle group mod/warn commands. Returns True if handled."""
+        parsed = self._parse_mod_command(text)
+        if not parsed:
+            return False
+        action, amount, rest = parsed
+
+        is_admin = await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID
+        if not is_admin:
+            await self.safe_send(chat_id, '⛔ برای این کار باید مدیر گروه باشی!', reply_to=msg.get('message_id'), parse_mode=None)
+            return True
+
+        # Clear ALL warns in group — no target needed
+        if action == 'clear_warns_all':
+            try:
+                n = await self.db.clear_all_group_warns(chat_id)
+                await self.safe_send(
+                    chat_id,
+                    f'✅ تمام اخطارهای گروه پاک شد. ({n} کاربر)',
+                    reply_to=msg.get('message_id'),
+                    parse_mode=None,
+                )
+            except Exception:
+                log.exception('clear_all_group_warns failed')
+                await self.safe_send(chat_id, '❌ پاک‌سازی اخطارها ناموفق بود.', reply_to=msg.get('message_id'), parse_mode=None)
+            return True
+
+        entities = msg.get('entities') or []
+        target_uid, target_name, err = await self._resolve_mod_target(chat_id, rest, replied, entities)
+        if err or not target_uid:
+            await self.safe_send(chat_id, err or '❓ کاربر هدف پیدا نشد.', reply_to=msg.get('message_id'), parse_mode=None)
+            return True
+
+        if self.bot_id and target_uid == self.bot_id:
+            await self.safe_send(
+                chat_id,
+                '😂 منو می‌خوای بن کنی؟! داداش من خودم رباتم و نمی‌تونم خودمو بن کنم!',
+                reply_to=msg.get('message_id'),
+                parse_mode=None,
+            )
+            return True
+        if target_uid == OWNER_ID:
+            await self.safe_send(chat_id, '⛔ مالک ربات قابل مدیریت با این دستور نیست.', reply_to=msg.get('message_id'), parse_mode=None)
+            return True
+        if target_uid == uid and action in ('ban', 'kick', 'mute', 'warn'):
+            await self.safe_send(chat_id, '🤔 نمی‌تونم این عملیات رو روی خودت انجام بدم!', reply_to=msg.get('message_id'), parse_mode=None)
+            return True
+
+        # Warn ops
+        if action == 'warn':
+            try:
+                total = await self.db.add_warns(chat_id, target_uid, amount, reason='دستور ادمین')
+                gs = await self.db.get_group_settings(chat_id)
+                limit = int((gs.get('moderation') or {}).get('warn_limit') or gs.get('warn_limit') or 5)
+                await self.safe_send(
+                    chat_id,
+                    f'⚠️ به کاربر {target_name} *{amount}* اخطار داده شد.\nمجموع اخطار: {total}/{limit}',
+                    reply_to=msg.get('message_id'),
+                    parse_mode=None,
+                )
+                if total >= limit and (gs.get('moderation') or {}).get('auto_punish', True):
+                    await self._execute_auto_punish(chat_id, target_uid, total, gs.get('moderation') or {})
+            except Exception:
+                log.exception('manual warn failed')
+                await self.safe_send(chat_id, '❌ ثبت اخطار ناموفق بود.', reply_to=msg.get('message_id'), parse_mode=None)
+            return True
+
+        if action == 'remove_warn':
+            try:
+                before = await self.db.get_warns(chat_id, target_uid)
+                if before <= 0:
+                    await self.safe_send(
+                        chat_id,
+                        f'ℹ️ کاربر {target_name} اخطار فعالی ندارد.',
+                        reply_to=msg.get('message_id'),
+                        parse_mode=None,
+                    )
+                    return True
+                after = await self.db.remove_warn(chat_id, target_uid, 1)
+                await self.safe_send(
+                    chat_id,
+                    f'✅ یک اخطار از {target_name} حذف شد.\nاخطار باقی‌مانده: {after}',
+                    reply_to=msg.get('message_id'),
+                    parse_mode=None,
+                )
+            except Exception:
+                log.exception('remove_warn failed')
+                await self.safe_send(chat_id, '❌ حذف اخطار ناموفق بود.', reply_to=msg.get('message_id'), parse_mode=None)
+            return True
+
+        # API actions: mute/unmute/ban/unban/kick
+        try:
+            if action == 'mute':
+                await self.api.restrict_chat_member(
+                    chat_id, target_uid,
+                    {
+                        'can_send_messages': False,
+                        'can_send_media_messages': False,
+                        'can_send_other_messages': False,
+                        'can_add_web_page_previews': False,
+                    },
+                )
+                await self.safe_send(chat_id, f'✅ انجام شد! 🔇 کاربر {target_name} سکوت شد.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.db.log(uid, 'group_mute', 'user', target_uid, {'chat_id': chat_id})
+            elif action == 'unmute':
+                await self.api.restrict_chat_member(
+                    chat_id, target_uid,
+                    {
+                        'can_send_messages': True,
+                        'can_send_media_messages': True,
+                        'can_send_other_messages': True,
+                        'can_add_web_page_previews': True,
+                    },
+                )
+                await self.safe_send(chat_id, f'✅ انجام شد! 🔊 سکوت کاربر {target_name} برداشته شد.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.db.log(uid, 'group_unmute', 'user', target_uid, {'chat_id': chat_id})
+            elif action == 'ban':
+                await self.api.ban_chat_member(chat_id, target_uid)
+                await self.safe_send(chat_id, f'✅ انجام شد! ⛔ کاربر {target_name} از گروه بن شد.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.db.log(uid, 'group_ban', 'user', target_uid, {'chat_id': chat_id})
+            elif action == 'unban':
+                await self.api.unban_chat_member(chat_id, target_uid)
+                await self.safe_send(chat_id, f'✅ انجام شد! بن کاربر {target_name} برداشته شد.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.db.log(uid, 'group_unban', 'user', target_uid, {'chat_id': chat_id})
+            elif action == 'kick':
+                await self.api.ban_chat_member(chat_id, target_uid, int(time.time()) + 45)
+                await self.api.unban_chat_member(chat_id, target_uid)
+                await self.safe_send(chat_id, f'✅ انجام شد! 👢 کاربر {target_name} از گروه اخراج شد.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.db.log(uid, 'group_kick', 'user', target_uid, {'chat_id': chat_id})
+        except Exception as exc:
+            err_l = str(exc).lower()
+            if any(x in err_l for x in ('not enough rights', 'permission', "can't", 'cannot', 'forbidden', 'have no rights', 'not an admin', 'chat_admin_required')):
+                user_msg = '⚠️ برای انجام این کار، من به دسترسی مدیریتی مناسب نیاز دارم. لطفاً دسترسی‌های من رو بررسی کن.'
+            elif any(x in err_l for x in ('bot is not', 'not a member', 'kicked', 'deactivated')):
+                user_msg = '🛡️ اول منو مدیر گروه کن و دسترسی‌های لازم رو بهم بده، بعد دوباره امتحان کن!'
+            else:
+                user_msg = '⚠️ عملیات انجام نشد. دسترسی‌های مدیریتی ربات در گروه را بررسی کن.'
+                log.warning('mod action failed chat=%s action=%s: %s', chat_id, action, type(exc).__name__)
+            await self.safe_send(chat_id, user_msg, reply_to=msg.get('message_id'), parse_mode=None)
+        return True
+
     LOCK_LABELS: list[tuple[str, str]] = [
         ('antispam', '🚫 ضداسپم'),
         ('antilink', '🔗 قفل لینک'),

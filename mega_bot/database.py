@@ -865,6 +865,32 @@ class Database:
     async def clear_warns(self, chat_id: int, user_id: int) -> None:
         await self.set_warns(chat_id, user_id, 0)
 
+    async def remove_warn(self, chat_id: int, user_id: int, amount: int = 1) -> int:
+        """Decrease warn count by amount (min 0). Returns new count."""
+        amount = max(1, int(amount))
+        current = await self.get_warns(chat_id, user_id)
+        new_c = max(0, current - amount)
+        return await self.set_warns(chat_id, user_id, new_c)
+
+    async def add_warns(self, chat_id: int, user_id: int, amount: int = 1, reason: str = '') -> int:
+        """Add multiple warns at once. Returns new total."""
+        amount = max(1, min(int(amount), 50))
+        total = 0
+        for i in range(amount):
+            total = await self.add_warn(chat_id, user_id, reason=reason or 'دستور ادمین', message_id=None)
+        return total
+
+    async def clear_all_group_warns(self, chat_id: int) -> int:
+        async with self._pool().acquire() as c:
+            result = await c.execute(
+                'DELETE FROM group_warns WHERE chat_id=$1 AND warn_count>0',
+                int(chat_id),
+            )
+        try:
+            return int(result.split()[-1])
+        except Exception:
+            return 0
+
     async def list_warned_users(self, chat_id: int, limit: int = 15, offset: int = 0) -> list[dict]:
         async with self._pool().acquire() as c:
             rows = await c.fetch(

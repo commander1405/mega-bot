@@ -80,6 +80,11 @@ CREATE TABLE IF NOT EXISTS group_settings (
   chat_id BIGINT PRIMARY KEY,
   welcome_enabled BOOLEAN NOT NULL DEFAULT TRUE,
   welcome_text TEXT,
+  welcome_varied BOOLEAN NOT NULL DEFAULT TRUE,
+  welcome_mention BOOLEAN NOT NULL DEFAULT TRUE,
+  goodbye_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  goodbye_text TEXT,
+  goodbye_varied BOOLEAN NOT NULL DEFAULT TRUE,
   security JSONB NOT NULL DEFAULT '{}'::jsonb,
   moderation JSONB NOT NULL DEFAULT '{}'::jsonb,
   warn_limit INTEGER NOT NULL DEFAULT 5,
@@ -198,6 +203,11 @@ class Database:
             # Lightweight migrations for tables created before new columns existed
             await conn.execute("ALTER TABLE whispers ADD COLUMN IF NOT EXISTS sender_name TEXT NOT NULL DEFAULT ''")
             await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS moderation JSONB NOT NULL DEFAULT '{}'::jsonb")
+            await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS welcome_varied BOOLEAN NOT NULL DEFAULT TRUE")
+            await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS welcome_mention BOOLEAN NOT NULL DEFAULT TRUE")
+            await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS goodbye_enabled BOOLEAN NOT NULL DEFAULT TRUE")
+            await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS goodbye_text TEXT")
+            await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS goodbye_varied BOOLEAN NOT NULL DEFAULT TRUE")
             await conn.execute("INSERT INTO settings(key,value) VALUES('about', to_jsonb($1::text)) ON CONFLICT(key) DO NOTHING", "MEGA BOT یک ربات اجتماعی برای بله است.")
             await conn.execute("INSERT INTO settings(key,value) VALUES('donations_total', '0'::jsonb) ON CONFLICT(key) DO NOTHING")
             defaults = {
@@ -581,6 +591,11 @@ class Database:
                 'chat_id': int(chat_id),
                 'welcome_enabled': True,
                 'welcome_text': None,
+                'welcome_varied': True,
+                'welcome_mention': True,
+                'goodbye_enabled': True,
+                'goodbye_text': None,
+                'goodbye_varied': True,
                 'security': dict(self.DEFAULT_SECURITY),
                 'moderation': mod,
                 'warn_limit': int(mod['warn_limit']),
@@ -597,17 +612,26 @@ class Database:
             mod = {}
         mmerged = dict(self.DEFAULT_MODERATION)
         mmerged.update(mod)
-        # keep warn_limit column in sync as source of truth if set
         if d.get('warn_limit') is not None:
             mmerged['warn_limit'] = int(d['warn_limit'])
         d['moderation'] = mmerged
         d['warn_limit'] = int(mmerged['warn_limit'])
+        d['welcome_enabled'] = bool(d.get('welcome_enabled', True))
+        d['welcome_varied'] = bool(d.get('welcome_varied', True) if d.get('welcome_varied') is not None else True)
+        d['welcome_mention'] = bool(d.get('welcome_mention', True) if d.get('welcome_mention') is not None else True)
+        d['goodbye_enabled'] = bool(d.get('goodbye_enabled', True) if d.get('goodbye_enabled') is not None else True)
+        d['goodbye_varied'] = bool(d.get('goodbye_varied', True) if d.get('goodbye_varied') is not None else True)
         return d
 
     async def set_group_setting_fields(self, chat_id: int, **fields) -> None:
         gs = await self.get_group_settings(chat_id)
         welcome_enabled = fields.get('welcome_enabled', gs['welcome_enabled'])
         welcome_text = fields.get('welcome_text', gs.get('welcome_text'))
+        welcome_varied = fields.get('welcome_varied', gs.get('welcome_varied', True))
+        welcome_mention = fields.get('welcome_mention', gs.get('welcome_mention', True))
+        goodbye_enabled = fields.get('goodbye_enabled', gs.get('goodbye_enabled', True))
+        goodbye_text = fields.get('goodbye_text', gs.get('goodbye_text'))
+        goodbye_varied = fields.get('goodbye_varied', gs.get('goodbye_varied', True))
         security = fields.get('security', gs.get('security') or self.DEFAULT_SECURITY)
         moderation = fields.get('moderation', gs.get('moderation') or self.DEFAULT_MODERATION)
         if not isinstance(moderation, dict):
@@ -617,16 +641,34 @@ class Database:
         moderation['warn_limit'] = warn_limit
         async with self._pool().acquire() as c:
             await c.execute(
-                """INSERT INTO group_settings(chat_id,welcome_enabled,welcome_text,security,moderation,warn_limit,updated_at)
-                   VALUES($1,$2,$3,$4,$5,$6,NOW())
+                """INSERT INTO group_settings(
+                     chat_id,welcome_enabled,welcome_text,welcome_varied,welcome_mention,
+                     goodbye_enabled,goodbye_text,goodbye_varied,
+                     security,moderation,warn_limit,updated_at)
+                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
                    ON CONFLICT(chat_id) DO UPDATE SET
                      welcome_enabled=EXCLUDED.welcome_enabled,
                      welcome_text=EXCLUDED.welcome_text,
+                     welcome_varied=EXCLUDED.welcome_varied,
+                     welcome_mention=EXCLUDED.welcome_mention,
+                     goodbye_enabled=EXCLUDED.goodbye_enabled,
+                     goodbye_text=EXCLUDED.goodbye_text,
+                     goodbye_varied=EXCLUDED.goodbye_varied,
                      security=EXCLUDED.security,
                      moderation=EXCLUDED.moderation,
                      warn_limit=EXCLUDED.warn_limit,
                      updated_at=NOW()""",
-                int(chat_id), bool(welcome_enabled), welcome_text, security, moderation, int(warn_limit),
+                int(chat_id),
+                bool(welcome_enabled),
+                welcome_text,
+                bool(welcome_varied),
+                bool(welcome_mention),
+                bool(goodbye_enabled),
+                goodbye_text,
+                bool(goodbye_varied),
+                security,
+                moderation,
+                int(warn_limit),
             )
 
     async def toggle_security(self, chat_id: int, key: str) -> bool:

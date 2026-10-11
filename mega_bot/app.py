@@ -278,6 +278,10 @@ class MegaBot:
                 await self.db.record_member_left(int(chat.get('id') or 0), 1)
             except Exception:
                 pass
+            try:
+                await self.goodbye_left_member(msg, chat)
+            except Exception:
+                log.exception('goodbye_left_member failed')
             return
         service_keys = (
             'new_chat_title', 'new_chat_photo', 'delete_chat_photo',
@@ -724,6 +728,26 @@ class MegaBot:
             await self._show_locks_panel(chat_id, message_id=None)
             return
 
+        # ── Welcome panel
+        if is_group and text in ('خوشامد', 'خوش آمد', 'خوشامد ها', 'خوشامدها', 'پنل خوشامد'):
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            await self._show_welcome_panel(chat_id, message_id=None)
+            return
+
+        # ── Goodbye / farewell panel (exact phrases; avoid social_reply conflict)
+        if is_group and text in ('خداحافظی', 'تنظیم خداحافظی', 'بدرقه', 'پنل بدرقه', 'پنل خداحافظی', 'پنل خدافظ', 'خدافظی'):
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            await self._show_goodbye_panel(chat_id, message_id=None)
+            return
+        # Exact «خداحافظ» in group by admin opens goodbye panel; members get social reply later
+        if is_group and text in ('خداحافظ', 'خدافظ') and (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+            await self._show_goodbye_panel(chat_id, message_id=None)
+            return
+
         # ── Group settings panel
         if is_group and text in ('تنظیمات گروه', 'پنل گروه', 'امنیت گروه'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
@@ -733,7 +757,7 @@ class MegaBot:
             return
         if is_group and text.startswith('خوشامدگویی '):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self.safe_send(chat_id, '⛔ فقط ادمین گروه.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
                 return
             body = text[len('خوشامدگویی '):].strip()
             if body in ('خاموش', 'off', 'غیرفعال'):
@@ -746,8 +770,33 @@ class MegaBot:
                 await self.db.set_group_setting_fields(chat_id, welcome_text=None, welcome_enabled=True)
                 await self.safe_send(chat_id, 'متن خوشامد به پیش‌فرض برگشت.', reply_to=msg.get('message_id'), parse_mode=None)
             else:
+                if len(body) > 1000:
+                    await self.safe_send(chat_id, '❌ متن خیلی بلنده (حداکثر ۱۰۰۰ کاراکتر).', reply_to=msg.get('message_id'), parse_mode=None)
+                    return
                 await self.db.set_group_setting_fields(chat_id, welcome_text=body, welcome_enabled=True)
                 await self.safe_send(chat_id, f'✅ متن خوشامدگویی ذخیره شد.\nپیش‌نمایش:\n{body}', reply_to=msg.get('message_id'), parse_mode=None)
+            return
+        if is_group and text.startswith('خداحافظی '):
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
+                return
+            body = text[len('خداحافظی '):].strip()
+            if body in ('خاموش', 'off', 'غیرفعال'):
+                await self.db.set_group_setting_fields(chat_id, goodbye_enabled=False)
+                await self.safe_send(chat_id, '🔴 خداحافظی خاموش شد.', reply_to=msg.get('message_id'), parse_mode=None)
+            elif body in ('روشن', 'on', 'فعال'):
+                await self.db.set_group_setting_fields(chat_id, goodbye_enabled=True)
+                await self.safe_send(chat_id, '🟢 خداحافظی روشن شد.', reply_to=msg.get('message_id'), parse_mode=None)
+            elif body in ('پیش‌فرض', 'پیشفرض', 'default'):
+                await self.db.set_group_setting_fields(chat_id, goodbye_text=None, goodbye_enabled=True)
+                await self.safe_send(chat_id, 'متن خداحافظی به پیش‌فرض برگشت.', reply_to=msg.get('message_id'), parse_mode=None)
+            else:
+                if len(body) > 1000:
+                    await self.safe_send(chat_id, '❌ متن خیلی بلنده (حداکثر ۱۰۰۰ کاراکتر).', reply_to=msg.get('message_id'), parse_mode=None)
+                    return
+                await self.db.set_group_setting_fields(chat_id, goodbye_text=body, goodbye_enabled=True)
+                await self.safe_send(chat_id, f'✅ متن خداحافظی ذخیره شد.\nپیش‌نمایش:\n{body}', reply_to=msg.get('message_id'), parse_mode=None)
+            return
             return
 
         # ── Group stats
@@ -1205,7 +1254,10 @@ class MegaBot:
             return
 
         # Group panel / security / VIP / learn / fun callbacks
-        if data.startswith('grp:') or data.startswith('learn:') or data.startswith('fun:') or data.startswith('lock:'):
+        if (
+            data.startswith('grp:') or data.startswith('learn:') or data.startswith('fun:')
+            or data.startswith('lock:') or data.startswith('wel:') or data.startswith('bye:')
+        ):
             await self._handle_group_callbacks(uid, chat_id, message_id, data, chat)
             return
 
@@ -1540,6 +1592,89 @@ class MegaBot:
                     return random.choice(replies)
         return None
 
+    WELCOME_TEMPLATES = [
+        '🎉 خوش اومدی {mention} عزیز! به جمع ما خوش اومدی.',
+        '🌟 یه عضو جدید به جمعمون اضافه شد! خوش اومدی {mention}!',
+        '👋 سلام {mention}! امیدواریم توی گروه بهمون خوش بگذره.',
+        '🎊 ورودت مبارک {mention}! به گروه خودت خوش اومدی.',
+        '💚 {mention} عزیز، خوشحالیم که به جمعمون پیوستی!',
+        '😎 به جمع ما خوش اومدی {mention}! امیدواریم لحظات خوبی داشته باشی.',
+        '🌱 سلام {mention}! خوش اومدی به *{group}* ✨',
+        '🙌 {mention} اومد وسط جمع! خوش اومدی رفیق 🌿',
+        '✨ ورودت به *{group}* رو خوش‌آمد می‌گیم {mention}!',
+        '🥳 یه‌نفس تازه توی گروه! خوش اومدی {mention} 🍃',
+    ]
+
+    GOODBYE_TEMPLATES = [
+        '👋 خداحافظ {mention}! امیدواریم دوباره ببینیمت.',
+        '💔 {mention} از جمعمون رفت. مراقب خودت باش!',
+        '🌙 فعلاً خداحافظ {mention}! جای تو توی گروه خالی می‌مونه.',
+        '🍀 {mention} عزیز، برات آرزوی موفقیت داریم!',
+        '🚪 {mention} از گروه خارج شد. به امید دیدار دوباره!',
+        '💚 خداحافظ {mention}! امیدواریم دوباره به جمعمون برگردی.',
+        '🌊 فعلاً {mention}، مسیرت سبز باشه 🌱',
+        '✈️ {mention} رفت؛ هر جا هستی موفق باشی!',
+        '🤍 خداحافظ {mention}. در رو باز می‌ذاریم برات.',
+        '🍃 {mention} عزیز، به امید دیدار دوباره در *{group}*.',
+    ]
+
+    # (chat_id, user_id, kind) -> timestamp — anti-duplicate join/leave messages
+    _member_event_dedupe: dict[tuple[int, int, str], float] = {}
+
+    @staticmethod
+    def _md_escape_name(name: str) -> str:
+        if not name:
+            return 'دوست'
+        out = []
+        for ch in str(name):
+            if ch in r'_*[]()`':
+                out.append('\\' + ch)
+            else:
+                out.append(ch)
+        return ''.join(out)[:64] or 'دوست'
+
+    def _format_member_mention(self, member: dict, *, mention: bool = True) -> tuple[str, int, str]:
+        """Return (display_name, uid, mention_or_plain)."""
+        uid = int(member.get('id') or 0)
+        raw_name = (member.get('first_name') or '').strip() or 'دوست'
+        safe = self._md_escape_name(raw_name)
+        if mention and uid:
+            link = f'[{safe}](uid:{uid})'
+        else:
+            link = safe
+        return raw_name, uid, link
+
+    def _member_event_ok(self, chat_id: int, user_id: int, kind: str) -> bool:
+        key = (int(chat_id), int(user_id), kind)
+        now = time.time()
+        last = self._member_event_dedupe.get(key, 0)
+        if now - last < 8.0:
+            return False
+        self._member_event_dedupe[key] = now
+        if len(self._member_event_dedupe) > 3000:
+            cutoff = now - 60
+            self._member_event_dedupe = {k: v for k, v in self._member_event_dedupe.items() if v >= cutoff}
+        return True
+
+    def _render_member_text(
+        self,
+        template: str,
+        *,
+        name: str,
+        uid: int,
+        group: str,
+        mention: str,
+        use_mention: bool,
+    ) -> str:
+        t = template or ''
+        # Support both {name}/{mention}/{group}/{uid} and plain replacements
+        plain = name if not use_mention else mention
+        t = t.replace('{mention}', mention if use_mention else name)
+        t = t.replace('{name}', plain)
+        t = t.replace('{group}', group)
+        t = t.replace('{uid}', str(uid or ''))
+        return t
+
     async def welcome_new_members(self, msg: dict, chat: dict) -> None:
         members = msg.get('new_chat_members') or []
         chat_id = int(chat.get('id') or 0)
@@ -1559,21 +1694,85 @@ class MegaBot:
             return
         rules = await self.db.get_setting(f'rules:{chat_id}')
         custom = (gs.get('welcome_text') or '').strip()
+        varied = bool(gs.get('welcome_varied', True))
+        use_mention = bool(gs.get('welcome_mention', True))
         title = chat.get('title') or 'گروه'
         for member in members[:10]:
-            await self.db.upsert_user(member)
-            name = member.get('first_name') or 'دوست'
-            uid = member.get('id')
+            try:
+                await self.db.upsert_user(member)
+            except Exception:
+                pass
+            if member.get('is_bot'):
+                continue
+            name, muid, mention = self._format_member_mention(member, mention=use_mention)
+            if not muid or not self._member_event_ok(chat_id, muid, 'join'):
+                continue
             if custom:
-                text = custom.replace('{name}', name).replace('{group}', title).replace('{uid}', str(uid or ''))
+                text = self._render_member_text(
+                    custom, name=name, uid=muid, group=title, mention=mention, use_mention=use_mention,
+                )
+            elif varied:
+                tmpl = random.choice(self.WELCOME_TEMPLATES)
+                text = self._render_member_text(
+                    tmpl, name=name, uid=muid, group=title, mention=mention, use_mention=use_mention,
+                )
             else:
-                text = (
-                    f"سلام [{name}](uid:{uid}) عزیز⛱️\n"
-                    f"خیلی خوش اومدی به گروه *{title}*\n"
-                    f"فقط یادت باشه اگه تونستی یه سر به قوانین گروه بزنی ✨️"
+                text = self._render_member_text(
+                    'سلام {mention} عزیز! خوش اومدی به *{group}* ✨',
+                    name=name, uid=muid, group=title, mention=mention, use_mention=use_mention,
                 )
             keyboard = inline([[('📜 قوانین گروه', 'rules:show')]]) if rules else None
-            await self.safe_send(chat_id, text, keyboard)
+            try:
+                await self.safe_send(chat_id, text, keyboard)
+            except Exception:
+                log.exception('welcome send failed chat=%s', chat_id)
+
+    async def goodbye_left_member(self, msg: dict, chat: dict) -> None:
+        left = msg.get('left_chat_member') or {}
+        chat_id = int(chat.get('id') or 0)
+        if not chat_id or not left:
+            return
+        if left.get('is_bot'):
+            return
+        # Skip if the leaver is the bot itself
+        if self.bot_id and int(left.get('id') or 0) == self.bot_id:
+            return
+        gs = await self.db.get_group_settings(chat_id)
+        if not gs.get('goodbye_enabled', True):
+            return
+        name, muid, mention = self._format_member_mention(left, mention=True)
+        if not muid or not self._member_event_ok(chat_id, muid, 'leave'):
+            return
+        try:
+            await self.db.upsert_user(left)
+        except Exception:
+            pass
+        custom = (gs.get('goodbye_text') or '').strip()
+        varied = bool(gs.get('goodbye_varied', True))
+        title = chat.get('title') or 'گروه'
+        # Prefer uid mention; if markdown fails, safe_send has fallbacks without parse_mode
+        if custom:
+            text = self._render_member_text(
+                custom, name=name, uid=muid, group=title, mention=mention, use_mention=True,
+            )
+        elif varied:
+            tmpl = random.choice(self.GOODBYE_TEMPLATES)
+            text = self._render_member_text(
+                tmpl, name=name, uid=muid, group=title, mention=mention, use_mention=True,
+            )
+        else:
+            text = self._render_member_text(
+                '👋 خداحافظ {mention}! به امید دیدار.',
+                name=name, uid=muid, group=title, mention=mention, use_mention=True,
+            )
+        try:
+            await self.safe_send(chat_id, text)
+        except Exception:
+            log.exception('goodbye send failed chat=%s', chat_id)
+            try:
+                await self.safe_send(chat_id, f'👋 خداحافظ {name}! به امید دیدار.', parse_mode=None)
+            except Exception:
+                pass
 
     GUIDE_ENTRIES = [
         ('📌 دستورات عمومی',
@@ -1626,11 +1825,13 @@ class MegaBot:
          '• `گیف` — بدون متن\n'
          '• `گیف متن دلخواه` — با نوشته روی تصویر\n'
          'دسترسی: همه کاربران'),
-        ('📌 پین، قوانین، خوشامد',
+        ('📌 پین، قوانین، خوشامد و بدرقه',
          '• `پین` — ریپلای + پین (ادمین)\n'
          '• `تنظیم قوانین متن...` / `قوانین`\n'
-         '• `تنظیمات گروه` — پنل مدیر گروه (خوشامد، امنیت، ویژه)\n'
-         '• `خوشامدگویی متن...` — متن اختصاصی گروه\n'
+         '• `تنظیمات گروه` — پنل مدیر گروه\n'
+         '• `خوشامد` / `خوشامدها` — پنل خوشامدگویی\n'
+         '• `خداحافظی` / `بدرقه` — پنل خداحافظی\n'
+         '• `خوشامدگویی متن...` / `خداحافظی متن...`\n'
          'دسترسی: ادمین همان گروه'),
         ('🔐 قفل‌ها و ضداسپم',
          'دستور: `قفل` / `قفل‌ها` / `ضداسپم`\n'
@@ -2963,7 +3164,7 @@ class MegaBot:
             f"سقف اخطار: {gs.get('warn_limit', 3)}",
             inline([
                 [('🔐 قفل‌ها و ضداسپم', 'lock:panel'), ('⭐ لیست ویژه‌ها', 'grp:vips:0')],
-                [('🟢/🔴 خوشامد', 'grp:welcome_toggle'), ('📝 راهنمای خوشامد', 'grp:welcome_help')],
+                [('👋 پنل خوشامد', 'wel:panel'), ('🚪 پنل خداحافظی', 'bye:panel')],
                 [('🧠 لیست یادگیری', 'learn:list:0'), ('✖️ بستن', 'close')],
             ]),
         )
@@ -3222,19 +3423,153 @@ class MegaBot:
             await self.db.update_moderation(chat_id, reset_warns_on_punish=not mod.get('reset_warns_on_punish', True))
             await self._show_punish_config(chat_id, message_id)
             return
-        if data == 'grp:welcome_toggle':
+        if data == 'grp:welcome_toggle' or data == 'wel:toggle':
             gs = await self.db.get_group_settings(chat_id)
             new_v = not gs.get('welcome_enabled', True)
             await self.db.set_group_setting_fields(chat_id, welcome_enabled=new_v)
-            await self.safe_send(chat_id, '🟢 خوشامدگویی روشن شد.' if new_v else '🔴 خوشامدگویی خاموش شد.', parse_mode=None)
+            await self._show_welcome_panel(chat_id, message_id)
             return
-        if data == 'grp:welcome_help':
-            await self.safe_send(
-                chat_id,
-                'برای تنظیم متن:\n`خوشامدگویی متن دلخواه`\nمتغیرها: {name} {group} {uid}\n'
-                'روشن/خاموش: `خوشامدگویی روشن` / `خوشامدگویی خاموش`\n'
-                'بازگشت به پیش‌فرض: `خوشامدگویی پیش‌فرض`',
-                parse_mode=None,
+        if data == 'grp:welcome_help' or data == 'wel:help':
+            await self.safe_edit(
+                chat_id, message_id,
+                '📝 *راهنمای متن خوشامد*\n\n'
+                'دستور متن:\n`خوشامدگویی متن دلخواه شما`\n\n'
+                'متغیرها:\n'
+                '• `{name}` نام کاربر\n'
+                '• `{mention}` منشن با uid\n'
+                '• `{group}` نام گروه\n'
+                '• `{uid}` شناسه عددی\n\n'
+                'روشن/خاموش از پنل یا:\n`خوشامدگویی روشن` / `خوشامدگویی خاموش`\n'
+                'پیش‌فرض: `خوشامدگویی پیش‌فرض`',
+                inline([[('🔙 بازگشت', 'wel:panel'), ('✖️ بستن', 'close')]]),
+            )
+            return
+        if data == 'wel:panel':
+            await self._show_welcome_panel(chat_id, message_id)
+            return
+        if data == 'wel:refresh':
+            await self._show_welcome_panel(chat_id, message_id)
+            return
+        if data == 'wel:view':
+            gs = await self.db.get_group_settings(chat_id)
+            custom = (gs.get('welcome_text') or '').strip()
+            body = custom if custom else '— از پاسخ‌های متنوع پیش‌فرض استفاده می‌شود —'
+            await self.safe_edit(
+                chat_id, message_id,
+                f'👁 *متن خوشامد فعلی:*\n\n{body}',
+                inline([[('🔙 بازگشت', 'wel:panel')]]),
+            )
+            return
+        if data == 'wel:preview':
+            gs = await self.db.get_group_settings(chat_id)
+            title = (chat.get('title') or 'گروه')
+            sample_uid = uid
+            sample_name = 'کاربر نمونه'
+            mention = f'[{self._md_escape_name(sample_name)}](uid:{sample_uid})'
+            use_mention = bool(gs.get('welcome_mention', True))
+            custom = (gs.get('welcome_text') or '').strip()
+            if custom:
+                text = self._render_member_text(
+                    custom, name=sample_name, uid=sample_uid, group=title, mention=mention, use_mention=use_mention,
+                )
+            else:
+                tmpl = random.choice(self.WELCOME_TEMPLATES)
+                text = self._render_member_text(
+                    tmpl, name=sample_name, uid=sample_uid, group=title, mention=mention, use_mention=use_mention,
+                )
+            await self.safe_edit(
+                chat_id, message_id,
+                f'🔎 *پیش‌نمایش خوشامد:*\n\n{text}',
+                inline([[('🔙 بازگشت', 'wel:panel')]]),
+            )
+            return
+        if data == 'wel:default':
+            await self.db.set_group_setting_fields(chat_id, welcome_text=None, welcome_enabled=True)
+            await self._show_welcome_panel(chat_id, message_id)
+            return
+        if data == 'wel:varied':
+            gs = await self.db.get_group_settings(chat_id)
+            await self.db.set_group_setting_fields(chat_id, welcome_varied=not gs.get('welcome_varied', True))
+            await self._show_welcome_panel(chat_id, message_id)
+            return
+        if data == 'wel:mention':
+            gs = await self.db.get_group_settings(chat_id)
+            await self.db.set_group_setting_fields(chat_id, welcome_mention=not gs.get('welcome_mention', True))
+            await self._show_welcome_panel(chat_id, message_id)
+            return
+        if data == 'wel:settext':
+            self.states[uid] = {'step': 'welcome_text', 'chat_id': chat_id, 'message_id': message_id}
+            await self.safe_edit(
+                chat_id, message_id,
+                '✏️ متن خوشامد جدید را بفرست.\nمتغیرها: `{name}` `{mention}` `{group}` `{uid}`\nبرای لغو: `لغو`',
+                inline([[('❌ لغو', 'wel:panel')]]),
+            )
+            return
+        # ── Goodbye panel callbacks
+        if data == 'bye:panel':
+            await self._show_goodbye_panel(chat_id, message_id)
+            return
+        if data == 'bye:toggle':
+            gs = await self.db.get_group_settings(chat_id)
+            await self.db.set_group_setting_fields(chat_id, goodbye_enabled=not gs.get('goodbye_enabled', True))
+            await self._show_goodbye_panel(chat_id, message_id)
+            return
+        if data == 'bye:varied':
+            gs = await self.db.get_group_settings(chat_id)
+            await self.db.set_group_setting_fields(chat_id, goodbye_varied=not gs.get('goodbye_varied', True))
+            await self._show_goodbye_panel(chat_id, message_id)
+            return
+        if data == 'bye:default':
+            await self.db.set_group_setting_fields(chat_id, goodbye_text=None, goodbye_enabled=True)
+            await self._show_goodbye_panel(chat_id, message_id)
+            return
+        if data == 'bye:view':
+            gs = await self.db.get_group_settings(chat_id)
+            custom = (gs.get('goodbye_text') or '').strip()
+            body = custom if custom else '— از پاسخ‌های متنوع پیش‌فرض استفاده می‌شود —'
+            await self.safe_edit(
+                chat_id, message_id,
+                f'👁 *متن خداحافظی فعلی:*\n\n{body}',
+                inline([[('🔙 بازگشت', 'bye:panel')]]),
+            )
+            return
+        if data == 'bye:preview':
+            gs = await self.db.get_group_settings(chat_id)
+            title = (chat.get('title') or 'گروه')
+            sample_name = 'کاربر نمونه'
+            mention = f'[{self._md_escape_name(sample_name)}](uid:{uid})'
+            custom = (gs.get('goodbye_text') or '').strip()
+            if custom:
+                text = self._render_member_text(
+                    custom, name=sample_name, uid=uid, group=title, mention=mention, use_mention=True,
+                )
+            else:
+                tmpl = random.choice(self.GOODBYE_TEMPLATES)
+                text = self._render_member_text(
+                    tmpl, name=sample_name, uid=uid, group=title, mention=mention, use_mention=True,
+                )
+            await self.safe_edit(
+                chat_id, message_id,
+                f'🔎 *پیش‌نمایش خداحافظی:*\n\n{text}',
+                inline([[('🔙 بازگشت', 'bye:panel')]]),
+            )
+            return
+        if data == 'bye:settext':
+            self.states[uid] = {'step': 'goodbye_text', 'chat_id': chat_id, 'message_id': message_id}
+            await self.safe_edit(
+                chat_id, message_id,
+                '✏️ متن خداحافظی جدید را بفرست.\nمتغیرها: `{name}` `{mention}` `{group}` `{uid}`\nبرای لغو: `لغو`',
+                inline([[('❌ لغو', 'bye:panel')]]),
+            )
+            return
+        if data == 'bye:help':
+            await self.safe_edit(
+                chat_id, message_id,
+                '📝 *راهنمای خداحافظی*\n\n'
+                'دستور متن:\n`خداحافظی متن دلخواه شما`\n\n'
+                'متغیرها: `{name}` `{mention}` `{group}` `{uid}`\n'
+                'روشن/خاموش از پنل.',
+                inline([[('🔙 بازگشت', 'bye:panel')]]),
             )
             return
         if data.startswith('grp:vips:'):
@@ -3284,6 +3619,63 @@ class MegaBot:
         ])
         rows.append([('✖️ بستن', 'close')])
         return inline(rows)
+
+    async def _show_welcome_panel(self, chat_id: int, message_id: int | None = None) -> None:
+        gs = await self.db.get_group_settings(chat_id)
+        on = '🟢 روشن' if gs.get('welcome_enabled', True) else '🔴 خاموش'
+        varied = '🟢' if gs.get('welcome_varied', True) else '🔴'
+        mention = '🟢' if gs.get('welcome_mention', True) else '🔴'
+        custom = (gs.get('welcome_text') or '').strip()
+        text_status = 'سفارشی' if custom else 'پیش‌فرض متنوع'
+        body = (
+            f'👋 *پنل خوشامدگویی*\n\n'
+            f'وضعیت: *{on}*\n'
+            f'متن: *{text_status}*\n'
+            f'پاسخ‌های متنوع: {varied}\n'
+            f'نمایش نام با منشن: {mention}\n'
+        )
+        if custom:
+            preview = custom if len(custom) <= 120 else custom[:117] + '...'
+            body += f'\nمتن فعلی:\n`{preview}`\n'
+        kb = inline([
+            [('🟢/🔴 روشن-خاموش', 'wel:toggle'), ('👁 مشاهده متن', 'wel:view')],
+            [('✏️ تغییر متن', 'wel:settext'), ('🔎 پیش‌نمایش', 'wel:preview')],
+            [(f'{varied} پاسخ متنوع', 'wel:varied'), (f'{mention} منشن نام', 'wel:mention')],
+            [('♻️ متن پیش‌فرض', 'wel:default'), ('❓ راهنما', 'wel:help')],
+            [('🔄 تازه‌سازی', 'wel:refresh'), ('🔙 بازگشت', 'grp:panel')],
+            [('✖️ بستن', 'close')],
+        ])
+        if message_id:
+            await self.safe_edit(chat_id, message_id, body, kb)
+        else:
+            await self.safe_send(chat_id, body, kb)
+
+    async def _show_goodbye_panel(self, chat_id: int, message_id: int | None = None) -> None:
+        gs = await self.db.get_group_settings(chat_id)
+        on = '🟢 روشن' if gs.get('goodbye_enabled', True) else '🔴 خاموش'
+        varied = '🟢' if gs.get('goodbye_varied', True) else '🔴'
+        custom = (gs.get('goodbye_text') or '').strip()
+        text_status = 'سفارشی' if custom else 'پیش‌فرض متنوع'
+        body = (
+            f'🚪 *پنل خداحافظی / بدرقه*\n\n'
+            f'وضعیت: *{on}*\n'
+            f'متن: *{text_status}*\n'
+            f'پاسخ‌های متنوع: {varied}\n'
+        )
+        if custom:
+            preview = custom if len(custom) <= 120 else custom[:117] + '...'
+            body += f'\nمتن فعلی:\n`{preview}`\n'
+        kb = inline([
+            [('🟢/🔴 روشن-خاموش', 'bye:toggle'), ('👁 مشاهده متن', 'bye:view')],
+            [('✏️ تغییر متن', 'bye:settext'), ('🔎 پیش‌نمایش', 'bye:preview')],
+            [(f'{varied} پاسخ متنوع', 'bye:varied'), ('♻️ متن پیش‌فرض', 'bye:default')],
+            [('❓ راهنما', 'bye:help'), ('🔄 تازه‌سازی', 'bye:panel')],
+            [('🔙 بازگشت', 'grp:panel'), ('✖️ بستن', 'close')],
+        ])
+        if message_id:
+            await self.safe_edit(chat_id, message_id, body, kb)
+        else:
+            await self.safe_send(chat_id, body, kb)
 
     async def _show_locks_panel(self, chat_id: int, message_id: int | None = None, header: str | None = None) -> None:
         gs = await self.db.get_group_settings(chat_id)
@@ -3401,6 +3793,30 @@ class MegaBot:
 
     async def handle_state(self, chat_id: int, uid: int, user: dict, text: str, state: dict, msg: dict) -> bool:
         step=state.get('step')
+        if step in ('welcome_text', 'goodbye_text'):
+            if text.strip() in ('لغو', 'cancel', 'انصراف'):
+                self.states.pop(uid, None)
+                if step == 'welcome_text':
+                    await self._show_welcome_panel(chat_id, state.get('message_id'))
+                else:
+                    await self._show_goodbye_panel(chat_id, state.get('message_id'))
+                return True
+            body = text.strip()
+            if not body or len(body) > 1000:
+                await self.safe_send(chat_id, '❌ متن خالی یا بیش از حد بلند است (حداکثر ۱۰۰۰).', parse_mode=None)
+                return True
+            target_chat = int(state.get('chat_id') or chat_id)
+            if step == 'welcome_text':
+                await self.db.set_group_setting_fields(target_chat, welcome_text=body, welcome_enabled=True)
+                self.states.pop(uid, None)
+                await self.safe_send(chat_id, f'✅ متن خوشامد ذخیره شد.\nپیش‌نمایش:\n{body}', parse_mode=None)
+                await self._show_welcome_panel(chat_id, None)
+            else:
+                await self.db.set_group_setting_fields(target_chat, goodbye_text=body, goodbye_enabled=True)
+                self.states.pop(uid, None)
+                await self.safe_send(chat_id, f'✅ متن خداحافظی ذخیره شد.\nپیش‌نمایش:\n{body}', parse_mode=None)
+                await self._show_goodbye_panel(chat_id, None)
+            return True
         if step == 'ad_url':
             normalized = self._validate_bale_link(text)
             if not normalized:

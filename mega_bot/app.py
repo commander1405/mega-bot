@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio, json, logging, random, re, secrets, string, time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 from .bale_api import BaleAPI, BaleAPIError
@@ -51,6 +52,10 @@ class MegaBot:
         self._broadcast_running: bool = False
         # Whisper rate-limit: user_id -> list of send timestamps
         self._whisper_sends: dict[int, list[float]] = {}
+        # Recent group message ids for purge: chat_id -> deque of message_id
+        self._recent_mids: dict[int, deque] = {}
+        # Pending purge confirmations: token -> {chat_id, uid, mids, expires}
+        self._purge_pending: dict[str, dict[str, Any]] = {}
 
     async def _get_ad_config(self) -> tuple[bool, str, str]:
         """Return (enabled, url, title). Cached for 30s to avoid DB hit on every send."""
@@ -323,6 +328,8 @@ class MegaBot:
                 chat_id, chat_type, uid, (text or '')[:80],
                 bool(msg.get('reply_to_message')), bot_st,
             )
+            if msg.get('message_id'):
+                self._track_group_mid(chat_id, int(msg['message_id']))
 
         # /ping works in EVERY chat, BEFORE any DB or admin logic.
         # This is the primary liveness probe for group-admin regressions.
@@ -385,6 +392,16 @@ class MegaBot:
                 log.exception('GIF conversion failed')
                 await self.safe_send(chat_id, f'ساخت GIF ناموفق بود: {self._short(exc)}')
             return
+
+        # Track recent message ids (for پاک)
+        if is_group and msg.get('message_id'):
+            self._track_group_mid(chat_id, int(msg['message_id']))
+
+        # Group purge: پاک / پاک N / reply+پاک
+        if is_group and text:
+            handled_purge = await self._handle_purge_command(chat_id, uid, text, msg, replied)
+            if handled_purge:
+                return
 
         # Group moderation + warn commands (reply or @user / numeric id)
         if self._is_group_chat(chat) and text:
@@ -1162,6 +1179,9 @@ class MegaBot:
             return
 
         # Group panel / security / VIP / learn / fun callbacks
+        if data.startswith('purge:'):
+            await self._handle_purge_callback(uid, chat_id, message_id, data)
+            return
         if (
             data.startswith('grp:') or data.startswith('learn:') or data.startswith('fun:')
             or data.startswith('lock:') or data.startswith('wel:') or data.startswith('bye:')
@@ -2872,6 +2892,191 @@ class MegaBot:
     _FLOOD_WINDOW: dict[tuple[int, int], list[float]] = {}
 
     # Lock keys shown in panel (label, security key)
+    PURGE_MAX = 150
+    PURGE_CONFIRM_THRESHOLD = 50
+
+    def _track_group_mid(self, chat_id: int, mid: int) -> None:
+        if not mid:
+            return
+        buf = self._recent_mids.get(chat_id)
+        if buf is None:
+            buf = deque(maxlen=200)
+            self._recent_mids[chat_id] = buf
+        if not buf or buf[-1] != mid:
+            buf.append(int(mid))
+
+    @staticmethod
+    def _fa_digits_to_en(s: str) -> str:
+        table = str.maketrans('۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩', '01234567890123456789')
+        return (s or '').translate(table)
+
+    def _collect_purge_mids_count(self, chat_id: int, count: int, current_mid: int | None) -> list[int]:
+        """Last N message ids from buffer; fill gaps by counting back from current if needed."""
+        count = max(1, min(int(count), self.PURGE_MAX))
+        buf = list(self._recent_mids.get(chat_id) or [])
+        mids: list[int] = []
+        if buf:
+            mids = buf[-count:]
+        # Also try sequential range from current_mid backward (Bale ids are usually sequential)
+        if current_mid and len(mids) < count:
+            start = max(1, int(current_mid) - count + 1)
+            seq = list(range(start, int(current_mid) + 1))
+            mids = sorted(set(mids) | set(seq))[-count:]
+        if current_mid and current_mid not in mids:
+            mids.append(int(current_mid))
+        return sorted(set(int(x) for x in mids if x))
+
+    def _collect_purge_mids_from_reply(
+        self, chat_id: int, from_mid: int, current_mid: int | None,
+    ) -> list[int]:
+        """Delete replied message and all newer ones we know of (mid >= from_mid)."""
+        from_mid = int(from_mid)
+        buf = list(self._recent_mids.get(chat_id) or [])
+        mids = [m for m in buf if m >= from_mid]
+        if current_mid:
+            # sequential fill between from and current
+            hi = int(current_mid)
+            if hi >= from_mid:
+                mids.extend(range(from_mid, hi + 1))
+        mids.append(from_mid)
+        mids = sorted(set(int(x) for x in mids if x))
+        if len(mids) > self.PURGE_MAX:
+            mids = mids[-self.PURGE_MAX:]
+        return mids
+
+    async def _delete_mids(self, chat_id: int, mids: list[int]) -> tuple[int, int]:
+        ok, fail = 0, 0
+        for mid in mids:
+            try:
+                await self.api.delete_message(chat_id, int(mid))
+                ok += 1
+                # small yield to avoid hammering API
+                if ok % 15 == 0:
+                    await asyncio.sleep(0.15)
+            except Exception:
+                fail += 1
+        # prune deleted from buffer
+        buf = self._recent_mids.get(chat_id)
+        if buf is not None:
+            deleted = set(mids)
+            self._recent_mids[chat_id] = deque((m for m in buf if m not in deleted), maxlen=200)
+        return ok, fail
+
+    async def _handle_purge_command(
+        self, chat_id: int, uid: int, text: str, msg: dict, replied: dict,
+    ) -> bool:
+        t = self._fa_digits_to_en((text or '').strip())
+        t = re.sub(r'\s+', ' ', t)
+        if not (t == 'پاک' or t.startswith('پاک ')):
+            return False
+
+        if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+            await self.safe_send(chat_id, '⛔ برای این کار باید مدیر گروه باشی!', reply_to=msg.get('message_id'), parse_mode=None)
+            return True
+
+        current_mid = int(msg.get('message_id') or 0) or None
+        mids: list[int] = []
+
+        if t == 'پاک' and replied and replied.get('message_id'):
+            from_mid = int(replied['message_id'])
+            mids = self._collect_purge_mids_from_reply(chat_id, from_mid, current_mid)
+            # include the admin's «پاک» command message
+            if current_mid:
+                mids = sorted(set(mids) | {current_mid})
+        elif t.startswith('پاک '):
+            rest = t[len('پاک '):].strip()
+            if not rest.isdigit():
+                await self.safe_send(
+                    chat_id,
+                    '❓ فرمت: `پاک ۵` یا ریپلای روی پیام + `پاک`\nحداکثر ۱۵۰ پیام.',
+                    reply_to=msg.get('message_id'),
+                    parse_mode=None,
+                )
+                return True
+            n = int(rest)
+            if n < 1:
+                await self.safe_send(chat_id, '❌ عدد باید حداقل ۱ باشد.', reply_to=msg.get('message_id'), parse_mode=None)
+                return True
+            if n > self.PURGE_MAX:
+                await self.safe_send(chat_id, f'❌ حداکثر {self.PURGE_MAX} پیام آخر قابل حذف است.', reply_to=msg.get('message_id'), parse_mode=None)
+                return True
+            mids = self._collect_purge_mids_count(chat_id, n, current_mid)
+        else:
+            # bare «پاک» without reply
+            await self.safe_send(
+                chat_id,
+                '❓ برای پاک کردن:\n• `پاک ۵` — آخرین پیام‌ها\n• ریپلای روی یک پیام + `پاک` — همان پیام و پیام‌های بعدش',
+                reply_to=msg.get('message_id'),
+                parse_mode=None,
+            )
+            return True
+
+        if not mids:
+            await self.safe_send(chat_id, '🔎 پیامی برای حذف پیدا نشد.', reply_to=msg.get('message_id'), parse_mode=None)
+            return True
+
+        count = len(mids)
+        if count >= self.PURGE_CONFIRM_THRESHOLD:
+            token = secrets.token_hex(4)
+            self._purge_pending[token] = {
+                'chat_id': chat_id,
+                'uid': uid,
+                'mids': mids,
+                'expires': time.time() + 120,
+            }
+            await self.safe_send(
+                chat_id,
+                f'⚠️ آیا از انجام دادن این عملیات مطمئن هستید؟\n🗑 حدود *{count}* پیام حذف می‌شود.',
+                keyboard=inline([
+                    [('✅ بله', f'purge:yes:{token}'), ('❌ خیر', f'purge:no:{token}')],
+                ]),
+                parse_mode=None,
+            )
+            return True
+
+        ok, fail = await self._delete_mids(chat_id, mids)
+        await self.safe_send(
+            chat_id,
+            f'✅ پاک‌سازی انجام شد.\nحذف‌شده: {ok}' + (f'\nناموفق: {fail}' if fail else ''),
+            parse_mode=None,
+        )
+        return True
+
+    async def _handle_purge_callback(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
+        parts = data.split(':', 2)
+        if len(parts) < 3:
+            return
+        _, decision, token = parts
+        pending = self._purge_pending.get(token)
+        if not pending or pending.get('expires', 0) < time.time():
+            self._purge_pending.pop(token, None)
+            await self.safe_edit(chat_id, message_id, '⌛ این درخواست منقضی شده.', None)
+            return
+        if int(pending.get('chat_id') or 0) != chat_id:
+            await self.safe_send(chat_id, '⛔ این عملیات مربوط به این گروه نیست.', parse_mode=None)
+            return
+        if int(pending.get('uid') or 0) != uid and uid != OWNER_ID:
+            await self.safe_send(chat_id, '⛔ فقط کسی که درخواست داده می‌تواند تأیید کند.', parse_mode=None)
+            return
+        if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+            await self.safe_send(chat_id, '⛔ برای این کار باید مدیر گروه باشی!', parse_mode=None)
+            return
+        if decision == 'no':
+            self._purge_pending.pop(token, None)
+            await self.safe_edit(chat_id, message_id, '❌ عملیات پاک‌سازی لغو شد.', None)
+            return
+        if decision != 'yes':
+            return
+        mids = list(pending.get('mids') or [])
+        self._purge_pending.pop(token, None)
+        await self.safe_edit(chat_id, message_id, '⏳ در حال پاک‌سازی...', None)
+        ok, fail = await self._delete_mids(chat_id, mids)
+        await self.safe_send(
+            chat_id,
+            f'✅ پاک‌سازی انجام شد.\nحذف‌شده: {ok}' + (f'\nناموفق: {fail}' if fail else ''),
+            parse_mode=None,
+        )
+
     async def _resolve_mod_target(
         self, chat_id: int, text_arg: str, replied: dict, entities: list | None = None,
     ) -> tuple[int | None, str, str | None]:

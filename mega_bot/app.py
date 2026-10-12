@@ -59,6 +59,8 @@ class MegaBot:
         # Pending purge confirmations: token -> {chat_id, uid, mids, expires}
         self._purge_pending: dict[str, dict[str, Any]] = {}
         self._stats_cache: dict | None = None
+        self._time_lock_cache: dict[int, tuple[bool, float]] = {}  # chat_id -> (locked, expires_ts)
+        self._lock_announce_cooldown: dict[int, float] = {}  # chat_id -> last announce ts
         self._stats_cache_ts: float = 0.0
 
     async def _get_ad_config(self) -> tuple[bool, str, str]:
@@ -531,6 +533,14 @@ class MegaBot:
                 await self.db.record_group_message(chat_id, uid, msg)
             except Exception:
                 pass
+
+        # Timed / manual group lock: delete non-admin messages immediately
+        if is_group and uid and uid != OWNER_ID:
+            try:
+                if await self._enforce_group_time_lock(chat_id, uid, msg):
+                    return
+            except Exception:
+                log.exception('time-lock enforce error chat=%s', chat_id)
 
         # Security filters (groups only; admins/owner exempt)
         if is_group and uid and uid != OWNER_ID:
@@ -3688,6 +3698,136 @@ class MegaBot:
         ('joinrestrict', '🚷 محدودیت عضویت'),
     ]
 
+
+    async def _group_time_locked(self, chat_id: int) -> bool:
+        """True if manual or schedule lock should silence non-admins right now."""
+        now = time.time()
+        cached = self._time_lock_cache.get(chat_id)
+        if cached and cached[1] > now:
+            return cached[0]
+        locked = False
+        try:
+            gs = await self.db.get_group_settings(chat_id)
+            mod = dict(gs.get('moderation') or {})
+            if mod.get('manual_group_lock'):
+                locked = True
+            else:
+                # Live evaluate schedules (not only stale is_active_now flag)
+                try:
+                    locked = await self._desired_schedule_lock(chat_id)
+                except Exception:
+                    locked = bool(mod.get('schedule_group_lock')) or await self.db.any_schedule_active_for_chat(chat_id)
+        except Exception:
+            log.debug('group_time_locked check failed chat=%s', chat_id, exc_info=True)
+            locked = False
+        self._time_lock_cache[chat_id] = (locked, now + 3.0)  # short TTL
+        return locked
+
+    def _invalidate_time_lock_cache(self, chat_id: int | None = None) -> None:
+        if chat_id is None:
+            self._time_lock_cache.clear()
+        else:
+            self._time_lock_cache.pop(int(chat_id), None)
+
+    async def _active_schedule_windows_text(self, chat_id: int) -> str:
+        """Human text of currently active enabled schedules for announcements."""
+        try:
+            rows = await self.db.list_lock_schedules(chat_id)
+        except Exception:
+            return ''
+        parts = []
+        for r in rows:
+            if not r.get('enabled'):
+                continue
+            if not r.get('is_active_now'):
+                continue
+            start = r.get('start_hm') or '?'
+            end = r.get('end_hm') or '?'
+            parts.append(f'{start} تا {end}')
+        if not parts:
+            # fallback: any enabled schedule description
+            for r in rows:
+                if r.get('enabled'):
+                    start = r.get('start_hm') or '?'
+                    end = r.get('end_hm') or '?'
+                    parts.append(f'{start} تا {end}')
+                    break
+        return '، '.join(parts) if parts else 'بازه تعیین‌شده'
+
+    async def _enforce_group_time_lock(
+        self, chat_id: int, uid: int, msg: dict,
+    ) -> bool:
+        """If group is time-locked, delete non-admin messages immediately. Returns True if blocked."""
+        if not uid or uid == OWNER_ID:
+            return False
+        try:
+            locked = await self._group_time_locked(chat_id)
+        except Exception:
+            return False
+        if not locked:
+            return False
+        try:
+            if await self._is_chat_admin(chat_id, uid):
+                return False
+        except Exception:
+            # If admin check fails, still enforce lock for safety of members
+            pass
+
+        mid = msg.get('message_id')
+        deleted = False
+        if mid:
+            try:
+                await self.api.delete_message(chat_id, int(mid))
+                deleted = True
+            except Exception as exc:
+                log.info(
+                    'time-lock delete failed chat=%s mid=%s: %s',
+                    chat_id, mid, type(exc).__name__,
+                )
+        # Optional soft notice to user — rate limited so chat is not flooded
+        now = time.time()
+        notice_key = f'tl_notice:{chat_id}'
+        last = float(self.game_cache.get(notice_key, {}).get('ts', 0) if isinstance(self.game_cache.get(notice_key), dict) else 0)
+        if now - last >= 45:
+            self.game_cache[notice_key] = {'ts': now}
+            try:
+                window = await self._active_schedule_windows_text(chat_id)
+                await self.safe_send(
+                    chat_id,
+                    f'🔒 گروه در بازه قفل زمانی است ({window}).\n'
+                    f'فقط مدیران می‌توانند پیام بفرستند؛ پیام اعضای عادی حذف می‌شود.',
+                    parse_mode=None,
+                )
+            except Exception:
+                pass
+        log.info('time-lock blocked msg chat=%s uid=%s deleted=%s', chat_id, uid, deleted)
+        return True
+
+    async def _announce_schedule_lock(self, chat_id: int, locking: bool) -> None:
+        """Announce when schedule lock engages or ends (not on every scheduler tick)."""
+        now = time.time()
+        # prevent double announce within 20s
+        last = self._lock_announce_cooldown.get(chat_id, 0)
+        if now - last < 20:
+            return
+        self._lock_announce_cooldown[chat_id] = now
+        try:
+            if locking:
+                window = await self._active_schedule_windows_text(chat_id)
+                text = (
+                    f'🔒 گروه توسط مدیریت قفل شد.\n'
+                    f'در بازه زمانی {window} هیچ‌کس (به‌جز مدیران) حق ارسال پیام ندارد.\n'
+                    f'پیام‌های اعضا در این مدت حذف می‌شوند.'
+                )
+            else:
+                text = (
+                    '🔓 قفل زمانی گروه پایان یافت.\n'
+                    'اعضا دوباره می‌توانند پیام ارسال کنند.'
+                )
+            await self.safe_send(chat_id, text, parse_mode=None)
+        except Exception:
+            log.exception('schedule lock announce failed chat=%s', chat_id)
+
     async def _apply_security_filters(self, chat_id: int, uid: int, msg: dict, text: str) -> bool:
         """Return True if message was blocked (caller should stop processing).
 
@@ -4707,13 +4847,28 @@ class MegaBot:
             sched = bool(mod.get('schedule_group_lock'))
         want_lock = manual or sched
         prev_sched = bool(mod.get('schedule_group_lock'))
+        prev_want = bool(mod.get('group_lock_effective'))
         if sched != prev_sched:
             try:
                 await self.db.update_moderation(chat_id, schedule_group_lock=sched)
             except Exception:
                 log.exception('update schedule_group_lock flag failed')
 
-        # If state unchanged relative to last applied schedule+manual, still try sync on manual_sync
+        # Persist effective lock for fast path + announce on edge
+        try:
+            await self.db.update_moderation(chat_id, group_lock_effective=want_lock)
+        except Exception:
+            log.debug('update group_lock_effective failed', exc_info=True)
+
+        self._invalidate_time_lock_cache(chat_id)
+
+        # Announce only when schedule portion transitions (not every 30s tick)
+        if sched and not prev_sched:
+            await self._announce_schedule_lock(chat_id, locking=True)
+        elif (not sched) and prev_sched and not manual:
+            await self._announce_schedule_lock(chat_id, locking=False)
+
+        # Best-effort platform permissions (may be unsupported on Bale)
         try:
             if want_lock:
                 await self.api.set_chat_permissions(chat_id, schlock.PERMS_LOCKED)
@@ -4723,7 +4878,7 @@ class MegaBot:
                 log.info('group UNLOCKED chat=%s reason=%s', chat_id, reason)
         except Exception as exc:
             log.warning('setChatPermissions failed chat=%s reason=%s: %s', chat_id, reason, type(exc).__name__)
-            # Do not claim success
+            # Enforcement continues via message deletion path
 
     async def _schedule_lock_loop(self) -> None:
         """One global loop: every ~30s evaluate schedules and sync permissions."""
@@ -4743,7 +4898,7 @@ class MegaBot:
                 raise
             except Exception:
                 log.exception('schedule lock loop error')
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
 
     async def _show_join_restrict_config(self, chat_id: int, message_id: int) -> None:
         gs = await self.db.get_group_settings(chat_id)

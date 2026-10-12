@@ -671,6 +671,7 @@ class Database:
         'join_window_count': 0,            # joins counted in current window
         'manual_group_lock': False,
         'schedule_group_lock': False,
+        'group_lock_effective': False,  # final: manual OR schedule (for fast enforce)
     }
 
     async def get_group_settings(self, chat_id: int) -> dict:

@@ -80,15 +80,63 @@ class MegaBot:
         self._ad_cache = None
         self._ad_cache_ts = 0.0
 
+
+    async def _metric_out(self, success: bool) -> None:
+        try:
+            day = await self.db.tehran_today()
+            if success:
+                await self.db.metric_inc('msg_out_ok', 1, day=day)
+                await self.db.metric_set('last_out_ts', int(time.time()))
+            else:
+                await self.db.metric_inc('msg_out_fail', 1, day=day)
+                await self.db.metric_set('last_err_ts', int(time.time()))
+                await self.db.metric_inc('err_total', 1, day=day)
+            self._invalidate_stats_cache()
+        except Exception:
+            log.debug('metric_out failed', exc_info=True)
+
+    async def _metric_in(self, chat: dict, responded: bool = False) -> None:
+        try:
+            day = await self.db.tehran_today()
+            ctype = (chat.get('type') or 'private')
+            await self.db.metric_inc('msg_in', 1, day=day)
+            if ctype in ('group', 'supergroup'):
+                await self.db.metric_inc('msg_in_group', 1, day=day)
+            else:
+                await self.db.metric_inc('msg_in_private', 1, day=day)
+            if responded:
+                await self.db.metric_inc('msg_in_answered', 1, day=day)
+            else:
+                await self.db.metric_inc('msg_in_unanswered', 1, day=day)
+            await self.db.metric_set('last_in_ts', int(time.time()))
+            self._invalidate_stats_cache()
+        except Exception:
+            log.debug('metric_in failed', exc_info=True)
+
     async def _cached_stats(self) -> dict:
         """Short-lived stats cache (social replies). Invalidated on donation total change."""
         now = time.time()
         if self._stats_cache is not None and (now - self._stats_cache_ts) < 20:
             return self._stats_cache
         try:
-            self._stats_cache = await self.db.stats()
+            s = await self.db.stats()
+            if not isinstance(s, dict):
+                s = {}
+            s['_ok'] = True
+            # Merge persistent message counters when available
+            try:
+                m = await self.db.metrics_get_many(['msg_in', 'msg_out_ok', 'msg_out_fail'])
+                s['msg_in'] = m.get('msg_in')
+                s['msg_out_ok'] = m.get('msg_out_ok')
+                s['msg_out_fail'] = m.get('msg_out_fail')
+            except Exception:
+                pass
+            self._stats_cache = s
         except Exception:
-            self._stats_cache = self._stats_cache or {}
+            log.warning('stats() failed for social cache', exc_info=True)
+            # Do not invent zeros — keep previous good cache or empty without _ok
+            if not self._stats_cache or not self._stats_cache.get('_ok'):
+                self._stats_cache = {}
         self._stats_cache_ts = now
         return self._stats_cache or {}
 
@@ -151,6 +199,10 @@ class MegaBot:
                     chat_id, body, kb, rt, pm, fast=True,
                 )
                 log.info('sendMessage ok chat=%s attempt=%s', chat_id, idx)
+                try:
+                    await self._metric_out(True)
+                except Exception:
+                    pass
                 return result
             except Exception as exc:
                 last_exc = exc
@@ -159,6 +211,10 @@ class MegaBot:
                     chat_id, idx, type(exc).__name__, str(exc)[:200],
                 )
         log.error('sendMessage gave up chat=%s err=%s', chat_id, type(last_exc).__name__ if last_exc else None)
+        try:
+            await self._metric_out(False)
+        except Exception:
+            pass
         return None
 
     def _group_keyboard(self, keyboard: dict | None) -> dict | None:
@@ -199,6 +255,12 @@ class MegaBot:
 
     async def run(self, poll_timeout: int = 25) -> None:
         await self._startup_checks()
+        self._started_at = time.time()
+        try:
+            await self.db.metric_inc('bot_restarts', 1)
+            await self.db.metric_set('last_start_ts', int(self._started_at))
+        except Exception:
+            pass
         # Single background scheduler for timed group locks (not per-group tasks).
         if not getattr(self, '_sched_task', None) or self._sched_task.done():
             self._sched_task = asyncio.create_task(self._schedule_lock_loop(), name='group-lock-sched')
@@ -285,6 +347,15 @@ class MegaBot:
 
     async def _dispatch_update(self, update: dict) -> None:
         uid = update.get('update_id')
+        # Skip duplicate update_ids when possible (restart-safe via DB)
+        if uid is not None:
+            try:
+                is_new = await self.db.mark_update_processed(int(uid))
+                if not is_new:
+                    log.info('UPDATE id=%s duplicate — skip', uid)
+                    return
+            except Exception:
+                pass
         kinds = [k for k in ('message', 'callback_query', 'my_chat_member', 'edited_message', 'chat_member') if k in update]
         log.info('UPDATE id=%s kinds=%s', uid, kinds or list(update.keys())[:6])
         if 'message' in update:
@@ -331,6 +402,11 @@ class MegaBot:
 
         # Bale may omit "from" on some service messages; also support sender_chat.
         user = msg.get('from') or msg.get('sender') or {}
+        # Real inbound message accepted for processing (not service events above)
+        try:
+            await self._metric_in(chat, responded=False)
+        except Exception:
+            pass
         if not user and msg.get('sender_chat'):
             user = {
                 'id': msg['sender_chat'].get('id'),
@@ -1573,7 +1649,7 @@ class MegaBot:
             (
                 ('چه خبر', 'چخبر', 'چه خبرا', 'چهخبر', 'اوضاع چطوره'),
                 [
-                    f"هیچی فقط دارم به {stats.get('groups', 0)} گروه رسیدگی می‌کنم ⛱️",
+                    '__STATS_GROUPS__',  # filled below from real stats
                     'خبر خاصی نیست، تو بگو 🌱',
                     'همه‌چی آرومه فعلاً 🍃',
                     'سری به گروه‌ها می‌زنم، تو چه خبر؟',
@@ -1617,7 +1693,10 @@ class MegaBot:
         for keys, replies in banks:
             for key in sorted(keys, key=len, reverse=True):
                 if low == key or (len(key) >= 3 and low.startswith(key + ' ')) or (len(key) >= 4 and key in low and len(low) <= len(key) + 8):
-                    return random.choice(replies)
+                    choice = random.choice(replies)
+                    if choice == '__STATS_GROUPS__':
+                        return self._social_stats_line(stats)
+                    return choice
         return None
 
     WELCOME_TEMPLATES = [
@@ -2281,6 +2360,96 @@ class MegaBot:
                 f"*⛔ محدودیت فعال کاربران:* {s['banned_users']}\n*🚫 گروه‌های محدود:* {s['banned_groups']}\n"
                 f"*💚 مجموع حمایت مالی:* {s['donations']} تومان\n\n*ℹ️ نسخه {BOT_VERSION}*")
 
+
+
+    async def _show_owner_monitoring(self, chat_id: int, message_id: int, data: str = 'own:mon') -> None:
+        """Owner live monitoring — all numbers from DB/events, never invented."""
+        from zoneinfo import ZoneInfo
+        started = getattr(self, '_started_at', None)
+        uptime_s = int(time.time() - started) if started else None
+        if uptime_s is None:
+            uptime_txt = 'نامشخص (قبل از ثبت شروع)'
+        else:
+            h, rem = divmod(uptime_s, 3600)
+            m, s = divmod(rem, 60)
+            uptime_txt = f'{h}س {m}د {s}ث'
+
+        try:
+            act = await self.db.activity_stats()
+        except Exception:
+            log.exception('activity_stats failed')
+            act = None
+
+        keys = [
+            'msg_in', 'msg_out_ok', 'msg_out_fail', 'msg_in_private', 'msg_in_group',
+            'msg_in_answered', 'msg_in_unanswered', 'err_total', 'bot_restarts',
+            'last_in_ts', 'last_out_ts', 'last_err_ts', 'last_start_ts',
+        ]
+        try:
+            totals = await self.db.metrics_get_many(keys)
+        except Exception:
+            log.exception('metrics_get_many failed')
+            totals = {}
+
+        try:
+            day = await self.db.tehran_today()
+            daily = await self.db.metrics_day(day)
+        except Exception:
+            day = None
+            daily = {}
+
+        def fmt_ts(key: str) -> str:
+            v = totals.get(key)
+            if not v:
+                return 'هنوز ثبت نشده'
+            try:
+                return datetime.fromtimestamp(int(v), tz=timezone.utc).astimezone(
+                    ZoneInfo('Asia/Tehran')
+                ).strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                return 'نامعتبر'
+
+        def n(key: str, src: dict | None = None) -> str:
+            src = src if src is not None else totals
+            if key not in src:
+                return '—'
+            return f'{int(src[key]):,}'
+
+        if act is None:
+            act_block = '⚠️ آمار فعالیت از دیتابیس خوانده نشد.'
+        else:
+            act_block = (
+                f"گروه ثبت‌شده: *{act['groups_total']:,}*\n"
+                f"گروه فعال ۲۴س: *{act['groups_active_24h']:,}* | ۷روز: *{act['groups_active_7d']:,}*\n"
+                f"کاربر ثبت‌شده: *{act['users_total']:,}*\n"
+                f"کاربر فعال ۲۴س: *{act['users_active_24h']:,}* | ۷روز: *{act['users_active_7d']:,}*\n"
+                f"چت خصوصی فعال ۲۴س: *{act['private_chats_active_24h']:,}*"
+            )
+
+        day_label = str(day) if day else 'نامشخص'
+        body = (
+            f'📡 *مانیتورینگ زنده MEGA BOT*\n'
+            f'منطقه زمانی روز: Asia/Tehran | روز جاری: `{day_label}`\n\n'
+            f'*پیام‌ها (از شروع جمع‌آوری)*\n'
+            f"ورودی کل: *{n('msg_in')}* (خصوصی {n('msg_in_private')} / گروه {n('msg_in_group')})\n"
+            f"خروجی موفق: *{n('msg_out_ok')}* | ناموفق: *{n('msg_out_fail')}*\n\n"
+            f'*امروز (تهران)*\n'
+            f"ورودی: *{n('msg_in', daily)}* | خروجی موفق: *{n('msg_out_ok', daily)}* | خطا: *{n('err_total', daily)}*\n\n"
+            f'*کاربران و گروه‌ها*\n{act_block}\n\n'
+            f'*وضعیت سرویس*\n'
+            f'Uptime فرایند: *{uptime_txt}*\n'
+            f"آخرین ورودی: {fmt_ts('last_in_ts')}\n"
+            f"آخرین خروجی موفق: {fmt_ts('last_out_ts')}\n"
+            f"آخرین خطا: {fmt_ts('last_err_ts')}\n"
+            f"شماره ری‌استارت‌ها: *{n('bot_restarts')}*\n\n"
+            f'_اعداد «—» یعنی هنوز داده جمع نشده یا خوانده نشد؛ صفر واقعی فقط وقتی شمارنده وجود دارد._'
+        )
+        kb = inline([
+            [('🔄 تازه‌سازی', 'own:mon'), ('📊 آمار کلاسیک', 'adm:stats')],
+            [('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')],
+        ])
+        await self.safe_edit(chat_id, message_id, body, kb)
+
     async def show_admin(self, chat_id: int, uid: int, owner: bool, edit_id: int | None = None, page: int = 0) -> None:
         if not owner:
             admin = await self.db.get_admin(uid)
@@ -2302,6 +2471,7 @@ class MegaBot:
                 ('🎫 بررسی کد پیگیری','adm:case'),('🧾 گزارش فعالیت‌ها','adm:logs'),('🛡️ مدیریت ادمین‌ها','own:admins'),
                 ('📝 ویرایش درباره ما','own:about'),('👨‍💻 تیم توسعه‌دهنده','own:team'),('💚 تنظیمات حمایت مالی','own:donations'),
                 ('📢 افزودن دکمه تبلیغ','adm:ad'),('📨 پیام همگانی','adm:broadcast'),
+                ('📡 مانیتورینگ زنده','own:mon'),
                 ('⚙️ تنظیمات مالک','own:settings')]
         # Exactly three content items per page, plus optional previous/next and back/close.
         start = page*2
@@ -2428,6 +2598,12 @@ class MegaBot:
             async with self.db._pool().acquire() as c: await c.execute('DELETE FROM admins WHERE user_id=$1',target)
             await self.db.log(uid,'admin_removed','user',target)
             await self.safe_edit(chat_id,message_id,'ادمین حذف شد.',inline([[('↩️ برگشت','own:admins'),('✖️ بستن','close')]])); return
+        if data == 'own:mon' or data.startswith('own:mon:'):
+            if uid != OWNER_ID:
+                await self.safe_send(chat_id, '⛔ فقط مالک.', parse_mode=None)
+                return
+            await self._show_owner_monitoring(chat_id, message_id, data)
+            return
         if data == 'own:settings':
             if not owner: return
             await self.safe_edit(chat_id,message_id,'*تنظیمات مالک*\nنسخه: '+BOT_VERSION+'\nشناسه مالک: `'+str(OWNER_ID)+'`\n\nتنظیمات محرمانه را در config.py یا متغیرهای محیطی Railway تغییر بده.',inline([[('👨‍💻 تیم توسعه','own:team'),('📝 درباره ما','own:about')],[('💚 حمایت مالی','own:donations')],[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]])); return

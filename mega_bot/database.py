@@ -130,6 +130,23 @@ CREATE TABLE IF NOT EXISTS group_lock_schedules (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS group_lock_schedules_chat_idx ON group_lock_schedules (chat_id, enabled);
+
+CREATE TABLE IF NOT EXISTS bot_metrics (
+  key TEXT PRIMARY KEY,
+  value BIGINT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS bot_daily_metrics (
+  day DATE NOT NULL,
+  key TEXT NOT NULL,
+  value BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, key)
+);
+CREATE TABLE IF NOT EXISTS bot_processed_updates (
+  update_id BIGINT PRIMARY KEY,
+  processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS bot_daily_metrics_day_idx ON bot_daily_metrics (day);
 CREATE TABLE IF NOT EXISTS group_vips (
 
   chat_id BIGINT NOT NULL,
@@ -324,6 +341,7 @@ class Database:
                 'banned_users': await c.fetchval("SELECT COUNT(*) FROM moderation_cases WHERE target_type='user' AND active=TRUE AND (expires_at IS NULL OR expires_at>NOW())"),
                 'banned_groups': await c.fetchval("SELECT COUNT(*) FROM moderation_cases WHERE target_type='group' AND active=TRUE AND (expires_at IS NULL OR expires_at>NOW())"),
                 'donations': await c.fetchval("SELECT COALESCE((value #>> '{}')::bigint,0) FROM settings WHERE key='donations_total'") or 0,
+                'groups_registered': await c.fetchval('SELECT COUNT(*) FROM groups_seen') or 0,
             }
 
     async def create_donation(self, user_id: int, user_name: str, amount: int, show_name: bool) -> int:
@@ -1164,3 +1182,119 @@ class Database:
                 'SELECT 1 FROM group_lock_schedules WHERE chat_id=$1 AND enabled=TRUE AND is_active_now=TRUE LIMIT 1',
                 int(chat_id),
             ))
+
+    # ── Bot metrics / monitoring ────────────────────────────────────────
+
+    async def mark_update_processed(self, update_id: int) -> bool:
+        """Return True if this update_id is new (first time). False if duplicate."""
+        try:
+            async with self._pool().acquire() as c:
+                row = await c.fetchrow(
+                    """INSERT INTO bot_processed_updates(update_id) VALUES($1)
+                       ON CONFLICT(update_id) DO NOTHING
+                       RETURNING update_id""",
+                    int(update_id),
+                )
+            return row is not None
+        except Exception:
+            # If table missing or error, allow processing (don't drop updates)
+            return True
+
+    async def metric_inc(self, key: str, amount: int = 1, *, day=None) -> None:
+        """Atomic increment of a global counter and optional Tehran-day counter."""
+        if amount == 0:
+            return
+        key = str(key)[:64]
+        amount = int(amount)
+        async with self._pool().acquire() as c:
+            async with c.transaction():
+                await c.execute(
+                    """INSERT INTO bot_metrics(key, value, updated_at) VALUES($1, $2, NOW())
+                       ON CONFLICT(key) DO UPDATE SET value=bot_metrics.value+$2, updated_at=NOW()""",
+                    key, amount,
+                )
+                if day is not None:
+                    await c.execute(
+                        """INSERT INTO bot_daily_metrics(day, key, value) VALUES($1, $2, $3)
+                           ON CONFLICT(day, key) DO UPDATE SET value=bot_daily_metrics.value+$3""",
+                        day, key, amount,
+                    )
+
+    async def metric_set(self, key: str, value: int) -> None:
+        key = str(key)[:64]
+        async with self._pool().acquire() as c:
+            await c.execute(
+                """INSERT INTO bot_metrics(key, value, updated_at) VALUES($1, $2, NOW())
+                   ON CONFLICT(key) DO UPDATE SET value=$2, updated_at=NOW()""",
+                key, int(value),
+            )
+
+    async def metric_get(self, key: str, default: int | None = 0) -> int | None:
+        async with self._pool().acquire() as c:
+            val = await c.fetchval('SELECT value FROM bot_metrics WHERE key=$1', str(key)[:64])
+        if val is None:
+            return default
+        return int(val)
+
+    async def metrics_get_many(self, keys: list[str]) -> dict[str, int]:
+        if not keys:
+            return {}
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                'SELECT key, value FROM bot_metrics WHERE key = ANY($1::text[])',
+                list(keys),
+            )
+        return {r['key']: int(r['value']) for r in rows}
+
+    async def metrics_day(self, day, keys: list[str] | None = None) -> dict[str, int]:
+        async with self._pool().acquire() as c:
+            if keys:
+                rows = await c.fetch(
+                    'SELECT key, value FROM bot_daily_metrics WHERE day=$1 AND key = ANY($2::text[])',
+                    day, list(keys),
+                )
+            else:
+                rows = await c.fetch(
+                    'SELECT key, value FROM bot_daily_metrics WHERE day=$1',
+                    day,
+                )
+        return {r['key']: int(r['value']) for r in rows}
+
+    async def activity_stats(self) -> dict:
+        """Real activity windows from usage_events + groups_seen/users."""
+        async with self._pool().acquire() as c:
+            groups_total = await c.fetchval('SELECT COUNT(*) FROM groups_seen') or 0
+            users_total = await c.fetchval('SELECT COUNT(*) FROM users') or 0
+            groups_24h = await c.fetchval(
+                "SELECT COUNT(*) FROM groups_seen WHERE last_seen >= NOW() - INTERVAL '24 hours'"
+            ) or 0
+            groups_7d = await c.fetchval(
+                "SELECT COUNT(*) FROM groups_seen WHERE last_seen >= NOW() - INTERVAL '7 days'"
+            ) or 0
+            users_24h = await c.fetchval(
+                "SELECT COUNT(DISTINCT user_id) FROM usage_events WHERE user_id IS NOT NULL AND created_at >= NOW() - INTERVAL '24 hours'"
+            ) or 0
+            users_7d = await c.fetchval(
+                "SELECT COUNT(DISTINCT user_id) FROM usage_events WHERE user_id IS NOT NULL AND created_at >= NOW() - INTERVAL '7 days'"
+            ) or 0
+            private_24h = await c.fetchval(
+                "SELECT COUNT(DISTINCT chat_id) FROM usage_events WHERE chat_type='private' AND created_at >= NOW() - INTERVAL '24 hours'"
+            ) or 0
+            last_usage = await c.fetchval('SELECT MAX(created_at) FROM usage_events')
+            last_group = await c.fetchval('SELECT MAX(last_seen) FROM groups_seen')
+        return {
+            'groups_total': int(groups_total),
+            'users_total': int(users_total),
+            'groups_active_24h': int(groups_24h),
+            'groups_active_7d': int(groups_7d),
+            'users_active_24h': int(users_24h),
+            'users_active_7d': int(users_7d),
+            'private_chats_active_24h': int(private_24h),
+            'last_usage_at': last_usage,
+            'last_group_seen_at': last_group,
+        }
+
+    async def tehran_today(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo('Asia/Tehran')).date()

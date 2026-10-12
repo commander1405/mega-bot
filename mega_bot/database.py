@@ -214,6 +214,20 @@ CREATE TABLE IF NOT EXISTS whispers (
 );
 CREATE INDEX IF NOT EXISTS whispers_lookup_idx ON whispers (id, recipient_id);
 CREATE INDEX IF NOT EXISTS whispers_expire_idx ON whispers (expires_at) WHERE consumed = FALSE;
+
+CREATE TABLE IF NOT EXISTS user_group_activity (
+  chat_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  xp BIGINT NOT NULL DEFAULT 0,
+  level INTEGER NOT NULL DEFAULT 1,
+  total_msgs BIGINT NOT NULL DEFAULT 0,
+  last_xp_at TIMESTAMPTZ,
+  display_name TEXT NOT NULL DEFAULT '',
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (chat_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS user_group_activity_rank_idx
+  ON user_group_activity (chat_id, xp DESC, user_id);
 CREATE TABLE IF NOT EXISTS user_group_points (
   chat_id BIGINT NOT NULL,
   user_id BIGINT NOT NULL,
@@ -1299,3 +1313,177 @@ class Database:
         from datetime import datetime
         from zoneinfo import ZoneInfo
         return datetime.now(ZoneInfo('Asia/Tehran')).date()
+
+    # ── Group activity / levels ─────────────────────────────────────────
+
+    async def record_activity_xp(
+        self,
+        chat_id: int,
+        user_id: int,
+        *,
+        gain: int = 8,
+        cooldown_sec: float = 10.0,
+        display_name: str = '',
+        count_message: bool = True,
+    ) -> dict:
+        """Atomically count a message and maybe grant XP (cooldown-gated).
+
+        Returns dict: granted, xp, level, old_level, leveled_up, total_msgs
+        """
+        from mega_bot.levels import apply_xp, level_from_xp, MAX_LEVEL
+        gain = max(0, int(gain))
+        name = (display_name or '')[:120]
+        async with self._pool().acquire() as c:
+            async with c.transaction():
+                row = await c.fetchrow(
+                    """SELECT xp, level, total_msgs, last_xp_at
+                       FROM user_group_activity
+                       WHERE chat_id=$1 AND user_id=$2
+                       FOR UPDATE""",
+                    int(chat_id), int(user_id),
+                )
+                if not row:
+                    # First message: always grant if gain>0
+                    new_xp, old_lv, new_lv = apply_xp(0, gain)
+                    await c.execute(
+                        """INSERT INTO user_group_activity
+                           (chat_id, user_id, xp, level, total_msgs, last_xp_at, display_name, updated_at)
+                           VALUES($1,$2,$3,$4,$5,NOW(),$6,NOW())""",
+                        int(chat_id), int(user_id), new_xp, new_lv,
+                        1 if count_message else 0, name,
+                    )
+                    return {
+                        'granted': gain > 0,
+                        'xp': new_xp,
+                        'level': new_lv,
+                        'old_level': old_lv,
+                        'leveled_up': new_lv > old_lv,
+                        'total_msgs': 1 if count_message else 0,
+                    }
+
+                old_xp = int(row['xp'] or 0)
+                old_lv = int(row['level'] or level_from_xp(old_xp))
+                total_msgs = int(row['total_msgs'] or 0) + (1 if count_message else 0)
+                granted = False
+                new_xp = old_xp
+                new_lv = old_lv
+                last = row['last_xp_at']
+                allow = True
+                if last is not None and cooldown_sec > 0:
+                    # compare in SQL for clock consistency
+                    age = await c.fetchval(
+                        'SELECT EXTRACT(EPOCH FROM (NOW() - $1::timestamptz))', last
+                    )
+                    if age is not None and float(age) < float(cooldown_sec):
+                        allow = False
+                if allow and gain > 0 and old_lv < MAX_LEVEL:
+                    new_xp, _, new_lv = apply_xp(old_xp, gain)
+                    granted = new_xp > old_xp
+                    await c.execute(
+                        """UPDATE user_group_activity SET
+                             xp=$3, level=$4, total_msgs=$5,
+                             last_xp_at=NOW(), display_name=CASE WHEN $6<>'' THEN $6 ELSE display_name END,
+                             updated_at=NOW()
+                           WHERE chat_id=$1 AND user_id=$2""",
+                        int(chat_id), int(user_id), new_xp, new_lv, total_msgs, name,
+                    )
+                else:
+                    await c.execute(
+                        """UPDATE user_group_activity SET
+                             total_msgs=$3,
+                             display_name=CASE WHEN $4<>'' THEN $4 ELSE display_name END,
+                             updated_at=NOW()
+                           WHERE chat_id=$1 AND user_id=$2""",
+                        int(chat_id), int(user_id), total_msgs, name,
+                    )
+                return {
+                    'granted': granted,
+                    'xp': new_xp,
+                    'level': new_lv,
+                    'old_level': old_lv,
+                    'leveled_up': new_lv > old_lv,
+                    'total_msgs': total_msgs,
+                }
+
+    async def get_activity(self, chat_id: int, user_id: int) -> dict:
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow(
+                """SELECT a.xp, a.level, a.total_msgs, a.display_name, a.updated_at,
+                          u.username, u.first_name
+                   FROM user_group_activity a
+                   LEFT JOIN users u ON u.user_id = a.user_id
+                   WHERE a.chat_id=$1 AND a.user_id=$2""",
+                int(chat_id), int(user_id),
+            )
+        if not row:
+            return {
+                'xp': 0, 'level': 1, 'total_msgs': 0, 'display_name': '',
+                'username': None, 'first_name': None, 'rank': None,
+            }
+        d = dict(row)
+        d['xp'] = int(d.get('xp') or 0)
+        d['level'] = int(d.get('level') or 1)
+        d['total_msgs'] = int(d.get('total_msgs') or 0)
+        return d
+
+    async def get_activity_rank(self, chat_id: int, user_id: int) -> int | None:
+        """1-based rank by XP desc in this group. None if user has no row."""
+        async with self._pool().acquire() as c:
+            exists = await c.fetchval(
+                'SELECT 1 FROM user_group_activity WHERE chat_id=$1 AND user_id=$2',
+                int(chat_id), int(user_id),
+            )
+            if not exists:
+                return None
+            rank = await c.fetchval(
+                """SELECT 1 + COUNT(*) FROM user_group_activity
+                   WHERE chat_id=$1 AND (
+                     xp > (SELECT xp FROM user_group_activity WHERE chat_id=$1 AND user_id=$2)
+                     OR (xp = (SELECT xp FROM user_group_activity WHERE chat_id=$1 AND user_id=$2) AND user_id < $2)
+                   )""",
+                int(chat_id), int(user_id),
+            )
+        return int(rank) if rank is not None else None
+
+    async def activity_neighbors(self, chat_id: int, user_id: int, window: int = 2) -> list[dict]:
+        """Users around the target rank (including self). window = rows above/below."""
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                """SELECT user_id, xp, level, total_msgs, display_name,
+                          ROW_NUMBER() OVER (ORDER BY xp DESC, user_id ASC) AS rank
+                   FROM user_group_activity
+                   WHERE chat_id=$1
+                   ORDER BY xp DESC, user_id ASC""",
+                int(chat_id),
+            )
+        if not rows:
+            return []
+        items = [dict(r) for r in rows]
+        for it in items:
+            it['rank'] = int(it['rank'])
+            it['xp'] = int(it['xp'] or 0)
+            it['level'] = int(it['level'] or 1)
+            it['total_msgs'] = int(it['total_msgs'] or 0)
+            it['user_id'] = int(it['user_id'])
+        idx = next((i for i, it in enumerate(items) if it['user_id'] == int(user_id)), None)
+        if idx is None:
+            return []
+        start = max(0, idx - window)
+        end = min(len(items), idx + window + 1)
+        return items[start:end]
+
+    async def total_messages_in_group(self, chat_id: int, user_id: int) -> int:
+        """Prefer activity total_msgs; fall back to sum of daily counters."""
+        async with self._pool().acquire() as c:
+            v = await c.fetchval(
+                'SELECT total_msgs FROM user_group_activity WHERE chat_id=$1 AND user_id=$2',
+                int(chat_id), int(user_id),
+            )
+            if v is not None:
+                return int(v)
+            v2 = await c.fetchval(
+                'SELECT COALESCE(SUM(msg_count),0) FROM group_user_msgs WHERE chat_id=$1 AND user_id=$2',
+                int(chat_id), int(user_id),
+            )
+        return int(v2 or 0)
+

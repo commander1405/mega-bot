@@ -12,6 +12,7 @@ from . import prices as price_mod
 from . import fun_content
 from .profanity import contains_profanity
 from . import schedule_lock as schlock
+from . import levels as level_mod
 from config import OWNER_ID, BOT_VERSION, SUPPORT_TEXT, DONATION_TEXT
 
 log = logging.getLogger(__name__)
@@ -543,6 +544,22 @@ class MegaBot:
             except Exception:
                 pass
 
+        # Activity XP / levels (per-group, cooldown in DB)
+        if is_group and uid and level_mod.is_valid_activity_message(text, msg):
+            try:
+                uname = (user.get('first_name') or user.get('name') or '')[:80]
+                act = await self.db.record_activity_xp(
+                    chat_id, uid,
+                    gain=level_mod.XP_PER_MESSAGE,
+                    cooldown_sec=level_mod.XP_COOLDOWN_SEC,
+                    display_name=uname,
+                    count_message=True,
+                )
+                if act.get('leveled_up'):
+                    await self._announce_level_up(chat_id, uid, uname, int(act['level']), msg.get('message_id'))
+            except Exception:
+                log.debug('activity xp failed', exc_info=True)
+
         # Security filters (groups only; admins/owner exempt)
         if is_group and uid and uid != OWNER_ID:
             try:
@@ -780,6 +797,13 @@ class MegaBot:
             return
 
         # ── Locks / anti-spam panel
+        if is_group and text in ('لول', 'لول من', 'level'):
+            await self._cmd_level_profile(chat_id, uid, user, msg, mode='level')
+            return
+        if is_group and text in ('پروفایل', 'پروفایل من', 'profile'):
+            await self._cmd_level_profile(chat_id, uid, user, msg, mode='profile')
+            return
+
         if is_group and text in ('قفل', 'قفل ها', 'قفل‌ها', 'ضد اسپم', 'ضداسپم', 'پنل قفل'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
                 await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
@@ -2372,6 +2396,101 @@ class MegaBot:
                 f"*💚 مجموع حمایت مالی:* {s['donations']} تومان\n\n*ℹ️ نسخه {BOT_VERSION}*")
 
 
+
+
+    def _mention_user(self, user_id: int, name: str) -> str:
+        safe = (name or 'کاربر').replace('[', '').replace(']', '').replace('(', '').replace(')', '')
+        safe = safe.replace('*', '').replace('`', '').replace('_', ' ')[:40] or 'کاربر'
+        return f'[{safe}](uid:{int(user_id)})'
+
+    async def _announce_level_up(
+        self, chat_id: int, user_id: int, name: str, new_level: int, reply_to: int | None = None,
+    ) -> None:
+        mention = self._mention_user(user_id, name)
+        body = f'🎉 ایول {mention}!\nفعالیتت عالی بود، رسیدی به لول *{new_level}* 🚀'
+        try:
+            await self.safe_send(chat_id, body, reply_to=reply_to)
+        except Exception:
+            log.debug('level-up announce failed', exc_info=True)
+
+    async def _cmd_level_profile(
+        self, chat_id: int, uid: int, user: dict, msg: dict, *, mode: str = 'level',
+    ) -> None:
+        """Show activity level card or full profile for this group."""
+        name = (user.get('first_name') or user.get('name') or 'کاربر')[:60]
+        username = (user.get('username') or '').lstrip('@')
+        mention = self._mention_user(uid, name)
+
+        try:
+            act = await self.db.get_activity(chat_id, uid)
+            rank = await self.db.get_activity_rank(chat_id, uid)
+            neighbors = await self.db.activity_neighbors(chat_id, uid, window=2)
+            total_msgs = int(act.get('total_msgs') or 0)
+            if total_msgs <= 0:
+                total_msgs = await self.db.total_messages_in_group(chat_id, uid)
+        except Exception:
+            log.exception('level profile db failed')
+            await self.safe_send(
+                chat_id, '❌ خواندن آمار فعالیت ممکن نشد. کمی بعد دوباره تلاش کن.',
+                reply_to=msg.get('message_id'), parse_mode=None,
+            )
+            return
+
+        prog = level_mod.progress_in_level(int(act.get('xp') or 0))
+        level = prog['level']
+        bar = level_mod.progress_bar(prog['percent'])
+        pct = prog['percent']
+        rank_s = f'#{rank}' if rank else '—'
+
+        if mode == 'profile':
+            uname_line = f'@{username}' if username else 'ثبت نشده'
+            body = (
+                f'👤 اطلاعات {mention}:\n\n'
+                f'➖➖➖➖➖➖➖➖➖➖➖➖\n\n'
+                f'🟢 نام : {name}\n\n'
+                f'🟢 ایدی : {uname_line}\n\n'
+                f'🟢 ایدی عددی : `{uid}`\n\n'
+                f'🟢 بیوگرافی:\nدر دسترس نیست\n\n'
+                f'🟢 مجموع پیام‌ها در این گروه: *{total_msgs:,}*\n\n'
+                f'⭐ لول: *{level}* | امتیاز: *{prog["total_xp"]:,}*\n\n'
+                f'➖➖➖➖➖➖➖➖➖➖➖➖'
+            )
+            await self.safe_send(chat_id, body, reply_to=msg.get('message_id'))
+            return
+
+        # mode == level
+        if prog['maxed']:
+            progress_line = f'🔥 پیشرفت:\n{bar} ۱۰۰٪\n\n🏆 به سقف لول {level_mod.MAX_LEVEL} رسیدی!'
+        else:
+            progress_line = (
+                f'🔥 پیشرفت:\n{bar} {pct:.0f}%\n\n'
+                f'⏳ *{prog["remaining"]:,}* امتیاز تا لول بعدی'
+            )
+
+        near_lines = []
+        if neighbors:
+            for n in neighbors:
+                nname = (n.get('display_name') or f'کاربر {n["user_id"]}')[:28]
+                nname = nname.replace('*', '').replace('`', '').replace('_', ' ')
+                mark = '👉 ' if int(n['user_id']) == uid else ''
+                near_lines.append(
+                    f'{mark}#{n["rank"]} {nname} | Lv {n["level"]}'
+                )
+        near_block = '\n'.join(near_lines) if near_lines else 'هنوز رتبه‌بندی برای این گروه شکل نگرفته.'
+
+        body = (
+            f'🏅 پروفایل فعالیت\n'
+            f'━━━━━━━━━━━━━━━━━━\n'
+            f'👤 {mention}\n'
+            f'🏆 رتبه: {rank_s}\n'
+            f'⭐ لول: *{level}*\n'
+            f'📊 امتیاز: *{prog["xp_in_level"]:,}*/*{prog["xp_need"]:,}*\n'
+            f'{progress_line}\n\n'
+            f'━━━━━━━━━━━━━━━━━━\n'
+            f'📊 کاربران نزدیک به شما\n\n'
+            f'{near_block}'
+        )
+        await self.safe_send(chat_id, body, reply_to=msg.get('message_id'))
 
     async def _show_owner_monitoring(self, chat_id: int, message_id: int, data: str = 'own:mon') -> None:
         """Owner live monitoring — all numbers from DB/events, never invented."""

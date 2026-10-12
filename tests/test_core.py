@@ -298,3 +298,47 @@ class ScheduleLockLogicTests(unittest.TestCase):
         self.assertEqual(line({}), 'no-claim')
         self.assertEqual(line({'_ok': True, 'groups': 12}), 'groups=12')
         self.assertEqual(line({'_ok': True, 'groups': 0}), 'zero-real')
+
+
+class LevelSystemLogicTests(unittest.TestCase):
+    def test_xp_curve_increases(self):
+        from mega_bot.levels import xp_to_next
+        self.assertLess(xp_to_next(1), xp_to_next(5))
+        self.assertLess(xp_to_next(5), xp_to_next(12))
+        self.assertLess(xp_to_next(12), xp_to_next(50))
+
+    def test_level_from_xp_and_cap(self):
+        from mega_bot.levels import level_from_xp, cumulative_xp_for_level, MAX_LEVEL, apply_xp
+        self.assertEqual(level_from_xp(0), 1)
+        self.assertEqual(level_from_xp(cumulative_xp_for_level(12)), 12)
+        cap = cumulative_xp_for_level(MAX_LEVEL)
+        new, old_lv, new_lv = apply_xp(cap - 10, 10_000_000)
+        self.assertEqual(new_lv, MAX_LEVEL)
+        self.assertLessEqual(new, cap)
+
+    def test_level12_requires_substantial_xp(self):
+        from mega_bot.levels import cumulative_xp_for_level, XP_PER_MESSAGE
+        need = cumulative_xp_for_level(12)
+        msgs = need / XP_PER_MESSAGE
+        self.assertGreater(need, 20_000)
+        self.assertGreater(msgs, 2000)
+
+    def test_progress_bar_and_percent(self):
+        from mega_bot.levels import progress_in_level, progress_bar, cumulative_xp_for_level, xp_to_next
+        base = cumulative_xp_for_level(5)
+        need = xp_to_next(5)
+        mid = base + need // 2
+        p = progress_in_level(mid)
+        self.assertEqual(p['level'], 5)
+        self.assertAlmostEqual(p['percent'], 50.0, delta=2.0)
+        bar = progress_bar(50, width=10)
+        self.assertEqual(len(bar), 10)
+        self.assertIn('█', bar)
+        self.assertIn('░', bar)
+
+    def test_valid_message_filter(self):
+        from mega_bot.levels import is_valid_activity_message
+        self.assertFalse(is_valid_activity_message(''))
+        self.assertFalse(is_valid_activity_message('   '))
+        self.assertTrue(is_valid_activity_message('سلام'))
+        self.assertTrue(is_valid_activity_message('', {'photo': [{}]}))

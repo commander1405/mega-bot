@@ -466,6 +466,7 @@ class MegaBot:
         # /ping above remains available for diagnostics.
         if is_group and uid and uid != OWNER_ID:
             try:
+                # VIP and admins are exempt (checked inside enforce + mod power)
                 if await self._enforce_group_time_lock(chat_id, uid, msg):
                     return
             except Exception:
@@ -568,7 +569,7 @@ class MegaBot:
         # Security filters (groups only; admins/owner exempt)
         if is_group and uid and uid != OWNER_ID:
             try:
-                if not await self._is_chat_admin(chat_id, uid):
+                if not await self._has_group_mod_power(chat_id, uid):
                     blocked = await self._apply_security_filters(chat_id, uid, msg, text)
                     if blocked:
                         return
@@ -1451,6 +1452,25 @@ class MegaBot:
             log.debug('getChatMember failed chat=%s user=%s: %s', chat_id, uid, exc)
             return False
 
+    async def _has_group_mod_power(self, chat_id: int, uid: int) -> bool:
+        """Owner, group admin, or VIP of this group may run moderation commands."""
+        if not uid:
+            return False
+        if uid == OWNER_ID:
+            return True
+        try:
+            if await self._is_chat_admin(chat_id, uid):
+                return True
+        except Exception:
+            pass
+        try:
+            if await self.db.is_vip(chat_id, uid):
+                return True
+        except Exception:
+            log.debug('is_vip check failed', exc_info=True)
+        return False
+
+
     async def on_my_chat_member(self, event: dict) -> None:
         """Promote/demote: log only. Never sendMessage from this handler."""
         try:
@@ -2099,7 +2119,7 @@ class MegaBot:
         ('🔇 مدیریت با Reply',
          'ریپلای روی پیام کاربر + یکی از:\n'
          '`سکوت` / `حذف سکوت` / `بن` / `حذف بن` / `کیک`\n'
-         'دسترسی: فقط ادمین گروه (و مالک ربات) — ممبر عادی: «شما ادمین نیستید»'),
+         'دسترسی: ادمین گروه، کاربر ویژه، یا مالک ربات'),
         ('🛡️ پنل ادمین و مالک ربات',
          '• `/admin` — پنل ادمین ربات\n'
          '• `/owner` — فقط مالک\n'
@@ -3468,8 +3488,8 @@ class MegaBot:
         if not (t == 'پاک' or t.startswith('پاک ')):
             return False
 
-        if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-            await self.safe_send(chat_id, '⛔ برای این کار باید مدیر گروه باشی!', reply_to=msg.get('message_id'), parse_mode=None)
+        if not await self._has_group_mod_power(chat_id, uid):
+            await self.safe_send(chat_id, '⛔ برای این کار باید مدیر گروه یا کاربر ویژه باشی!', reply_to=msg.get('message_id'), parse_mode=None)
             return True
 
         current_mid = int(msg.get('message_id') or 0) or None
@@ -3557,8 +3577,8 @@ class MegaBot:
         if int(pending.get('uid') or 0) != uid and uid != OWNER_ID:
             await self.safe_send(chat_id, '⛔ فقط کسی که درخواست داده می‌تواند تأیید کند.', parse_mode=None)
             return
-        if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-            await self.safe_send(chat_id, '⛔ برای این کار باید مدیر گروه باشی!', parse_mode=None)
+        if not await self._has_group_mod_power(chat_id, uid):
+            await self.safe_send(chat_id, '⛔ برای این کار باید مدیر گروه یا کاربر ویژه باشی!', parse_mode=None)
             return
         if decision == 'no':
             self._purge_pending.pop(token, None)
@@ -3686,9 +3706,9 @@ class MegaBot:
             return False
         action, amount, rest = parsed
 
-        is_admin = await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID
+        is_admin = await self._has_group_mod_power(chat_id, uid)
         if not is_admin:
-            await self.safe_send(chat_id, '⛔ برای این کار باید مدیر گروه باشی!', reply_to=msg.get('message_id'), parse_mode=None)
+            await self.safe_send(chat_id, '⛔ برای این کار باید مدیر گروه یا کاربر ویژه باشی!', reply_to=msg.get('message_id'), parse_mode=None)
             return True
 
         # Clear ALL warns in group — no target needed
@@ -3911,10 +3931,10 @@ class MegaBot:
         if not locked:
             return False
         try:
-            if await self._is_chat_admin(chat_id, uid):
+            if await self._has_group_mod_power(chat_id, uid):
                 return False
         except Exception:
-            # If admin check fails, still enforce lock for safety of members
+            # If check fails, still enforce lock for safety of members
             pass
 
         mid = msg.get('message_id')

@@ -13,6 +13,7 @@ from . import fun_content
 from .profanity import contains_profanity
 from . import schedule_lock as schlock
 from . import levels as level_mod
+from . import tts as tts_mod
 from config import OWNER_ID, BOT_VERSION, SUPPORT_TEXT, DONATION_TEXT
 
 log = logging.getLogger(__name__)
@@ -803,6 +804,11 @@ class MegaBot:
             return
 
         # ── Locks / anti-spam panel
+        # Experimental TTS: only exact phrase «ویس تست»
+        if text in ('ویس تست',):
+            await self._cmd_voice_test(chat_id, msg)
+            return
+
         if is_group and text in ('لول', 'لول من', 'level'):
             await self._cmd_level_profile(chat_id, uid, user, msg, mode='level')
             return
@@ -2455,6 +2461,48 @@ class MegaBot:
             await self.safe_send(chat_id, body, reply_to=reply_to)
         except Exception:
             log.debug('level-up announce failed', exc_info=True)
+
+
+    async def _cmd_voice_test(self, chat_id: int, msg: dict) -> None:
+        """Experimental: synthesize Persian «تست» and send as voice note."""
+        await self.safe_send(
+            chat_id,
+            '🎙 در حال ساخت ویس آزمایشی…',
+            reply_to=msg.get('message_id'),
+            parse_mode=None,
+        )
+        try:
+            data, filename = await tts_mod.synthesize_persian(tts_mod.DEFAULT_TEXT)
+        except Exception as exc:
+            log.exception('TTS synthesize failed')
+            await self.safe_send(
+                chat_id,
+                f'❌ ساخت ویس ناموفق بود: {self._short(exc)}',
+                reply_to=msg.get('message_id'),
+                parse_mode=None,
+            )
+            return
+        try:
+            if filename.endswith('.mp3'):
+                await self.api.send_audio_bytes(chat_id, data, filename=filename, caption='ویس تست ✨')
+            else:
+                await self.api.send_voice_bytes(chat_id, data, filename=filename, caption='ویس تست ✨')
+        except Exception as exc:
+            log.exception('send voice failed')
+            # one fallback switch
+            try:
+                if filename.endswith('.ogg'):
+                    await self.api.send_audio_bytes(chat_id, data, filename='voice.ogg', caption='ویس تست ✨')
+                else:
+                    await self.api.send_voice_bytes(chat_id, data, filename='voice.ogg', caption='ویس تست ✨')
+            except Exception as exc2:
+                log.exception('send voice fallback failed')
+                await self.safe_send(
+                    chat_id,
+                    f'❌ ارسال ویس ناموفق بود: {self._short(exc2)}',
+                    reply_to=msg.get('message_id'),
+                    parse_mode=None,
+                )
 
     async def _cmd_level_profile(
         self, chat_id: int, uid: int, user: dict, msg: dict, *, mode: str = 'level',

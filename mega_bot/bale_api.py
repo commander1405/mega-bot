@@ -270,6 +270,71 @@ class BaleAPI:
             name = file_path.rsplit('/', 1)[-1]
             return data, name
 
+
+    async def send_voice_bytes(
+        self,
+        chat_id: int,
+        data: bytes,
+        filename: str = 'voice.ogg',
+        caption: str | None = None,
+        duration: int | None = None,
+    ) -> dict:
+        """Upload OGG/Opus (or compatible) voice note via sendVoice."""
+        session = await self._ensure_session()
+        form = aiohttp.FormData()
+        form.add_field('chat_id', str(chat_id))
+        if caption:
+            form.add_field('caption', caption)
+        if duration is not None:
+            form.add_field('duration', str(int(duration)))
+        # Bale/Telegram expect OGG OPUS for voice messages
+        ctype = 'audio/ogg'
+        if filename.endswith('.mp3'):
+            ctype = 'audio/mpeg'
+        form.add_field('voice', data, filename=filename, content_type=ctype)
+        async with session.post(
+            self.base + 'sendVoice',
+            data=form,
+            timeout=aiohttp.ClientTimeout(total=120, connect=20),
+        ) as response:
+            raw = await response.text()
+            try:
+                result = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise BaleAPIError(f'sendVoice returned non-JSON HTTP {response.status}') from exc
+            if response.status >= 400 or not result.get('ok', response.status < 400):
+                raise BaleAPIError(f"sendVoice: HTTP {response.status}: {result.get('description', result)}")
+            return result.get('result', result)
+
+    async def send_audio_bytes(
+        self,
+        chat_id: int,
+        data: bytes,
+        filename: str = 'audio.mp3',
+        caption: str | None = None,
+    ) -> dict:
+        """Fallback: send as audio file (mp3/ogg) via sendAudio."""
+        session = await self._ensure_session()
+        form = aiohttp.FormData()
+        form.add_field('chat_id', str(chat_id))
+        if caption:
+            form.add_field('caption', caption)
+        ctype = 'audio/mpeg' if filename.endswith('.mp3') else 'audio/ogg'
+        form.add_field('audio', data, filename=filename, content_type=ctype)
+        async with session.post(
+            self.base + 'sendAudio',
+            data=form,
+            timeout=aiohttp.ClientTimeout(total=120, connect=20),
+        ) as response:
+            raw = await response.text()
+            try:
+                result = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise BaleAPIError(f'sendAudio returned non-JSON HTTP {response.status}') from exc
+            if response.status >= 400 or not result.get('ok', response.status < 400):
+                raise BaleAPIError(f"sendAudio: HTTP {response.status}: {result.get('description', result)}")
+            return result.get('result', result)
+
     async def send_animation_bytes(self, chat_id: int, data: bytes, filename: str = 'mega-bot.gif', caption: str = '') -> dict:
         session = await self._ensure_session()
         form = aiohttp.FormData()

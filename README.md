@@ -68,3 +68,11 @@
 - Only an owner-approved claim increments the donation total and starts a direct-message announcement to recorded user IDs; the broadcast target is always a user ID, never a group chat ID. Some DMs may fail if a user has not opened the bot, blocked it, or Bale rejects the message; the owner receives sent/failed counts.
 - If the donor chose public attribution, their name and numeric user ID are announced after approval and they receive a confirmation DM. If anonymous, the announcement does not expose their name. Rejected claims do not change totals and do not notify the donor.
 - This is an owner-reviewed honor system, not automatic bank verification. The owner must verify the payment before approving.
+
+## Audit notes (2026-10)
+
+- Scheduled group lock: `setChatPermissions` is best-effort on Bale; **primary enforcement** is immediate `deleteMessage` for non-admins during active windows, plus start/end announcements.
+- Bot must be group admin with **delete messages** permission for lock enforcement to work.
+- Social replies no longer invent a zero group count when stats fail to load.
+- Owner panel includes live monitoring counters (`bot_metrics` / daily metrics); numbers start from deployment of that feature.
+- Automated tests: `python -m pytest tests/ -v` (pure logic + schedule lock + regressions).

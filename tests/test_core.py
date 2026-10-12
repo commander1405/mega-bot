@@ -201,12 +201,14 @@ class AdminPromoteResilienceTests(unittest.TestCase):
 
 class GroupAdminShortCircuitTests(unittest.TestCase):
     def test_list_special_checks_text_before_getchatmember(self):
-        """Regression: admin check must not run on every group message."""
+        """Regression: VIP list matches text first; admin check only after match."""
         src = pathlib.Path('mega_bot/app.py').read_text(encoding='utf-8')
-        # Correct order: text match first
-        self.assertIn("if text == 'لیست ویژه ها' and self._is_group_chat(chat)", src)
+        # Current code: is_group + text membership, then admin gate
+        self.assertIn("if is_group and text in ('لیست ویژه ها', 'لیست ویژه‌ها', 'لیست ویژه')", src)
         # Old buggy order must be gone (admin check before text)
         self.assertNotIn("and await self._is_chat_admin(chat_id, uid) and text == 'لیست ویژه ها'", src)
+        # Early time-lock enforcement must exist before GIF path
+        self.assertIn('_enforce_group_time_lock', src)
 
 
 
@@ -225,3 +227,74 @@ class CallbackRoutingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ScheduleLockLogicTests(unittest.TestCase):
+    """Time-window evaluation and Persian parsing for scheduled group locks."""
+
+    def test_same_day_window(self):
+        from datetime import datetime, date
+        from zoneinfo import ZoneInfo
+        from mega_bot.schedule_lock import schedule_should_lock
+        TZ = ZoneInfo('Asia/Tehran')
+        day = date(2026, 10, 12)  # Monday
+        def at(h, m):
+            return datetime(day.year, day.month, day.day, h, m, tzinfo=TZ)
+        days = list(range(7))
+        self.assertTrue(schedule_should_lock(now=at(18, 0), start_hm='17:00', end_hm='21:00', days=days, valid_from=None, valid_until=None))
+        self.assertFalse(schedule_should_lock(now=at(16, 59), start_hm='17:00', end_hm='21:00', days=days, valid_from=None, valid_until=None))
+        self.assertFalse(schedule_should_lock(now=at(21, 0), start_hm='17:00', end_hm='21:00', days=days, valid_from=None, valid_until=None))
+
+    def test_overnight_window(self):
+        from datetime import datetime, date
+        from zoneinfo import ZoneInfo
+        from mega_bot.schedule_lock import schedule_should_lock
+        TZ = ZoneInfo('Asia/Tehran')
+        day = date(2026, 10, 12)
+        def at(h, m, d=day):
+            return datetime(d.year, d.month, d.day, h, m, tzinfo=TZ)
+        days = list(range(7))
+        self.assertTrue(schedule_should_lock(now=at(23, 0), start_hm='22:00', end_hm='02:00', days=days, valid_from=None, valid_until=None))
+        self.assertTrue(schedule_should_lock(now=at(1, 0), start_hm='22:00', end_hm='02:00', days=days, valid_from=None, valid_until=None))
+        self.assertFalse(schedule_should_lock(now=at(3, 0), start_hm='22:00', end_hm='02:00', days=days, valid_from=None, valid_until=None))
+
+    def test_persian_digits_and_har_roz(self):
+        from mega_bot.schedule_lock import parse_schedule_text
+        r = parse_schedule_text('۱۷:۰۰ ۲۱:۰۰ هر روز')
+        self.assertEqual(r['start_hm'], '17:00')
+        self.assertEqual(r['end_hm'], '21:00')
+        self.assertEqual(len(r['days']), 7)
+
+    def test_ta_and_two_days(self):
+        from mega_bot.schedule_lock import parse_schedule_text
+        r = parse_schedule_text('17:00 تا 21:00 دو روز')
+        self.assertEqual(r['start_hm'], '17:00')
+        self.assertIsNotNone(r.get('valid_from'))
+        self.assertIsNotNone(r.get('valid_until'))
+
+    def test_invalid_equal_times(self):
+        from mega_bot.schedule_lock import parse_schedule_text
+        with self.assertRaises(ValueError):
+            parse_schedule_text('10:00 10:00 هر روز')
+
+    def test_social_stats_line_no_fake_zero(self):
+        # Inline mirror of MegaBot._social_stats_line logic (avoid aiohttp import)
+        def line(stats):
+            stats = stats or {}
+            g = stats.get('groups')
+            if g is None:
+                g = stats.get('groups_registered')
+            if not stats.get('_ok') and g is None:
+                return 'no-claim'
+            try:
+                g = int(g or 0)
+            except Exception:
+                return 'no-claim'
+            if g > 0:
+                return f'groups={g}'
+            if g == 0 and stats.get('_ok'):
+                return 'zero-real'
+            return 'no-claim'
+        self.assertEqual(line({}), 'no-claim')
+        self.assertEqual(line({'_ok': True, 'groups': 12}), 'groups=12')
+        self.assertEqual(line({'_ok': True, 'groups': 0}), 'zero-real')

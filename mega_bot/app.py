@@ -459,6 +459,15 @@ class MegaBot:
             )
             return
 
+        # Timed/manual group lock — earliest enforcement (before GIF/commands)
+        # /ping above remains available for diagnostics.
+        if is_group and uid and uid != OWNER_ID:
+            try:
+                if await self._enforce_group_time_lock(chat_id, uid, msg):
+                    return
+            except Exception:
+                log.exception('time-lock enforce error chat=%s', chat_id)
+
         try:
             await asyncio.wait_for(self.db.upsert_user(user), timeout=3.0)
         except Exception:
@@ -533,14 +542,6 @@ class MegaBot:
                 await self.db.record_group_message(chat_id, uid, msg)
             except Exception:
                 pass
-
-        # Timed / manual group lock: delete non-admin messages immediately
-        if is_group and uid and uid != OWNER_ID:
-            try:
-                if await self._enforce_group_time_lock(chat_id, uid, msg):
-                    return
-            except Exception:
-                log.exception('time-lock enforce error chat=%s', chat_id)
 
         # Security filters (groups only; admins/owner exempt)
         if is_group and uid and uid != OWNER_ID:

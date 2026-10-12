@@ -5,9 +5,16 @@ import math
 from typing import Any
 
 MAX_LEVEL = 200
-XP_PER_MESSAGE = 8
-XP_COOLDOWN_SEC = 10.0
+# Economy: every N valid messages → 1 XP
+MESSAGES_PER_XP = 2
+XP_PER_GRANT = 1
+# Spam: if user sends this many messages within the window, grant no XP
+SPAM_WINDOW_SEC = 60.0
+SPAM_MSG_LIMIT = 80  # ~80+/min treated as spam (covers 100–500/min cases)
 MIN_TEXT_LEN = 1
+# Legacy aliases kept so older call sites do not break during deploy
+XP_PER_MESSAGE = XP_PER_GRANT
+XP_COOLDOWN_SEC = 0.0
 
 
 def xp_to_next(level: int) -> int:

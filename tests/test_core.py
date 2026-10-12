@@ -317,11 +317,17 @@ class LevelSystemLogicTests(unittest.TestCase):
         self.assertLessEqual(new, cap)
 
     def test_level12_requires_substantial_xp(self):
-        from mega_bot.levels import cumulative_xp_for_level, XP_PER_MESSAGE
+        from mega_bot.levels import cumulative_xp_for_level, MESSAGES_PER_XP, XP_PER_GRANT
         need = cumulative_xp_for_level(12)
-        msgs = need / XP_PER_MESSAGE
+        msgs = need * MESSAGES_PER_XP / max(1, XP_PER_GRANT)
         self.assertGreater(need, 20_000)
-        self.assertGreater(msgs, 2000)
+        self.assertGreater(msgs, 4000)
+
+    def test_two_messages_per_xp_constants(self):
+        from mega_bot.levels import MESSAGES_PER_XP, XP_PER_GRANT, SPAM_MSG_LIMIT
+        self.assertEqual(MESSAGES_PER_XP, 2)
+        self.assertEqual(XP_PER_GRANT, 1)
+        self.assertGreaterEqual(SPAM_MSG_LIMIT, 50)
 
     def test_progress_bar_and_percent(self):
         from mega_bot.levels import progress_in_level, progress_bar, cumulative_xp_for_level, xp_to_next

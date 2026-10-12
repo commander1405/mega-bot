@@ -62,6 +62,8 @@ class MegaBot:
         self._stats_cache: dict | None = None
         self._time_lock_cache: dict[int, tuple[bool, float]] = {}  # chat_id -> (locked, expires_ts)
         self._lock_announce_cooldown: dict[int, float] = {}  # chat_id -> last announce ts
+        # Activity anti-spam: (chat_id, user_id) -> list[timestamps]
+        self._xp_msg_times: dict[tuple[int, int], list[float]] = {}
         self._stats_cache_ts: float = 0.0
 
     async def _get_ad_config(self) -> tuple[bool, str, str]:
@@ -544,18 +546,21 @@ class MegaBot:
             except Exception:
                 pass
 
-        # Activity XP / levels (per-group, cooldown in DB)
+        # Activity XP / levels — every 2 msgs = 1 XP; spam window blocks XP
         if is_group and uid and level_mod.is_valid_activity_message(text, msg):
             try:
                 uname = (user.get('first_name') or user.get('name') or '')[:80]
+                grant_xp = not self._is_xp_spam(chat_id, uid)
                 act = await self.db.record_activity_xp(
                     chat_id, uid,
-                    gain=level_mod.XP_PER_MESSAGE,
-                    cooldown_sec=level_mod.XP_COOLDOWN_SEC,
+                    grant_xp=grant_xp,
                     display_name=uname,
                     count_message=True,
+                    messages_per_xp=level_mod.MESSAGES_PER_XP,
+                    xp_per_grant=level_mod.XP_PER_GRANT,
                 )
-                if act.get('leveled_up'):
+                # Level-up only when XP was actually granted (never on spam)
+                if grant_xp and act.get('leveled_up'):
                     await self._announce_level_up(chat_id, uid, uname, int(act['level']), msg.get('message_id'))
             except Exception:
                 log.debug('activity xp failed', exc_info=True)
@@ -2398,6 +2403,24 @@ class MegaBot:
 
 
 
+
+    def _is_xp_spam(self, chat_id: int, user_id: int) -> bool:
+        """True if user flooded the group beyond SPAM_MSG_LIMIT in SPAM_WINDOW_SEC."""
+        now = time.time()
+        key = (int(chat_id), int(user_id))
+        window = float(level_mod.SPAM_WINDOW_SEC)
+        limit = int(level_mod.SPAM_MSG_LIMIT)
+        bucket = self._xp_msg_times.get(key) or []
+        bucket = [t for t in bucket if now - t < window]
+        bucket.append(now)
+        self._xp_msg_times[key] = bucket
+        # Bound memory
+        if len(self._xp_msg_times) > 5000:
+            stale = [k for k, v in self._xp_msg_times.items() if not v or now - v[-1] > window * 2]
+            for k in stale[:1000]:
+                self._xp_msg_times.pop(k, None)
+        return len(bucket) >= limit
+
     def _mention_user(self, user_id: int, name: str) -> str:
         safe = (name or 'کاربر').replace('[', '').replace(']', '').replace('(', '').replace(')', '')
         safe = safe.replace('*', '').replace('`', '').replace('_', ' ')[:40] or 'کاربر'
@@ -2489,6 +2512,7 @@ class MegaBot:
             f'━━━━━━━━━━━━━━━━━━\n'
             f'📊 کاربران نزدیک به شما\n\n'
             f'{near_block}'
+            f'\n\n💡 با چت کردن XP بدست بیارید — هر ۲ پیام = ۱ XP'
         )
         await self.safe_send(chat_id, body, reply_to=msg.get('message_id'))
 

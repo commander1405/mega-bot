@@ -221,6 +221,7 @@ CREATE TABLE IF NOT EXISTS user_group_activity (
   xp BIGINT NOT NULL DEFAULT 0,
   level INTEGER NOT NULL DEFAULT 1,
   total_msgs BIGINT NOT NULL DEFAULT 0,
+  pending_msgs INTEGER NOT NULL DEFAULT 0,
   last_xp_at TIMESTAMPTZ,
   display_name TEXT NOT NULL DEFAULT '',
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -253,6 +254,7 @@ class Database:
             # Lightweight migrations for tables created before new columns existed
             await conn.execute("ALTER TABLE whispers ADD COLUMN IF NOT EXISTS sender_name TEXT NOT NULL DEFAULT ''")
             await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS moderation JSONB NOT NULL DEFAULT '{}'::jsonb")
+            await conn.execute('ALTER TABLE user_group_activity ADD COLUMN IF NOT EXISTS pending_msgs INTEGER NOT NULL DEFAULT 0')
             await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS welcome_varied BOOLEAN NOT NULL DEFAULT TRUE")
             await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS welcome_mention BOOLEAN NOT NULL DEFAULT TRUE")
             await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS goodbye_enabled BOOLEAN NOT NULL DEFAULT TRUE")
@@ -1321,80 +1323,77 @@ class Database:
         chat_id: int,
         user_id: int,
         *,
-        gain: int = 8,
-        cooldown_sec: float = 10.0,
+        grant_xp: bool = True,
         display_name: str = '',
         count_message: bool = True,
+        messages_per_xp: int = 2,
+        xp_per_grant: int = 1,
     ) -> dict:
-        """Atomically count a message and maybe grant XP (cooldown-gated).
+        """Count a group message; every `messages_per_xp` valid msgs grant `xp_per_grant` XP.
 
-        Returns dict: granted, xp, level, old_level, leveled_up, total_msgs
+        If grant_xp is False (spam window), message may still increment total_msgs
+        but never XP / pending progress / level-up.
         """
         from mega_bot.levels import apply_xp, level_from_xp, MAX_LEVEL
-        gain = max(0, int(gain))
         name = (display_name or '')[:120]
+        messages_per_xp = max(1, int(messages_per_xp))
+        xp_per_grant = max(0, int(xp_per_grant))
         async with self._pool().acquire() as c:
             async with c.transaction():
                 row = await c.fetchrow(
-                    """SELECT xp, level, total_msgs, last_xp_at
+                    """SELECT xp, level, total_msgs, COALESCE(pending_msgs, 0) AS pending_msgs
                        FROM user_group_activity
                        WHERE chat_id=$1 AND user_id=$2
                        FOR UPDATE""",
                     int(chat_id), int(user_id),
                 )
                 if not row:
-                    # First message: always grant if gain>0
-                    new_xp, old_lv, new_lv = apply_xp(0, gain)
-                    await c.execute(
-                        """INSERT INTO user_group_activity
-                           (chat_id, user_id, xp, level, total_msgs, last_xp_at, display_name, updated_at)
-                           VALUES($1,$2,$3,$4,$5,NOW(),$6,NOW())""",
-                        int(chat_id), int(user_id), new_xp, new_lv,
-                        1 if count_message else 0, name,
-                    )
-                    return {
-                        'granted': gain > 0,
-                        'xp': new_xp,
-                        'level': new_lv,
-                        'old_level': old_lv,
-                        'leveled_up': new_lv > old_lv,
-                        'total_msgs': 1 if count_message else 0,
-                    }
+                    pending = 0
+                    old_xp = 0
+                    old_lv = 1
+                    total_msgs = 0
+                else:
+                    pending = int(row['pending_msgs'] or 0)
+                    old_xp = int(row['xp'] or 0)
+                    old_lv = int(row['level'] or level_from_xp(old_xp))
+                    total_msgs = int(row['total_msgs'] or 0)
 
-                old_xp = int(row['xp'] or 0)
-                old_lv = int(row['level'] or level_from_xp(old_xp))
-                total_msgs = int(row['total_msgs'] or 0) + (1 if count_message else 0)
+                if count_message:
+                    total_msgs += 1
+
                 granted = False
                 new_xp = old_xp
                 new_lv = old_lv
-                last = row['last_xp_at']
-                allow = True
-                if last is not None and cooldown_sec > 0:
-                    # compare in SQL for clock consistency
-                    age = await c.fetchval(
-                        'SELECT EXTRACT(EPOCH FROM (NOW() - $1::timestamptz))', last
-                    )
-                    if age is not None and float(age) < float(cooldown_sec):
-                        allow = False
-                if allow and gain > 0 and old_lv < MAX_LEVEL:
-                    new_xp, _, new_lv = apply_xp(old_xp, gain)
-                    granted = new_xp > old_xp
+                new_pending = pending
+
+                if grant_xp and xp_per_grant > 0 and old_lv < MAX_LEVEL:
+                    new_pending = pending + 1
+                    if new_pending >= messages_per_xp:
+                        grants = new_pending // messages_per_xp
+                        new_pending = new_pending % messages_per_xp
+                        gain = grants * xp_per_grant
+                        new_xp, _, new_lv = apply_xp(old_xp, gain)
+                        granted = new_xp > old_xp
+                # else: spam or blocked — leave pending/xp unchanged
+
+                if not row:
                     await c.execute(
-                        """UPDATE user_group_activity SET
-                             xp=$3, level=$4, total_msgs=$5,
-                             last_xp_at=NOW(), display_name=CASE WHEN $6<>'' THEN $6 ELSE display_name END,
-                             updated_at=NOW()
-                           WHERE chat_id=$1 AND user_id=$2""",
-                        int(chat_id), int(user_id), new_xp, new_lv, total_msgs, name,
+                        """INSERT INTO user_group_activity
+                           (chat_id, user_id, xp, level, total_msgs, pending_msgs, last_xp_at, display_name, updated_at)
+                           VALUES($1,$2,$3,$4,$5,$6,CASE WHEN $7 THEN NOW() ELSE NULL END,$8,NOW())""",
+                        int(chat_id), int(user_id), new_xp, new_lv, total_msgs, new_pending,
+                        granted, name,
                     )
                 else:
                     await c.execute(
                         """UPDATE user_group_activity SET
-                             total_msgs=$3,
-                             display_name=CASE WHEN $4<>'' THEN $4 ELSE display_name END,
+                             xp=$3, level=$4, total_msgs=$5, pending_msgs=$6,
+                             last_xp_at=CASE WHEN $7 THEN NOW() ELSE last_xp_at END,
+                             display_name=CASE WHEN $8<>'' THEN $8 ELSE display_name END,
                              updated_at=NOW()
                            WHERE chat_id=$1 AND user_id=$2""",
-                        int(chat_id), int(user_id), total_msgs, name,
+                        int(chat_id), int(user_id), new_xp, new_lv, total_msgs, new_pending,
+                        granted, name,
                     )
                 return {
                     'granted': granted,
@@ -1403,7 +1402,10 @@ class Database:
                     'old_level': old_lv,
                     'leveled_up': new_lv > old_lv,
                     'total_msgs': total_msgs,
+                    'pending_msgs': new_pending,
+                    'spam_blocked': not grant_xp,
                 }
+
 
     async def get_activity(self, chat_id: int, user_id: int) -> dict:
         async with self._pool().acquire() as c:

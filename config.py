@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "2138298271:TV1ymgVqvURsuKdRavGhaS2q3MbEJPaUl2k")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "2138298271:0aSgr4kiWGnt0u9IvnVW584M3HxJHZkN_-4")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:FVHwCKGqMnVKkkjRZPhVQjFtVsGakaaN@postgres.railway.internal:5432/railway")
 OWNER_ID = int(os.getenv("OWNER_ID", "1967315238"))
 BOT_VERSION = os.getenv("BOT_VERSION", "2.0.0 Beta")

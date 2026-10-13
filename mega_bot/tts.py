@@ -229,6 +229,61 @@ async def synthesize_farid_fa(text: str) -> bytes:
     return await synthesize_edge(text, EDGE_VOICE_FA)
 
 
+
+# ── Official Azure Speech (optional key) ────────────────────────────────
+
+async def synthesize_azure_fa(text: str) -> bytes:
+    """Azure Cognitive Services TTS — fa-IR-FaridNeural when AZURE_SPEECH_KEY is set."""
+    import aiohttp
+    key = (os.getenv('AZURE_SPEECH_KEY') or os.getenv('SPEECH_KEY') or '').strip()
+    region = (os.getenv('AZURE_SPEECH_REGION') or os.getenv('SPEECH_REGION') or 'eastus').strip()
+    if not key:
+        raise RuntimeError('AZURE_SPEECH_KEY not set')
+    text = normalize_tts_text(text) or DEFAULT_TEXT
+    if len(text) > MAX_CHARS:
+        text = text[:MAX_CHARS]
+    # Escape XML
+    safe = (
+        text.replace('&', '&amp;')
+        .replace('<', '&lt;')
+        .replace('>', '&gt;')
+        .replace('"', '&quot;')
+        .replace("'", '&apos;')
+    )
+    voice = EDGE_VOICE_FA  # fa-IR-FaridNeural
+    ssml = (
+        f"<speak version='1.0' xml:lang='fa-IR'>"
+        f"<voice name='{voice}'>{safe}</voice></speak>"
+    )
+    url = f'https://{region}.tts.speech.microsoft.com/cognitiveservices/v1'
+    headers = {
+        'Ocp-Apim-Subscription-Key': key,
+        'Content-Type': 'application/ssml+xml',
+        'X-Microsoft-OutputFormat': 'audio-24khz-48kbitrate-mono-mp3',
+        'User-Agent': 'MEGA-BOT',
+    }
+    timeout = aiohttp.ClientTimeout(total=60, connect=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, data=ssml.encode('utf-8'), headers=headers) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise RuntimeError(f'azure HTTP {resp.status}: {body[:200]}')
+            raw = await resp.read()
+    if len(raw) < 50:
+        raise RuntimeError('azure empty audio')
+    with tempfile.TemporaryDirectory(prefix='mega-az-') as td:
+        mp3 = os.path.join(td, 'a.mp3')
+        ogg = os.path.join(td, 'a.ogg')
+        with open(mp3, 'wb') as f:
+            f.write(raw)
+        try:
+            _ffmpeg_to_ogg(mp3, ogg)
+            with open(ogg, 'rb') as f:
+                return f.read()
+        except Exception:
+            return raw
+
+
 # ── Public entry ────────────────────────────────────────────────────────
 
 async def synthesize_persian(text: str = DEFAULT_TEXT) -> tuple[bytes, str]:
@@ -242,10 +297,24 @@ async def synthesize_persian(text: str = DEFAULT_TEXT) -> tuple[bytes, str]:
         log.info('TTS engine=google-en bytes=%s', len(data))
         return data, f'voice.{ext}'
 
+    errors: list[str] = []
+    # 1) Microsoft Edge neural (free FaridNeural)
     try:
         data = await synthesize_farid_fa(text)
         log.info('TTS engine=edge-farid voice=%s bytes=%s', EDGE_VOICE_FA, len(data))
         return data, 'voice.ogg'
     except Exception as exc:
-        log.exception('FaridNeural FA failed')
-        raise RuntimeError(f'فارسی FaridNeural: {type(exc).__name__}: {exc}') from exc
+        errors.append(f'edge:{type(exc).__name__}')
+        log.warning('edge FaridNeural failed: %s', type(exc).__name__)
+    # 2) Official Azure Speech if key configured
+    try:
+        data = await synthesize_azure_fa(text)
+        log.info('TTS engine=azure-farid voice=%s bytes=%s', EDGE_VOICE_FA, len(data))
+        return data, 'voice.ogg'
+    except Exception as exc:
+        errors.append(f'azure:{type(exc).__name__}')
+        log.warning('azure FaridNeural failed: %s', type(exc).__name__)
+    raise RuntimeError(
+        f'فارسی FaridNeural ناموفق: {", ".join(errors)}. '
+        'اگر edge مسدود است، AZURE_SPEECH_KEY و AZURE_SPEECH_REGION را در Railway ست کنید.'
+    )

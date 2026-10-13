@@ -804,9 +804,9 @@ class MegaBot:
             return
 
         # ── Locks / anti-spam panel
-        # Experimental TTS: only exact phrase «ویس تست»
-        if text in ('ویس تست',):
-            await self._cmd_voice_test(chat_id, msg)
+        # TTS: «ویس» / «ویس تست» / «ویس متن دلخواه» (any length)
+        if text == 'ویس' or text.startswith('ویس '):
+            await self._cmd_voice_tts(chat_id, uid, text, msg)
             return
 
         if is_group and text in ('لول', 'لول من', 'level'):
@@ -2463,16 +2463,45 @@ class MegaBot:
             log.debug('level-up announce failed', exc_info=True)
 
 
-    async def _cmd_voice_test(self, chat_id: int, msg: dict) -> None:
-        """Experimental: synthesize Persian «تست» and send as voice note."""
+    async def _cmd_voice_tts(self, chat_id: int, uid: int, text: str, msg: dict) -> None:
+        """Free offline TTS: «ویس متن…» or reply+«ویس». Supports long text."""
+        body = text[3:].strip() if text.startswith('ویس') else ''
+        # Exact «ویس تست» keeps legacy short test
+        if text.strip() == 'ویس تست':
+            body = 'تست'
+        if not body:
+            replied = msg.get('reply_to_message') or {}
+            body = (replied.get('text') or replied.get('caption') or '').strip()
+        if not body:
+            await self.safe_send(
+                chat_id,
+                '🎙 بعد از «ویس» متن را بنویس.\n'
+                'مثال: ویس سلام خوبی؟\n'
+                'یا روی یک پیام ریپلای کن و فقط بنویس: ویس',
+                reply_to=msg.get('message_id'),
+                parse_mode=None,
+            )
+            return
+
+        body = tts_mod.normalize_tts_text(body)
+        if not body:
+            await self.safe_send(chat_id, '❌ متن خالی است.', reply_to=msg.get('message_id'), parse_mode=None)
+            return
+        if len(body) > tts_mod.MAX_CHARS:
+            body = body[: tts_mod.MAX_CHARS]
+            note = f' (متن تا {tts_mod.MAX_CHARS} کاراکتر کوتاه شد)'
+        else:
+            note = ''
+
+        est = tts_mod.estimate_duration_sec(body)
         await self.safe_send(
             chat_id,
-            '🎙 در حال ساخت ویس آزمایشی…',
+            f'🎙 در حال ساخت ویس… حدود {est} ثانیه{note}',
             reply_to=msg.get('message_id'),
             parse_mode=None,
         )
         try:
-            data, filename = await tts_mod.synthesize_persian(tts_mod.DEFAULT_TEXT)
+            data, filename = await tts_mod.synthesize_persian(body)
         except Exception as exc:
             log.exception('TTS synthesize failed')
             await self.safe_send(
@@ -2482,27 +2511,29 @@ class MegaBot:
                 parse_mode=None,
             )
             return
+
+        caption = '🎤 ویس ساخته‌شده با MEGA BOT'
         try:
-            if filename.endswith('.mp3'):
-                await self.api.send_audio_bytes(chat_id, data, filename=filename, caption='ویس تست ✨')
+            # Long audio: prefer sendAudio (more reliable for multi-minute)
+            if len(data) > 900_000 or est >= 60:
+                await self.api.send_audio_bytes(chat_id, data, filename=filename, caption=caption)
             else:
-                await self.api.send_voice_bytes(chat_id, data, filename=filename, caption='ویس تست ✨')
+                await self.api.send_voice_bytes(
+                    chat_id, data, filename=filename, caption=caption, duration=est,
+                )
         except Exception as exc:
             log.exception('send voice failed')
-            # one fallback switch
             try:
-                if filename.endswith('.ogg'):
-                    await self.api.send_audio_bytes(chat_id, data, filename='voice.ogg', caption='ویس تست ✨')
-                else:
-                    await self.api.send_voice_bytes(chat_id, data, filename='voice.ogg', caption='ویس تست ✨')
+                await self.api.send_audio_bytes(chat_id, data, filename=filename or 'voice.ogg', caption=caption)
             except Exception as exc2:
-                log.exception('send voice fallback failed')
+                log.exception('send audio fallback failed')
                 await self.safe_send(
                     chat_id,
                     f'❌ ارسال ویس ناموفق بود: {self._short(exc2)}',
                     reply_to=msg.get('message_id'),
                     parse_mode=None,
                 )
+
 
     async def _cmd_level_profile(
         self, chat_id: int, uid: int, user: dict, msg: dict, *, mode: str = 'level',

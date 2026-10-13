@@ -549,6 +549,13 @@ class MegaBot:
             except Exception:
                 pass
 
+        # Cache profile photo in background (for stats dashboard avatars)
+        if uid and user:
+            try:
+                asyncio.create_task(self._cache_sender_avatar(user))
+            except Exception:
+                pass
+
         # Activity XP / levels — every 2 msgs = 1 XP; spam window blocks XP
         if is_group and uid and level_mod.is_valid_activity_message(text, msg):
             try:
@@ -4306,33 +4313,118 @@ class MegaBot:
 
 
     async def _fetch_user_avatars(self, user_ids: list[int], limit: int = 5) -> dict:
-        """Best-effort profile photos for dashboard. Empty dict if API unsupported."""
+        """Download real profile photos when Bale API allows; cache to disk.
+
+        Flow per user:
+        1) disk cache hit
+        2) getUserProfilePhotos → getFile → download bytes
+        3) skip (caller draws letter/gradient avatar)
+        """
         from io import BytesIO
+        from pathlib import Path
         from PIL import Image
-        out = {}
-        for uid in user_ids[:limit]:
+        import hashlib
+
+        cache_dir = Path('/tmp/mega_avatars')
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            cache_dir = Path('.')
+
+        out: dict = {}
+
+        async def one(uid: int):
+            uid = int(uid)
+            cache_path = cache_dir / f'{uid}.jpg'
+            # 1) disk cache
+            try:
+                if cache_path.is_file() and cache_path.stat().st_size > 200:
+                    img = Image.open(cache_path).convert('RGBA')
+                    out[uid] = img
+                    return
+            except Exception:
+                pass
+
+            file_id = None
+            # 2) Official Bot API method (Telegram-compatible; Bale may support)
             try:
                 res = await asyncio.wait_for(
-                    self.api.call('getUserProfilePhotos', {'user_id': int(uid), 'limit': 1}, retries=0),
-                    timeout=4.0,
+                    self.api.call(
+                        'getUserProfilePhotos',
+                        {'user_id': uid, 'limit': 1, 'offset': 0},
+                        retries=0,
+                    ),
+                    timeout=6.0,
                 )
-                # Telegram-like: {total_count, photos: [[{file_id,...}]]}
                 photos = None
                 if isinstance(res, dict):
-                    photos = res.get('photos') or (res.get('result') or {}).get('photos')
-                if not photos:
-                    continue
-                sizes = photos[0] if isinstance(photos[0], list) else photos
-                if not sizes:
-                    continue
-                file_id = sizes[-1].get('file_id') or sizes[0].get('file_id')
-                if not file_id:
-                    continue
-                data, _name = await self.api.get_file_bytes(str(file_id), max_bytes=2_000_000)
-                out[int(uid)] = Image.open(BytesIO(data)).convert('RGBA')
-            except Exception:
-                continue
+                    photos = res.get('photos')
+                    if photos is None and isinstance(res.get('result'), dict):
+                        photos = res['result'].get('photos')
+                if photos and isinstance(photos, list) and photos:
+                    first = photos[0]
+                    sizes = first if isinstance(first, list) else [first]
+                    # largest size last
+                    best = None
+                    best_area = -1
+                    for s in sizes:
+                        if not isinstance(s, dict):
+                            continue
+                        area = int(s.get('width') or 0) * int(s.get('height') or 0)
+                        fid = s.get('file_id')
+                        if fid and area >= best_area:
+                            best_area = area
+                            best = fid
+                    file_id = best or (sizes[-1].get('file_id') if sizes and isinstance(sizes[-1], dict) else None)
+            except Exception as exc:
+                log.debug('getUserProfilePhotos uid=%s: %s', uid, type(exc).__name__)
+
+            if not file_id:
+                return
+
+            try:
+                data, _name = await asyncio.wait_for(
+                    self.api.get_file_bytes(str(file_id), max_bytes=2_000_000),
+                    timeout=12.0,
+                )
+                img = Image.open(BytesIO(data)).convert('RGBA')
+                # normalize square-ish for circle crop later
+                try:
+                    img.save(cache_path, format='JPEG', quality=85)
+                except Exception:
+                    try:
+                        img.convert('RGB').save(cache_path, format='JPEG', quality=85)
+                    except Exception:
+                        pass
+                out[uid] = img
+                log.info('avatar cached uid=%s bytes=%s', uid, len(data))
+            except Exception as exc:
+                log.debug('avatar download uid=%s failed: %s', uid, type(exc).__name__)
+
+        ids = [int(u) for u in user_ids[:limit]]
+        if not ids:
+            return out
+        await asyncio.gather(*(one(u) for u in ids), return_exceptions=True)
         return out
+
+    async def _cache_sender_avatar(self, user: dict) -> None:
+        """Opportunistically cache profile photo when a user is active (rate-limited)."""
+        if not user or not user.get('id'):
+            return
+        uid = int(user['id'])
+        # simple in-memory throttle: once per process per user session window
+        if not hasattr(self, '_avatar_tried'):
+            self._avatar_tried: set[int] = set()
+        if uid in self._avatar_tried:
+            return
+        self._avatar_tried.add(uid)
+        if len(self._avatar_tried) > 5000:
+            self._avatar_tried = set(list(self._avatar_tried)[-2000:])
+        try:
+            await self._fetch_user_avatars([uid], limit=1)
+        except Exception:
+            pass
+
 
     async def _send_group_stats(self, chat_id: int, chat: dict) -> None:
         """Professional image dashboard for the group (replaces text-only stats)."""

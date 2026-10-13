@@ -127,16 +127,22 @@ def _circle_avatar(draw_img: Image.Image, center: tuple[int, int], radius: int, 
     size = radius * 2
     if photo is not None:
         try:
-            av = photo.convert('RGBA').resize((size, size), Image.Resampling.LANCZOS)
+            src = photo.convert('RGBA')
+            # center-crop to square then resize
+            w, h = src.size
+            side = min(w, h)
+            left = (w - side) // 2
+            top = (h - side) // 2
+            src = src.crop((left, top, left + side, top + side))
+            av = src.resize((size, size), Image.Resampling.LANCZOS)
             mask = Image.new('L', (size, size), 0)
-            ImageDraw.Draw(mask).ellipse([0, 0, size - 1, size - 1], fill=255)
+            ImageDraw.Draw(mask).ellipse([1, 1, size - 2, size - 2], fill=255)
             base = Image.new('RGBA', (size, size), (0, 0, 0, 0))
-            base.paste(av, (0, 0))
+            base.paste(av, (0, 0), av)
             base.putalpha(mask)
             draw_img.paste(base, (cx - radius, cy - radius), base)
-            # ring
             d = ImageDraw.Draw(draw_img)
-            d.ellipse([cx - radius - 2, cy - radius - 2, cx + radius + 2, cy + radius + 2], outline=accent, width=2)
+            d.ellipse([cx - radius - 2, cy - radius - 2, cx + radius + 2, cy + radius + 2], outline=accent, width=3)
             return
         except Exception:
             pass
@@ -324,7 +330,7 @@ def render_group_dashboard(
             # avatar
             cx = (x1 + x2) // 2
             photo = avatars.get(uid)
-            _circle_avatar(img, (cx, y1 + 48), 28, photo, name, accent)
+            _circle_avatar(img, (cx, y1 + 52), 34, photo, name, accent)
             draw = ImageDraw.Draw(img)
 
             # rank badge

@@ -251,9 +251,14 @@ class BaleAPI:
     async def get_file_bytes(self, file_id: str, max_bytes: int = 20 * 1024 * 1024) -> tuple[bytes, str]:
         """Download a Bot API file, enforcing a conservative memory limit."""
         info = await self.call('getFile', {'file_id': file_id})
+        if not isinstance(info, dict):
+            raise BaleAPIError('getFile returned invalid payload')
+        # Some gateways nest under result again
+        if 'file_path' not in info and isinstance(info.get('result'), dict):
+            info = info['result']
         file_path = info.get('file_path')
         if not file_path:
-            raise BaleAPIError('getFile did not return file_path')
+            raise BaleAPIError(f'getFile did not return file_path: {list(info.keys())}')
         # Host without embedding token in path twice
         host = self.base.split('/bot', 1)[0]
         url = f'{host}/file/bot{self.token}/{file_path}'

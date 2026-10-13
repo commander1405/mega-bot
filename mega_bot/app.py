@@ -2512,7 +2512,7 @@ class MegaBot:
             )
             return
 
-        caption = '🎤 ویس ساخته‌شده با MEGA BOT'
+        caption = '🎤 ویس MEGA BOT'
         try:
             # Long audio: prefer sendAudio (more reliable for multi-minute)
             if len(data) > 900_000 or est >= 60:

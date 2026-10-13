@@ -14,6 +14,8 @@ from .profanity import contains_profanity
 from . import schedule_lock as schlock
 from . import levels as level_mod
 from . import tts as tts_mod
+from . import font_styles as font_mod
+from . import time_literary as time_mod
 from . import stats_dashboard as dash
 from config import OWNER_ID, BOT_VERSION, SUPPORT_TEXT, DONATION_TEXT
 
@@ -987,6 +989,15 @@ class MegaBot:
             await self._send_group_stats(chat_id, chat)
             return
 
+        # ── Font stylizer: «فونت متن» or reply+«فونت»
+        if text == 'فونت' or text.startswith('فونت '):
+            await self._cmd_font(chat_id, text, msg)
+            return
+        # ── Literary time (Tehran)
+        if text in ('تایم', 'ساعت', 'زمان'):
+            await self._cmd_time_story(chat_id, msg)
+            return
+
         # ── Fun commands
         _fun_key = text.replace('‌', '').replace('ـ', '').strip()
         if _fun_key in ('چالش', 'فکت', 'حقیقت', 'جرئت', 'جرأت'):
@@ -1358,6 +1369,9 @@ class MegaBot:
                 await self.safe_edit(chat_id, message_id, 'بازی لغو شد.', None)
             return
 
+        if data.startswith('font:') or data.startswith('fontp:'):
+            await self._handle_font_callback(uid, chat_id, message_id, data, query)
+            return
         if data.startswith('ttt:'):
             await self.handle_ttt_callback(query, data)
             return
@@ -2250,6 +2264,89 @@ class MegaBot:
             except Exception:
                 pass
 
+
+    async def _cmd_font(self, chat_id: int, text: str, msg: dict) -> None:
+        body = text[4:].strip() if text.startswith('فونت') else ''
+        if not body:
+            replied = msg.get('reply_to_message') or {}
+            body = (replied.get('text') or replied.get('caption') or '').strip()
+        if not body:
+            await self.safe_send(
+                chat_id,
+                '✨ بعد از «فونت» متن را بنویس.\nمثال: `فونت آرتین`\nیا روی یک پیام ریپلای کن و بنویس: فونت',
+                reply_to=msg.get('message_id'),
+                parse_mode='Markdown',
+            )
+            return
+        try:
+            caption, rows, _tok = font_mod.build_panel(body, page=0, extra=False)
+            await self.safe_send(chat_id, caption, keyboard=inline(rows), reply_to=msg.get('message_id'))
+        except Exception:
+            log.exception('font panel failed')
+            await self.safe_send(chat_id, '❌ ساخت فونت‌ساز ناموفق بود.', parse_mode=None)
+
+    async def _handle_font_callback(self, uid: int, chat_id: int, message_id: int, data: str, query: dict) -> None:
+        callback_id = query.get('id')
+        try:
+            if data.startswith('fontp:'):
+                # fontp:token:page:extra
+                parts = data.split(':')
+                if len(parts) < 4:
+                    return
+                tok, page_s, extra_s = parts[1], parts[2], parts[3]
+                page = int(page_s)
+                extra = extra_s == '1'
+                resolved = font_mod.resolve_page(tok, page, extra)
+                if not resolved:
+                    try:
+                        await self.api.answer_callback_query(callback_id, '⏰ منقضی شده؛ دوباره «فونت …» بفرست', show_alert=True)
+                    except Exception:
+                        pass
+                    return
+                cap, rows = resolved
+                await self.safe_edit(chat_id, message_id, cap, inline(rows))
+                try:
+                    await self.api.answer_callback_query(callback_id)
+                except Exception:
+                    pass
+                return
+
+            if data.startswith('font:'):
+                # font:token:style_id
+                parts = data.split(':')
+                if len(parts) < 3:
+                    return
+                tok, sid_s = parts[1], parts[2]
+                sid = int(sid_s)
+                styled = font_mod.resolve_selection(tok, sid)
+                if styled is None:
+                    try:
+                        await self.api.answer_callback_query(callback_id, '⏰ منقضی شده؛ دوباره «فونت …» بفرست', show_alert=True)
+                    except Exception:
+                        pass
+                    return
+                # Send as plain copyable text (no markdown corruption)
+                await self.safe_send(chat_id, styled, parse_mode=None)
+                try:
+                    await self.api.answer_callback_query(callback_id, '✅ ارسال شد — می‌تونی کپی کنی')
+                except Exception:
+                    pass
+                return
+        except Exception:
+            log.exception('font callback failed')
+            try:
+                await self.api.answer_callback_query(callback_id, 'خطا در فونت‌ساز', show_alert=True)
+            except Exception:
+                pass
+
+    async def _cmd_time_story(self, chat_id: int, msg: dict) -> None:
+        try:
+            story = time_mod.format_time_story()
+            await self.safe_send(chat_id, story, reply_to=msg.get('message_id'), parse_mode='Markdown')
+        except Exception:
+            log.exception('time story failed')
+            await self.safe_send(chat_id, '❌ خواندن ساعت ممکن نشد.', parse_mode=None)
+
     GUIDE_ENTRIES = [
         ('📌 دستورات عمومی',
          '• کیبورد پایین: پشتیبانی، حمایت مالی، تیم توسعه، آمار، منوی بیشتر\n'
@@ -2290,7 +2387,16 @@ class MegaBot:
          '• انگلیسی: صدای Google Translate\n'
          '• متن طولانی پشتیبانی می‌شود\n'
          'دسترسی: همه کاربران'),
-        ('🎲 سرگرمی',
+                ('✨ فونت‌ساز',
+         '• `فونت متن دلخواه` — استایل‌های فارسی و انگلیسی\n'
+         '• ریپلای + `فونت` — فونت‌سازی روی همان پیام\n'
+         '• صفحه‌بندی ۶تایی، قبلی/بعدی، فونت‌های بیشتر\n'
+         'دسترسی: همه کاربران'),
+        ('📜 تایم ادبی',
+         '• `تایم` یا `ساعت` — حکایت زمان با تقویم شمسی و ساعت تهران\n'
+         '• منطقه زمانی: Asia/Tehran\n'
+         'دسترسی: همه کاربران'),
+('🎲 سرگرمی',
          '• `چالش` — مأموریت/سؤال سرگرم‌کننده\n'
          '• `فکت` — حقیقت جالب\n'
          '• `حقیقت` — سؤال حقیقت (قابل رد)\n'

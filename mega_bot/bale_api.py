@@ -352,6 +352,34 @@ class BaleAPI:
                 raise BaleAPIError(f"sendAnimation: HTTP {response.status}: {result.get('description', result)}")
             return result.get('result', result)
 
+
+    async def send_photo_bytes(
+        self,
+        chat_id: int,
+        data: bytes,
+        filename: str = 'stats.png',
+        caption: str | None = None,
+    ) -> dict:
+        session = await self._ensure_session()
+        form = aiohttp.FormData()
+        form.add_field('chat_id', str(chat_id))
+        if caption:
+            form.add_field('caption', caption)
+        form.add_field('photo', data, filename=filename, content_type='image/png')
+        async with session.post(
+            self.base + 'sendPhoto',
+            data=form,
+            timeout=aiohttp.ClientTimeout(total=120, connect=20),
+        ) as response:
+            raw = await response.text()
+            try:
+                result = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise BaleAPIError(f'sendPhoto returned non-JSON HTTP {response.status}') from exc
+            if response.status >= 400 or not result.get('ok', response.status < 400):
+                raise BaleAPIError(f"sendPhoto: HTTP {response.status}: {result.get('description', result)}")
+            return result.get('result', result)
+
     async def send_photo(self, chat_id: int, photo: str, caption: str | None = None, reply_markup: dict | None = None, parse_mode: str | None = None) -> dict:
         payload: dict[str, Any] = {'chat_id': chat_id, 'photo': photo}
         if caption:

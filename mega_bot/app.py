@@ -14,6 +14,7 @@ from .profanity import contains_profanity
 from . import schedule_lock as schlock
 from . import levels as level_mod
 from . import tts as tts_mod
+from . import stats_dashboard as dash
 from config import OWNER_ID, BOT_VERSION, SUPPORT_TEXT, DONATION_TEXT
 
 log = logging.getLogger(__name__)
@@ -4304,42 +4305,68 @@ class MegaBot:
         await self.safe_send(chat_id, body, kb, reply_to=msg.get('message_id'))
 
     async def _send_group_stats(self, chat_id: int, chat: dict) -> None:
-        data = await self.db.group_stats_today(chat_id)
-        c = data['counts']
-        top_lines = []
-        for i, u in enumerate(data.get('top_users') or [], 1):
-            name = u.get('first_name') or u.get('username') or str(u.get('user_id'))
-            top_lines.append(f"{i}. {name} — {u.get('msg_count', 0)} پیام")
-        top_txt = '\n'.join(top_lines) if top_lines else 'هنوز داده‌ای ثبت نشده'
+        """Professional image dashboard for the group (replaces text-only stats)."""
         title = chat.get('title') or 'گروه'
-        text = (
-            f"📊 *آمار گروه امروز*\n"
-            f"گروه: *{title}*\n"
-            f"شناسه: `{chat_id}`\n"
-            f"بازه: `{data['day']}` (تقویم سرور)\n\n"
-            f"➕ ورود امروز: {c['joined']}\n"
-            f"➖ خروج امروز: {c['left_count']}\n\n"
-            f"📝 متن: {c['text_count']} | 🖼 عکس: {c['photo_count']}\n"
-            f"🎬 ویدئو: {c['video_count']} | 🎤 ویس: {c['voice_count']}\n"
-            f"🎵 آهنگ: {c['audio_count']} | 🎞 GIF: {c['animation_count']}\n"
-            f"استیکر: {c['sticker_count']} | 📎 فایل: {c['document_count']}\n"
-            f"🗑 حذف‌شده توسط ربات: {c['deleted_by_bot']}\n\n"
-            f"*۳ کاربر فعال‌تر امروز:*\n{top_txt}\n\n"
-            f"_فقط از زمان ثبت رویدادها توسط ربات شمارش می‌شود._"
-        )
         try:
-            cnt = await asyncio.wait_for(self.api.call('getChatMembersCount', {'chat_id': chat_id}, retries=0), timeout=5.0)
+            stats = await self.db.group_stats_24h(chat_id)
+        except Exception:
+            log.exception('group_stats_24h failed')
+            try:
+                stats = await self.db.group_stats_today(chat_id)
+                # adapt legacy shape
+                stats = {
+                    'counts': stats.get('counts') or {},
+                    'hourly': [],
+                    'top_users': stats.get('top_users') or [],
+                    'active_users': len(stats.get('top_users') or []),
+                    'total_msgs': sum(int(u.get('msg_count') or 0) for u in (stats.get('top_users') or [])),
+                    'window': 'today',
+                }
+            except Exception:
+                await self.safe_send(chat_id, '❌ خواندن آمار گروه ممکن نشد.', parse_mode=None)
+                return
+
+        members_count = None
+        try:
+            cnt = await asyncio.wait_for(
+                self.api.call('getChatMembersCount', {'chat_id': chat_id}, retries=0),
+                timeout=5.0,
+            )
             if isinstance(cnt, int):
-                n = cnt
+                members_count = cnt
             elif isinstance(cnt, dict):
-                n = cnt.get('result', cnt)
-            else:
-                n = None
-            if n is not None:
-                text = text.replace(f"شناسه: `{chat_id}`\n", f"شناسه: `{chat_id}`\nاعضای فعلی (API): `{n}`\n")
+                members_count = cnt.get('result', cnt) if not isinstance(cnt.get('result'), dict) else None
+                if isinstance(members_count, dict):
+                    members_count = None
         except Exception:
             pass
-        await self.safe_send(chat_id, text)
+
+        try:
+            png = await asyncio.to_thread(
+                dash.render_group_dashboard,
+                title=title,
+                stats=stats,
+                members_count=members_count if isinstance(members_count, int) else None,
+            )
+            await self.api.send_photo_bytes(
+                chat_id,
+                png,
+                filename='group-stats.png',
+                caption=f'📊 داشبورد تحلیلی — {title}',
+            )
+        except Exception as exc:
+            log.exception('stats dashboard render/send failed')
+            # Fallback minimal text so command never dies silently
+            c = stats.get('counts') or {}
+            await self.safe_send(
+                chat_id,
+                f"📊 آمار گروه (پشتیبان متنی)\n"
+                f"پیام‌ها: {stats.get('total_msgs', 0)} | فعال: {stats.get('active_users', 0)}\n"
+                f"عکس: {c.get('photo_count', 0)} | ویدیو: {c.get('video_count', 0)} | ویس: {c.get('voice_count', 0)}\n"
+                f"❌ تصویر: {self._short(exc)}",
+                parse_mode=None,
+            )
+
 
     async def _show_group_panel(self, chat_id: int, uid: int) -> None:
         gs = await self.db.get_group_settings(chat_id)

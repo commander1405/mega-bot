@@ -13,20 +13,20 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 # ── palette (from reference) ───────────────────────────────────────────
-BG = (3, 4, 12)
-CARD = (10, 14, 30)
-CARD_INNER = (8, 11, 24)
-BORDER = (70, 55, 140)
-CYAN = (0, 245, 255)
-CYAN_SOFT = (20, 230, 255)
-PURPLE = (190, 90, 255)
-PINK = (255, 70, 170)
-GREEN = (40, 255, 180)
-GOLD = (255, 210, 50)
-ORANGE = (255, 160, 50)
-BLUE = (80, 180, 255)
+BG = (2, 3, 10)
+CARD = (8, 10, 24)
+CARD_INNER = (6, 8, 20)
+BORDER = (90, 60, 180)
+CYAN = (0, 255, 255)
+CYAN_SOFT = (0, 240, 255)
+PURPLE = (200, 70, 255)
+PINK = (255, 50, 160)
+GREEN = (20, 255, 170)
+GOLD = (255, 200, 30)
+ORANGE = (255, 150, 30)
+BLUE = (60, 170, 255)
 TEXT = (255, 255, 255)
-MUTED = (175, 185, 210)
+MUTED = (160, 175, 205)
 GRID = (36, 42, 70)
 
 W, H = 1280, 1140
@@ -264,6 +264,74 @@ def _draw_mixed(draw, xy, text: str, size: int, fill=TEXT, anchor='mm', bold: bo
             cursor += size / 2
 
 
+
+def _icon_bubble(draw, cx, cy, r, color):
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=color, width=2)
+
+
+def _draw_kpi_icon(draw, kind: str, x1, y1, x2, y2, color):
+    """Simple vector-style icons (SVG-like paths drawn with Pillow)."""
+    cx = x1 + 28
+    cy = (y1 + y2) // 2
+    if kind == 'msgs':
+        # chat bubble
+        draw.rounded_rectangle([cx - 12, cy - 10, cx + 12, cy + 6], radius=5, outline=color, width=2)
+        draw.polygon([(cx - 4, cy + 6), (cx - 10, cy + 14), (cx + 2, cy + 6)], outline=color)
+        draw.line([(cx - 6, cy - 2), (cx + 6, cy - 2)], fill=color, width=2)
+        draw.line([(cx - 6, cy + 2), (cx + 3, cy + 2)], fill=color, width=2)
+    elif kind == 'active':
+        # user
+        draw.ellipse([cx - 7, cy - 12, cx + 7, cy - 2], outline=color, width=2)
+        draw.arc([cx - 12, cy - 2, cx + 12, cy + 14], 200, 340, fill=color, width=2)
+    elif kind == 'join':
+        # user +
+        draw.ellipse([cx - 7, cy - 12, cx + 5, cy - 2], outline=color, width=2)
+        draw.arc([cx - 12, cy - 2, cx + 8, cy + 14], 200, 340, fill=color, width=2)
+        draw.line([(cx + 10, cy - 2), (cx + 10, cy + 10)], fill=color, width=2)
+        draw.line([(cx + 4, cy + 4), (cx + 16, cy + 4)], fill=color, width=2)
+    elif kind == 'left':
+        # door/exit
+        draw.rounded_rectangle([cx - 10, cy - 12, cx + 6, cy + 12], radius=2, outline=color, width=2)
+        draw.line([(cx + 6, cy), (cx + 16, cy)], fill=color, width=2)
+        draw.polygon([(cx + 10, cy - 5), (cx + 16, cy), (cx + 10, cy + 5)], outline=color)
+    elif kind == 'members':
+        # group
+        draw.ellipse([cx - 10, cy - 12, cx - 2, cy - 4], outline=color, width=2)
+        draw.ellipse([cx + 2, cy - 12, cx + 10, cy - 4], outline=color, width=2)
+        draw.arc([cx - 14, cy - 4, cx, cy + 12], 200, 340, fill=color, width=2)
+        draw.arc([cx, cy - 4, cx + 14, cy + 12], 200, 340, fill=color, width=2)
+    elif kind == 'photo':
+        draw.rounded_rectangle([cx - 12, cy - 10, cx + 12, cy + 10], radius=3, outline=color, width=2)
+        draw.ellipse([cx - 3, cy - 3, cx + 5, cy + 5], outline=color, width=2)
+        draw.polygon([(cx - 10, cy + 8), (cx - 2, cy - 2), (cx + 4, cy + 4), (cx + 10, cy + 8)], outline=color)
+    elif kind == 'video':
+        draw.rounded_rectangle([cx - 12, cy - 9, cx + 4, cy + 9], radius=3, outline=color, width=2)
+        draw.polygon([(cx + 4, cy - 6), (cx + 14, cy), (cx + 4, cy + 6)], outline=color)
+    elif kind == 'sticker':
+        draw.ellipse([cx - 12, cy - 12, cx + 12, cy + 12], outline=color, width=2)
+        draw.arc([cx - 6, cy - 2, cx + 6, cy + 8], 20, 160, fill=color, width=2)
+        draw.ellipse([cx - 5, cy - 5, cx - 2, cy - 2], fill=color)
+        draw.ellipse([cx + 2, cy - 5, cx + 5, cy - 2], fill=color)
+    elif kind == 'gif':
+        draw.rounded_rectangle([cx - 12, cy - 10, cx + 12, cy + 10], radius=4, outline=color, width=2)
+        _t(draw, (cx, cy), 'GIF', _font(9, True), color, 'mm')
+    elif kind == 'music':
+        draw.ellipse([cx - 10, cy + 2, cx - 2, cy + 10], outline=color, width=2)
+        draw.line([(cx - 2, cy + 6), (cx - 2, cy - 10), (cx + 10, cy - 12), (cx + 10, cy + 2)], fill=color, width=2)
+        draw.ellipse([cx + 2, cy + 2, cx + 10, cy + 10], outline=color, width=2)
+    elif kind == 'voice':
+        draw.rounded_rectangle([cx - 5, cy - 12, cx + 5, cy + 4], radius=5, outline=color, width=2)
+        draw.arc([cx - 10, cy - 4, cx + 10, cy + 12], 10, 170, fill=color, width=2)
+        draw.line([(cx, cy + 12), (cx, cy + 16)], fill=color, width=2)
+    elif kind == 'file':
+        draw.polygon([(cx - 8, cy - 12), (cx + 4, cy - 12), (cx + 10, cy - 6), (cx + 10, cy + 12), (cx - 8, cy + 12)], outline=color)
+        draw.line([(cx + 4, cy - 12), (cx + 4, cy - 6), (cx + 10, cy - 6)], fill=color, width=2)
+    elif kind == 'chart':
+        for i, h in enumerate((6, 12, 9, 15)):
+            bx = cx - 10 + i * 6
+            draw.rectangle([bx, cy + 8 - h, bx + 4, cy + 8], fill=color)
+
+
 def _panel(draw, xy, radius=18, fill=CARD, outline=BORDER, width=1):
     draw.rounded_rectangle(xy, radius=radius, fill=fill, outline=outline, width=width)
 
@@ -279,9 +347,9 @@ def _background() -> Image.Image:
     glow = Image.new('RGBA', (W, H), (0, 0, 0, 0))
     g = ImageDraw.Draw(glow)
     # large purple / blue washes like reference
-    g.ellipse([W - 420, -180, W + 180, 320], fill=(120, 50, 220, 70))
-    g.ellipse([-120, 200, 420, 720], fill=(30, 120, 180, 55))
-    g.ellipse([W // 3, H - 280, W // 3 + 500, H + 120], fill=(100, 40, 160, 50))
+    g.ellipse([W - 420, -180, W + 180, 320], fill=(140, 40, 230, 85))
+    g.ellipse([-120, 200, 420, 720], fill=(20, 140, 200, 70))
+    g.ellipse([W // 3, H - 280, W // 3 + 500, H + 120], fill=(120, 30, 180, 65))
     glow = glow.filter(ImageFilter.GaussianBlur(55))
     return Image.alpha_composite(img, glow)
 
@@ -364,11 +432,11 @@ def render_group_dashboard(
     # ═══ 2) FIVE KPI CARDS ════════════════════════════════════════════
     # RTL order from right: پیام‌ها, فعال, جدید, خارج‌شده, کل اعضا
     kpis = [
-        ('تعداد پیام‌ها', total_msgs, GOLD, ORANGE),
-        ('کاربران فعال', active, PURPLE, PINK),
-        ('کاربران جدید', joined, GREEN, CYAN_SOFT),
-        ('کاربران خارج‌شده', left, CYAN_SOFT, BLUE),
-        ('کل اعضا', members if members is not None else '—', PURPLE, BLUE),
+        ('تعداد پیام‌ها', total_msgs, GOLD, 'msgs'),
+        ('کاربران فعال', active, PURPLE, 'active'),
+        ('کاربران جدید', joined, GREEN, 'join'),
+        ('کاربران خارج‌شده', left, CYAN_SOFT, 'left'),
+        ('کل اعضا', members if members is not None else '—', PURPLE, 'members'),
     ]
     margin = 36
     gap = 14
@@ -376,17 +444,16 @@ def render_group_dashboard(
     card_w = (W - 2 * margin - gap * (n - 1)) // n
     y0 = 128
     card_h = 108
-    for i, (lbl, val, c1, c2) in enumerate(kpis):
+    for i, (lbl, val, c1, icon_kind) in enumerate(kpis):
         x2 = W - margin - i * (card_w + gap)
         x1 = x2 - card_w
         _panel(draw, [x1, y0, x2, y0 + card_h], radius=16, fill=CARD, outline=c1, width=2)
-        # value
-        val_s = fa_num(val) if isinstance(val, (int, float)) else _fa(str(val))
+        _draw_kpi_icon(draw, icon_kind, x1, y0, x2, y0 + card_h, c1)
         if isinstance(val, (int, float)):
-            _t(draw, (x2 - 18, y0 + 18), fa_num(val), f_kpi, c1, 'rt')
+            _t(draw, (x2 - 16, y0 + 18), fa_num(val), f_kpi, c1, 'rt')
         else:
-            _t(draw, (x2 - 18, y0 + 18), str(val), f_kpi, c1, 'rt')
-        _t(draw, (x2 - 18, y0 + 66), lbl, f_kpi_lbl, MUTED, 'rt')
+            _t(draw, (x2 - 16, y0 + 18), str(val), f_kpi, c1, 'rt')
+        _t(draw, (x2 - 16, y0 + 66), lbl, f_kpi_lbl, MUTED, 'rt')
 
     # ═══ 3) HOURLY CHART PANEL ════════════════════════════════════════
     chart_top = 250
@@ -449,24 +516,26 @@ def render_group_dashboard(
     _t(draw, (W - margin - 20, media_top + 12), 'تفکیک رسانه‌ها', f_sec, TEXT, 'rt')
 
     media_items = [
-        ('عکس‌ها', int(counts.get('photo_count') or 0), PURPLE),
-        ('ویدیوها', int(counts.get('video_count') or 0), CYAN_SOFT),
-        ('استیکرها', int(counts.get('sticker_count') or 0), GOLD),
-        ('گیف‌ها', int(counts.get('animation_count') or 0), BLUE),
-        ('موسیقی‌ها', int(counts.get('audio_count') or 0), GREEN),
-        ('ویس‌ها', int(counts.get('voice_count') or 0), PINK),
-        ('فایل‌ها', int(counts.get('document_count') or 0), PURPLE),
+        ('عکس‌ها', int(counts.get('photo_count') or 0), PURPLE, 'photo'),
+        ('ویدیوها', int(counts.get('video_count') or 0), CYAN_SOFT, 'video'),
+        ('استیکرها', int(counts.get('sticker_count') or 0), GOLD, 'sticker'),
+        ('گیف‌ها', int(counts.get('animation_count') or 0), BLUE, 'gif'),
+        ('موسیقی‌ها', int(counts.get('audio_count') or 0), GREEN, 'music'),
+        ('ویس‌ها', int(counts.get('voice_count') or 0), PINK, 'voice'),
+        ('فایل‌ها', int(counts.get('document_count') or 0), PURPLE, 'file'),
     ]
 
     def _media_row(items, row_y, cols):
         gap_m = 12
         mw = (W - 2 * margin - 28 - gap_m * (cols - 1)) // cols
-        for i, (lbl, val, color) in enumerate(items):
+        for i, item in enumerate(items):
+            lbl, val, color, ik = item if len(item) == 4 else (*item, 'file')
             x2 = W - margin - 14 - i * (mw + gap_m)
             x1 = x2 - mw
             _panel(draw, [x1, row_y, x2, row_y + 66], radius=14, fill=CARD_INNER, outline=color, width=2)
-            _t(draw, (x2 - 14, row_y + 10), fa_num(val), f_kpi, color, 'rt')
-            _t(draw, (x2 - 14, row_y + 42), lbl, f_tiny, MUTED, 'rt')
+            _draw_kpi_icon(draw, ik, x1 - 4, row_y, x1 + 50, row_y + 66, color)
+            _t(draw, (x2 - 12, row_y + 10), fa_num(val), f_kpi, color, 'rt')
+            _t(draw, (x2 - 12, row_y + 42), lbl, f_tiny, MUTED, 'rt')
 
     _media_row(media_items[:4], media_top + 48, 4)
     _media_row(media_items[4:], media_top + 124, 3)
@@ -534,5 +603,5 @@ def render_group_dashboard(
     _t(draw, (W - margin, H - 28), 'Powered by Dk', f_tiny, MUTED, 'rt')
 
     buf = BytesIO()
-    img.convert('RGB').save(buf, format='PNG', optimize=False, compress_level=3)
+    img.convert('RGB').save(buf, format='PNG', optimize=False, compress_level=1)
     return buf.getvalue()

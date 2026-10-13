@@ -903,7 +903,10 @@ class MegaBot:
             return
 
         # ── Group stats
-        if is_group and text in ('آمار', 'آمار گروه', 'آمارگروه'):
+        if is_group and text in ('آمار', 'امار', 'آمار گروه', 'آمارگروه', 'امار گروه'):
+            if not await self._has_group_mod_power(chat_id, uid):
+                await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', parse_mode=None)
+                return
             await self._send_group_stats(chat_id, chat)
             return
 

@@ -1157,7 +1157,7 @@ class MegaBot:
             try:
                 if await self._is_maintenance():
                     try:
-                        await self.api.answer_callback_query(callback_id, '🛠️ ربات در حالت تعمیرات است', show_alert=True)
+                        await self.api.answer_callback(callback_id, '🛠️ ربات در حالت تعمیرات است', show_alert=True)
                     except Exception:
                         pass
                     return
@@ -2299,14 +2299,14 @@ class MegaBot:
                 resolved = font_mod.resolve_page(tok, page, extra)
                 if not resolved:
                     try:
-                        await self.api.answer_callback_query(callback_id, '⏰ منقضی شده؛ دوباره «فونت …» بفرست', show_alert=True)
+                        await self.api.answer_callback(callback_id, '⏰ منقضی شده؛ دوباره «فونت …» بفرست', show_alert=True)
                     except Exception:
                         pass
                     return
                 cap, rows = resolved
                 await self.safe_edit(chat_id, message_id, cap, inline(rows))
                 try:
-                    await self.api.answer_callback_query(callback_id)
+                    await self.api.answer_callback(callback_id)
                 except Exception:
                     pass
                 return
@@ -2321,21 +2321,21 @@ class MegaBot:
                 styled = font_mod.resolve_selection(tok, sid)
                 if styled is None:
                     try:
-                        await self.api.answer_callback_query(callback_id, '⏰ منقضی شده؛ دوباره «فونت …» بفرست', show_alert=True)
+                        await self.api.answer_callback(callback_id, '⏰ منقضی شده؛ دوباره «فونت …» بفرست', show_alert=True)
                     except Exception:
                         pass
                     return
                 # Send as plain copyable text (no markdown corruption)
                 await self.safe_send(chat_id, styled, parse_mode=None)
                 try:
-                    await self.api.answer_callback_query(callback_id, '✅ ارسال شد — می‌تونی کپی کنی')
+                    await self.api.answer_callback(callback_id, '✅ ارسال شد — می‌تونی کپی کنی')
                 except Exception:
                     pass
                 return
         except Exception:
             log.exception('font callback failed')
             try:
-                await self.api.answer_callback_query(callback_id, 'خطا در فونت‌ساز', show_alert=True)
+                await self.api.answer_callback(callback_id, 'خطا در فونت‌ساز', show_alert=True)
             except Exception:
                 pass
 

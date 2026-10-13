@@ -34,6 +34,11 @@ PIPER_BASE = os.getenv(
     'https://huggingface.co/rhasspy/piper-voices/resolve/main/fa/fa_IR/amir/medium',
 )
 PIPER_DIR = Path(os.getenv('TTS_PIPER_DIR', '/tmp/mega_piper'))
+# Calm speech: higher length_scale = slower; lower noise = less nervous
+PIPER_LENGTH_SCALE = float(os.getenv('TTS_PIPER_LENGTH', '1.45'))
+PIPER_NOISE_SCALE = float(os.getenv('TTS_PIPER_NOISE', '0.35'))
+PIPER_NOISE_W = float(os.getenv('TTS_PIPER_NOISE_W', '0.55'))
+PIPER_VOLUME = float(os.getenv('TTS_PIPER_VOLUME', '1.0'))
 
 _piper_voice = None
 _piper_lock = asyncio.Lock()
@@ -249,19 +254,33 @@ def _load_piper():
     return _piper_voice
 
 
+def _piper_syn_config():
+    """Calm, slower delivery — less nervous / rushed."""
+    from piper.config import SynthesisConfig
+    return SynthesisConfig(
+        length_scale=PIPER_LENGTH_SCALE,   # >1 slower & calmer
+        noise_scale=PIPER_NOISE_SCALE,     # lower = smoother, less jitter
+        noise_w_scale=PIPER_NOISE_W,
+        normalize_audio=True,
+        volume=PIPER_VOLUME,
+    )
+
+
 def _piper_synthesize_sync(text: str) -> bytes:
     import wave
     voice = _load_piper()
     text = normalize_tts_text(text) or DEFAULT_TEXT
     if len(text) > MAX_CHARS:
         text = text[:MAX_CHARS]
-    chunks = _chunk_text(text, 800)
+    # Slightly longer phrases read more naturally when speaking slowly
+    chunks = _chunk_text(text, 600)
+    syn = _piper_syn_config()
     with tempfile.TemporaryDirectory(prefix='mega-piper-') as td:
         wav_parts: list[str] = []
         for i, ch in enumerate(chunks):
             path = os.path.join(td, f'{i:04d}.wav')
             with wave.open(path, 'wb') as wf:
-                voice.synthesize_wav(ch, wf)
+                voice.synthesize_wav(ch, wf, syn_config=syn)
             wav_parts.append(path)
         merged = os.path.join(td, 'm.wav')
         _concat_audio_files(wav_parts, merged)

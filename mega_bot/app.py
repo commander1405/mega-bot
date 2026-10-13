@@ -904,7 +904,7 @@ class MegaBot:
 
         # ── Group stats
         if is_group and text in ('آمار', 'امار', 'آمار گروه', 'آمارگروه', 'امار گروه'):
-            if not await self._has_group_mod_power(chat_id, uid):
+            if not await self._require_group_admin(chat_id, uid):
                 await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', parse_mode=None)
                 return
             await self._send_group_stats(chat_id, chat)
@@ -1438,35 +1438,56 @@ class MegaBot:
     # (chat_id, user_id) -> (is_admin, expires_at)
     _admin_cache: dict[tuple[int, int], tuple[bool, float]] = {}
 
-    async def _is_chat_admin(self, chat_id: int, uid: int) -> bool:
+    async def _is_chat_admin(self, chat_id: int, uid: int, *, force: bool = False) -> bool:
         """Check group admin status with a short TTL cache.
 
-        After the bot itself is promoted, groups generate more traffic and
-        repeated getChatMember calls can slow or trip the API. Cache for 60s.
+        Only ``creator`` / ``administrator`` count. On API failure returns False
+        (fail-closed) so non-admins never get elevated access by accident.
         """
         key = (int(chat_id), int(uid))
         now = time.time()
-        cached = self._admin_cache.get(key)
-        if cached and cached[1] > now:
-            return cached[0]
+        if not force:
+            cached = self._admin_cache.get(key)
+            if cached and cached[1] > now:
+                return bool(cached[0])
         try:
             result = await asyncio.wait_for(
                 self.api.call('getChatMember', {'chat_id': chat_id, 'user_id': uid}),
                 timeout=4.0,
             )
+            if isinstance(result, dict) and isinstance(result.get('result'), dict):
+                result = result['result']
             if not isinstance(result, dict):
+                self._admin_cache[key] = (False, now + 15)
                 return False
-            status = (result.get('status') or '').lower()
+            status = (result.get('status') or '').strip().lower()
             is_admin = status in ('creator', 'administrator')
-            self._admin_cache[key] = (is_admin, now + 60)
-            # Bound cache size
+            # Cache positives longer; negatives shorter so promotions apply faster
+            self._admin_cache[key] = (is_admin, now + (60 if is_admin else 20))
             if len(self._admin_cache) > 2000:
                 expired = [k for k, v in self._admin_cache.items() if v[1] <= now]
                 for k in expired[:500]:
                     self._admin_cache.pop(k, None)
             return is_admin
         except Exception as exc:
-            log.debug('getChatMember failed chat=%s user=%s: %s', chat_id, uid, exc)
+            log.warning('getChatMember failed chat=%s user=%s: %s', chat_id, uid, exc)
+            # Fail closed — do not grant admin on network errors
+            self._admin_cache[key] = (False, now + 10)
+            return False
+
+    async def _require_group_admin(self, chat_id: int, uid: int) -> bool:
+        """True only for bot owner or real group admin (NOT VIP).
+
+        Used for destructive / sensitive group tools: آمار, پاک, …
+        """
+        if not uid:
+            return False
+        if uid == OWNER_ID:
+            return True
+        try:
+            return bool(await self._is_chat_admin(chat_id, uid, force=True))
+        except Exception:
+            log.exception('admin check failed chat=%s uid=%s', chat_id, uid)
             return False
 
     async def _has_group_mod_power(self, chat_id: int, uid: int) -> bool:
@@ -3608,8 +3629,13 @@ class MegaBot:
         if not (t == 'پاک' or t.startswith('پاک ')):
             return False
 
-        if not await self._has_group_mod_power(chat_id, uid):
-            await self.safe_send(chat_id, '⛔ برای این کار باید مدیر گروه یا کاربر ویژه باشی!', reply_to=msg.get('message_id'), parse_mode=None)
+        if not await self._require_group_admin(chat_id, uid):
+            await self.safe_send(
+                chat_id,
+                '⛔ فقط مدیران گروه می‌توانند از دستور پاک استفاده کنند!',
+                reply_to=msg.get('message_id'),
+                parse_mode=None,
+            )
             return True
 
         current_mid = int(msg.get('message_id') or 0) or None
@@ -3697,7 +3723,7 @@ class MegaBot:
         if int(pending.get('uid') or 0) != uid and uid != OWNER_ID:
             await self.safe_send(chat_id, '⛔ فقط کسی که درخواست داده می‌تواند تأیید کند.', parse_mode=None)
             return
-        if not await self._has_group_mod_power(chat_id, uid):
+        if not await self._require_group_admin(chat_id, uid):
             await self.safe_send(chat_id, '⛔ برای این کار باید مدیر گروه یا کاربر ویژه باشی!', parse_mode=None)
             return
         if decision == 'no':

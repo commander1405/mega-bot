@@ -4313,99 +4313,140 @@ class MegaBot:
 
 
     async def _fetch_user_avatars(self, user_ids: list[int], limit: int = 5) -> dict:
-        """Download real profile photos when Bale API allows; cache to disk.
+        """Load avatars for dashboard cards.
 
-        Flow per user:
-        1) disk cache hit
-        2) getUserProfilePhotos → getFile → download bytes
-        3) skip (caller draws letter/gradient avatar)
+        Priority:
+        1) disk cache
+        2) Bale/Telegram getUserProfilePhotos + getFile (when platform supports it)
+        3) free ui-avatars.com generated portrait (always works, no API key)
         """
         from io import BytesIO
         from pathlib import Path
         from PIL import Image
-        import hashlib
+        import urllib.parse
 
         cache_dir = Path('/tmp/mega_avatars')
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
-            cache_dir = Path('.')
+            cache_dir = Path('/tmp')
 
+        # names for generated avatars
+        name_map: dict[int, str] = {}
+        # caller may pass only ids; names filled later if present in stats — optional
         out: dict = {}
 
-        async def one(uid: int):
+        async def download_url(url: str, timeout: float = 10.0) -> bytes | None:
+            try:
+                session = await self.api._ensure_session()
+                import aiohttp
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout, connect=6)) as resp:
+                    if resp.status >= 400:
+                        return None
+                    data = await resp.read()
+                    return data if data and len(data) > 100 else None
+            except Exception:
+                return None
+
+        async def from_bale(uid: int) -> Image.Image | None:
+            try:
+                res = await asyncio.wait_for(
+                    self.api.call('getUserProfilePhotos', {'user_id': uid, 'limit': 1, 'offset': 0}, retries=0),
+                    timeout=5.0,
+                )
+            except Exception as exc:
+                log.debug('getUserProfilePhotos uid=%s %s', uid, type(exc).__name__)
+                return None
+            photos = None
+            if isinstance(res, dict):
+                photos = res.get('photos')
+                if photos is None and isinstance(res.get('result'), dict):
+                    photos = res['result'].get('photos')
+            if not photos:
+                return None
+            first = photos[0]
+            sizes = first if isinstance(first, list) else [first]
+            file_id = None
+            best_area = -1
+            for s in sizes:
+                if not isinstance(s, dict) or not s.get('file_id'):
+                    continue
+                area = int(s.get('width') or 0) * int(s.get('height') or 0)
+                if area >= best_area:
+                    best_area = area
+                    file_id = s['file_id']
+            if not file_id:
+                return None
+            try:
+                data, _ = await asyncio.wait_for(self.api.get_file_bytes(str(file_id), max_bytes=2_000_000), timeout=12.0)
+                return Image.open(BytesIO(data)).convert('RGBA')
+            except Exception as exc:
+                log.debug('profile file uid=%s %s', uid, type(exc).__name__)
+                return None
+
+        async def from_ui_avatars(uid: int, name: str) -> Image.Image | None:
+            """Free generated avatar — looks like a profile picture with initial."""
+            label = (name or str(uid) or 'U')[:20]
+            # color from uid for stability
+            colors = ['7c3aed', '06b6d4', 'ec4899', 'f59e0b', '10b981', '3b82f6', '8b5cf6']
+            bg = colors[abs(uid) % len(colors)]
+            q = urllib.parse.urlencode({
+                'name': label,
+                'background': bg,
+                'color': 'fff',
+                'size': '128',
+                'bold': 'true',
+                'format': 'png',
+                'length': '2',
+            })
+            url = f'https://ui-avatars.com/api/?{q}'
+            data = await download_url(url)
+            if not data:
+                # dicebear fallback
+                seed = urllib.parse.quote(label)
+                data = await download_url(f'https://api.dicebear.com/7.x/initials/png?seed={seed}&size=128')
+            if not data:
+                return None
+            try:
+                return Image.open(BytesIO(data)).convert('RGBA')
+            except Exception:
+                return None
+
+        async def one(uid: int, name: str = ''):
             uid = int(uid)
-            cache_path = cache_dir / f'{uid}.jpg'
-            # 1) disk cache
+            cache_path = cache_dir / f'{uid}.png'
             try:
                 if cache_path.is_file() and cache_path.stat().st_size > 200:
-                    img = Image.open(cache_path).convert('RGBA')
-                    out[uid] = img
+                    out[uid] = Image.open(cache_path).convert('RGBA')
                     return
             except Exception:
                 pass
 
-            file_id = None
-            # 2) Official Bot API method (Telegram-compatible; Bale may support)
-            try:
-                res = await asyncio.wait_for(
-                    self.api.call(
-                        'getUserProfilePhotos',
-                        {'user_id': uid, 'limit': 1, 'offset': 0},
-                        retries=0,
-                    ),
-                    timeout=6.0,
-                )
-                photos = None
-                if isinstance(res, dict):
-                    photos = res.get('photos')
-                    if photos is None and isinstance(res.get('result'), dict):
-                        photos = res['result'].get('photos')
-                if photos and isinstance(photos, list) and photos:
-                    first = photos[0]
-                    sizes = first if isinstance(first, list) else [first]
-                    # largest size last
-                    best = None
-                    best_area = -1
-                    for s in sizes:
-                        if not isinstance(s, dict):
-                            continue
-                        area = int(s.get('width') or 0) * int(s.get('height') or 0)
-                        fid = s.get('file_id')
-                        if fid and area >= best_area:
-                            best_area = area
-                            best = fid
-                    file_id = best or (sizes[-1].get('file_id') if sizes and isinstance(sizes[-1], dict) else None)
-            except Exception as exc:
-                log.debug('getUserProfilePhotos uid=%s: %s', uid, type(exc).__name__)
-
-            if not file_id:
+            img = await from_bale(uid)
+            source = 'bale'
+            if img is None:
+                img = await from_ui_avatars(uid, name or str(uid))
+                source = 'ui-avatars'
+            if img is None:
                 return
-
             try:
-                data, _name = await asyncio.wait_for(
-                    self.api.get_file_bytes(str(file_id), max_bytes=2_000_000),
-                    timeout=12.0,
-                )
-                img = Image.open(BytesIO(data)).convert('RGBA')
-                # normalize square-ish for circle crop later
-                try:
-                    img.save(cache_path, format='JPEG', quality=85)
-                except Exception:
-                    try:
-                        img.convert('RGB').save(cache_path, format='JPEG', quality=85)
-                    except Exception:
-                        pass
-                out[uid] = img
-                log.info('avatar cached uid=%s bytes=%s', uid, len(data))
-            except Exception as exc:
-                log.debug('avatar download uid=%s failed: %s', uid, type(exc).__name__)
+                img.save(cache_path, format='PNG')
+            except Exception:
+                pass
+            out[uid] = img
+            log.info('avatar uid=%s source=%s', uid, source)
 
-        ids = [int(u) for u in user_ids[:limit]]
-        if not ids:
-            return out
-        await asyncio.gather(*(one(u) for u in ids), return_exceptions=True)
+        # user_ids may be list[int] or we accept parallel names via optional second approach
+        tasks = []
+        for item in user_ids[:limit]:
+            if isinstance(item, dict):
+                tasks.append(one(int(item['user_id']), str(item.get('first_name') or item.get('username') or '')))
+            else:
+                tasks.append(one(int(item), name_map.get(int(item), '')))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         return out
+
 
     async def _cache_sender_avatar(self, user: dict) -> None:
         """Opportunistically cache profile photo when a user is active (rate-limited)."""
@@ -4465,9 +4506,9 @@ class MegaBot:
 
         avatars = {}
         try:
-            uids = [int(u['user_id']) for u in (stats.get('top_users') or []) if u.get('user_id')]
-            if uids:
-                avatars = await self._fetch_user_avatars(uids)
+            tops = [u for u in (stats.get('top_users') or []) if u.get('user_id')]
+            if tops:
+                avatars = await self._fetch_user_avatars(tops)
         except Exception:
             log.debug('avatar fetch skipped', exc_info=True)
 

@@ -298,7 +298,7 @@ def render_group_dashboard(
     place_media(media[:4], media_top + 48, 4)
     place_media(media[4:], media_top + 128, 3)
 
-    # Top users — horizontal cards like reference
+    # Top users — horizontal cards (reference-like spacing: avatar, then name BELOW)
     users_top = media_top + mh + 16
     draw.rounded_rectangle([margin, users_top, W - margin, H - 36], radius=18, fill=CARD, outline=(55, 50, 100), width=1)
     _t(draw, (W - margin - 18, users_top + 12), 'کاربران برتر در ۲۴ ساعت گذشته', f_sec, TEXT, 'rt')
@@ -310,43 +310,47 @@ def render_group_dashboard(
         _t(draw, (W // 2, users_top + 120), 'هنوز کاربر فعالی ثبت نشده است', f_body, MUTED, 'mm')
     else:
         cols = len(top_users)
-        gap_u = 10
+        gap_u = 12
         uw = (W - 2 * margin - 28 - gap_u * (cols - 1)) // cols
         accents = [NEON_ORANGE, NEON_CYAN, NEON_PINK, NEON_PURPLE, NEON_GREEN]
+        max_msg = max(int(u.get('msg_count') or 0) for u in top_users) or 1
         for i, u in enumerate(top_users):
-            # right-to-left: rank 1 on the right
+            # rank 1 on the right
             x2 = W - margin - 14 - i * (uw + gap_u)
             x1 = x2 - uw
-            y1 = users_top + 48
-            y2 = y1 + 200
+            y1 = users_top + 44
+            y2 = H - 52
             accent = accents[i % len(accents)]
-            draw.rounded_rectangle([x1, y1, x2, y2], radius=14, fill=CARD2, outline=accent, width=2)
+            draw.rounded_rectangle([x1, y1, x2, y2], radius=16, fill=CARD2, outline=accent, width=2)
 
             uid = int(u.get('user_id') or 0)
-            name = (u.get('first_name') or u.get('username') or f'کاربر')[:16]
+            name = (u.get('first_name') or u.get('username') or 'کاربر')[:14]
             cnt = int(u.get('msg_count') or 0)
             pct = (cnt / total_for_pct) * 100.0
 
-            # avatar
             cx = (x1 + x2) // 2
+            # Avatar higher; name clearly below with gap
+            av_cy = y1 + 44
+            av_r = 30
             photo = avatars.get(uid)
-            _circle_avatar(img, (cx, y1 + 52), 34, photo, name, accent)
+            _circle_avatar(img, (cx, av_cy), av_r, photo, name, accent)
             draw = ImageDraw.Draw(img)
 
-            # rank badge
-            bx, by = x2 - 18, y1 + 14
-            draw.ellipse([bx - 12, by - 12, bx + 12, by + 12], fill=accent)
+            # rank badge top-right of card
+            bx, by = x2 - 16, y1 + 16
+            draw.ellipse([bx - 11, by - 11, bx + 11, by + 11], fill=accent)
             _t(draw, (bx, by), fa_num(i + 1), f_tiny, TEXT, 'mm')
 
-            _t(draw, (cx, y1 + 90), name, f_body, TEXT, 'mm')
-            _t(draw, (cx, y1 + 118), f'تعداد پیام‌ها: {fa_num(cnt)}', f_tiny, MUTED, 'mm')
-            _t(draw, (cx, y1 + 140), f'فعالیت: {fa_num(round(pct, 1))}٪', f_tiny, MUTED, 'mm')
+            # Name starts well below avatar (avatar bottom ~ y1+74)
+            name_y = y1 + 88
+            _t(draw, (cx, name_y), name, f_body, TEXT, 'mm')
+            _t(draw, (cx, name_y + 26), f'تعداد پیام‌ها: {fa_num(cnt)}', f_tiny, MUTED, 'mm')
+            _t(draw, (cx, name_y + 48), f'فعالیت: {fa_num(round(pct, 1))}٪', f_tiny, MUTED, 'mm')
 
-            # activity bar
-            bar_x1, bar_x2 = x1 + 14, x2 - 14
-            bar_y = y1 + 168
+            bar_x1, bar_x2 = x1 + 12, x2 - 12
+            bar_y = y2 - 22
             draw.rounded_rectangle([bar_x1, bar_y, bar_x2, bar_y + 8], radius=4, fill=GRID)
-            fill = int((cnt / max(int(u.get('msg_count') or 0) for u in top_users)) * (bar_x2 - bar_x1))
+            fill = int((cnt / max_msg) * (bar_x2 - bar_x1))
             if fill > 2:
                 draw.rounded_rectangle([bar_x1, bar_y, bar_x1 + fill, bar_y + 8], radius=4, fill=accent)
 

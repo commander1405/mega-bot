@@ -27,21 +27,35 @@ _FA_DIGITS = str.maketrans('0123456789', '۰۱۲۳۴۵۶۷۸۹')
 
 
 def fa_num(n: int | float | str) -> str:
-    return str(n).translate(_FA_DIGITS)
+    if isinstance(n, (int, float)) and not isinstance(n, bool):
+        s = f'{int(n):,}'.replace(',', '٬')
+    else:
+        s = str(n)
+    return s.translate(_FA_DIGITS)
+
+
+def _font_path(bold: bool = False) -> str | None:
+    base = Path(__file__).resolve().parent / 'assets' / 'fonts'
+    name = 'Vazirmatn-Bold.ttf' if bold else 'Vazirmatn-Regular.ttf'
+    local = base / name
+    if local.is_file():
+        return str(local)
+    for path in (
+        '/usr/share/fonts/SlidesCarnival/google/Noto Sans Arabic/NotoSansArabic-VariableFont_wdth,wght.ttf',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf' if bold else '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    ):
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 def _find_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    candidates = [
-        '/usr/share/fonts/SlidesCarnival/google/Noto Sans Arabic/NotoSansArabic-VariableFont_wdth,wght.ttf',
-        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf' if bold else '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
-        '/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf',
-    ]
-    for path in candidates:
-        if path and os.path.isfile(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                continue
+    path = _font_path(bold)
+    if path:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            pass
     return ImageFont.load_default()
 
 
@@ -151,13 +165,13 @@ def render_group_dashboard(
 
     # KPI cards row
     cards = [
-        ('پیام‌ها', fa_num(total_msgs), NEON_PURPLE),
+        ('تعداد پیام‌ها', fa_num(total_msgs), NEON_PURPLE),
         ('کاربران فعال', fa_num(active), NEON_CYAN),
-        ('ورود', fa_num(joined), NEON_GREEN),
-        ('خروج', fa_num(left), NEON_PINK),
+        ('کاربران جدید', fa_num(joined), NEON_GREEN),
+        ('کاربران خارج‌شده', fa_num(left), NEON_PINK),
     ]
     if members_count is not None:
-        cards.append(('اعضا', fa_num(members_count), NEON_ORANGE))
+        cards.append(('تعداد اعضا', fa_num(members_count), NEON_ORANGE))
 
     card_w = (W - 48 - 12 * (len(cards) - 1)) // len(cards)
     y0 = 130
@@ -172,7 +186,7 @@ def render_group_dashboard(
     chart_top = 240
     chart_h = 220
     _rounded_rect(draw, (24, chart_top, W - 24, chart_top + chart_h + 50), 16, CARD, CARD_BORDER, 1)
-    _text(draw, (W - 40, chart_top + 12), 'تحلیل و تراکم پیام‌ها در شبانه‌روز', font_sec, TEXT, 'rt')
+    _text(draw, (W - 40, chart_top + 12), 'تحلیل تراکم پیام‌ها در شبانه‌روز', font_sec, TEXT, 'rt')
 
     hourly = list(stats.get('hourly') or [])
     # Build 24 slots
@@ -180,7 +194,7 @@ def render_group_dashboard(
     if hourly:
         for h in hourly:
             hr = int(h.get('hour') or 0) % 24
-            series[hr] = max(series[hr], int(h.get('count') or 0))
+            series[hr] += int(h.get('count') or 0)
     max_v = max(series) if any(series) else 1
     plot_x1, plot_y1 = 48, chart_top + 48
     plot_x2, plot_y2 = W - 48, chart_top + chart_h + 20
@@ -232,7 +246,7 @@ def render_group_dashboard(
         ('موزیک‌ها', int(counts.get('audio_count') or 0), NEON_GREEN),
         ('ویس‌ها', int(counts.get('voice_count') or 0), NEON_PURPLE),
         ('فایل‌ها', int(counts.get('document_count') or 0), MUTED),
-        ('متن', int(counts.get('text_count') or 0), NEON_CYAN),
+        ('پیام متنی', int(counts.get('text_count') or 0), NEON_CYAN),
     ]
     cols = 4
     for i, (lbl, val, color) in enumerate(media_items):
@@ -247,7 +261,7 @@ def render_group_dashboard(
     # Top users
     users_top = media_top + 220
     _rounded_rect(draw, (24, users_top, W - 24, H - 36), 16, CARD, CARD_BORDER, 1)
-    _text(draw, (W - 40, users_top + 12), 'کاربران برتر (۲۴ ساعت اخیر)', font_sec, TEXT, 'rt')
+    _text(draw, (W - 40, users_top + 12), 'کاربران برتر در ۲۴ ساعت گذشته', font_sec, TEXT, 'rt')
 
     top_users = list(stats.get('top_users') or [])[:5]
     if not top_users:

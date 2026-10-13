@@ -1,13 +1,10 @@
-"""TTS for MEGA BOT — free, fast, unlimited practical length.
+"""TTS for MEGA BOT — free, fast, no practical length limit.
 
-Priority (Persian):
-  1) Google Translate TTS (lang=fa) — familiar Google voice, free, no key
-  2) Piper fa_IR-amir-medium offline — if Google is blocked
+Persian: Piper neural «Amir» offline (fa_IR-amir-medium) — free, unlimited,
+no API key, works even when cloud TTS is blocked.
+English: Google Translate TTS.
 
-English: Google Translate TTS (en)
-
-Long text is chunked and merged with ffmpeg. No hard user-facing char cap
-beyond a safety ceiling to protect memory (default 100k).
+Long text is chunked and merged with ffmpeg. Soft safety ceiling 100k chars.
 """
 from __future__ import annotations
 
@@ -285,6 +282,7 @@ async def synthesize_piper_fa(text: str) -> bytes:
 # ── Public ──────────────────────────────────────────────────────────────
 
 async def synthesize_persian(text: str = DEFAULT_TEXT) -> tuple[bytes, str]:
+    """FA → Piper Amir offline (free/unlimited/fast). EN → Google TTS."""
     text = normalize_tts_text(text or DEFAULT_TEXT) or DEFAULT_TEXT
     lang = detect_lang(text)
     errors: list[str] = []
@@ -298,22 +296,23 @@ async def synthesize_persian(text: str = DEFAULT_TEXT) -> tuple[bytes, str]:
         except Exception as exc:
             raise RuntimeError(f'انگلیسی google:{type(exc).__name__}: {exc}') from exc
 
-    # Persian: Google first (famous + free + fast), Piper offline fallback
+    # Persian: offline Piper neural male (no network, no quota, long text OK)
+    try:
+        data = await synthesize_piper_fa(text)
+        log.info('TTS engine=piper-amir bytes=%s chars=%s', len(data), len(text))
+        return data, 'voice.ogg'
+    except Exception as exc:
+        errors.append(f'piper:{type(exc).__name__}')
+        log.warning('piper-fa failed: %s', exc)
+
+    # Last resort: Google (often blocked for fa on some hosts)
     try:
         data = await synthesize_google(text, 'fa')
         ext = 'ogg' if data[:4] == b'OggS' else 'mp3'
-        log.info('TTS engine=google-fa bytes=%s chunks~%s', len(data), max(1, len(text) // GOOGLE_CHUNK))
+        log.info('TTS engine=google-fa bytes=%s', len(data))
         return data, f'voice.{ext}'
     except Exception as exc:
         errors.append(f'google:{type(exc).__name__}')
         log.warning('google-fa failed: %s', exc)
-
-    try:
-        data = await synthesize_piper_fa(text)
-        log.info('TTS engine=piper-amir bytes=%s', len(data))
-        return data, 'voice.ogg'
-    except Exception as exc:
-        errors.append(f'piper:{type(exc).__name__}')
-        log.exception('piper-fa failed')
 
     raise RuntimeError(f'ساخت ویس ناموفق: {", ".join(errors)}')

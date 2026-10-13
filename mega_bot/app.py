@@ -4304,6 +4304,36 @@ class MegaBot:
             kb = inline([[('🎲 یکی دیگه', f'fun:again:{kind}'), ('⏭ رد کن', 'fun:skip')]])
         await self.safe_send(chat_id, body, kb, reply_to=msg.get('message_id'))
 
+
+    async def _fetch_user_avatars(self, user_ids: list[int], limit: int = 5) -> dict:
+        """Best-effort profile photos for dashboard. Empty dict if API unsupported."""
+        from io import BytesIO
+        from PIL import Image
+        out = {}
+        for uid in user_ids[:limit]:
+            try:
+                res = await asyncio.wait_for(
+                    self.api.call('getUserProfilePhotos', {'user_id': int(uid), 'limit': 1}, retries=0),
+                    timeout=4.0,
+                )
+                # Telegram-like: {total_count, photos: [[{file_id,...}]]}
+                photos = None
+                if isinstance(res, dict):
+                    photos = res.get('photos') or (res.get('result') or {}).get('photos')
+                if not photos:
+                    continue
+                sizes = photos[0] if isinstance(photos[0], list) else photos
+                if not sizes:
+                    continue
+                file_id = sizes[-1].get('file_id') or sizes[0].get('file_id')
+                if not file_id:
+                    continue
+                data, _name = await self.api.get_file_bytes(str(file_id), max_bytes=2_000_000)
+                out[int(uid)] = Image.open(BytesIO(data)).convert('RGBA')
+            except Exception:
+                continue
+        return out
+
     async def _send_group_stats(self, chat_id: int, chat: dict) -> None:
         """Professional image dashboard for the group (replaces text-only stats)."""
         title = chat.get('title') or 'گروه'
@@ -4341,12 +4371,21 @@ class MegaBot:
         except Exception:
             pass
 
+        avatars = {}
+        try:
+            uids = [int(u['user_id']) for u in (stats.get('top_users') or []) if u.get('user_id')]
+            if uids:
+                avatars = await self._fetch_user_avatars(uids)
+        except Exception:
+            log.debug('avatar fetch skipped', exc_info=True)
+
         try:
             png = await asyncio.to_thread(
                 dash.render_group_dashboard,
                 title=title,
                 stats=stats,
                 members_count=members_count if isinstance(members_count, int) else None,
+                avatars=avatars or None,
             )
             await self.api.send_photo_bytes(
                 chat_id,

@@ -33,147 +33,6 @@ W, H = 1280, 1140
 _FA = str.maketrans('0123456789', '۰۱۲۳۴۵۶۷۸۹')
 _FONT_DIR = Path(__file__).resolve().parent / 'assets' / 'fonts'
 
-# Fallback stack for fancy Unicode names (math bold, fullwidth, symbols, emoji)
-_NAME_FONT_FILES = (
-    'Vazirmatn-Bold.ttf',
-    'Vazirmatn-Regular.ttf',
-    'NotoSans-Bold.ttf',
-    'NotoSans-Regular.ttf',
-    'NotoSansMath-Regular.ttf',
-    'NotoSansSymbols2-Regular.ttf',
-    'DejaVuSans-Bold.ttf',
-    'DejaVuSans.ttf',
-    'NotoColorEmoji.ttf',
-)
-
-_font_cache: dict[tuple[str, int], object] = {}
-
-
-def _load_font_file(name: str, size: int):
-    key = (name, size)
-    if key in _font_cache:
-        return _font_cache[key]
-    path = _FONT_DIR / name
-    if not path.is_file():
-        # system fallbacks
-        sys_map = {
-            'NotoColorEmoji.ttf': '/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf',
-            'DejaVuSans.ttf': '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
-            'DejaVuSans-Bold.ttf': '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
-        }
-        alt = sys_map.get(name)
-        path = Path(alt) if alt and Path(alt).is_file() else None
-    if not path or not Path(path).is_file():
-        _font_cache[key] = None
-        return None
-    try:
-        # NotoColorEmoji is CBDT; Pillow often requires size 109
-        sz = 109 if 'Emoji' in name else size
-        font = ImageFont.truetype(str(path), sz)
-        _font_cache[key] = font
-        return font
-    except Exception:
-        _font_cache[key] = None
-        return None
-
-
-def _glyph_ok(font, ch: str) -> bool:
-    if font is None or not ch:
-        return False
-    try:
-        if hasattr(font, 'getbbox'):
-            b = font.getbbox(ch)
-            return bool(b and (b[2] - b[0]) > 0 and (b[3] - b[1]) > 0)
-        m = font.getmask(ch)
-        return m.size[0] > 0 and m.size[1] > 0
-    except Exception:
-        return False
-
-
-def _font_for_char(ch: str, size: int, bold: bool = True):
-    """Pick first font in stack that has a real glyph for this character."""
-    # Prefer Vazirmatn for Arabic/Persian
-    o = ord(ch)
-    order = list(_NAME_FONT_FILES)
-    if 0x0600 <= o <= 0x06FF or 0xFB50 <= o <= 0xFDFF or 0xFE70 <= o <= 0xFEFF:
-        order = ['Vazirmatn-Bold.ttf' if bold else 'Vazirmatn-Regular.ttf'] + [f for f in order if 'Vazir' not in f]
-    elif 'Emoji' in '' or (o >= 0x1F300) or (0x2600 <= o <= 0x27BF) or (0x1F000 <= o <= 0x1FAFF):
-        order = ['NotoColorEmoji.ttf'] + [f for f in order if f != 'NotoColorEmoji.ttf']
-    elif 0x1D400 <= o <= 0x1D7FF:  # mathematical alphanumeric
-        order = ['NotoSansMath-Regular.ttf', 'NotoSans-Bold.ttf', 'DejaVuSans.ttf'] + order
-    for name in order:
-        font = _load_font_file(name, size)
-        if _glyph_ok(font, ch):
-            return font
-    # last resort
-    return _font(size, bold)
-
-
-def _measure_mixed(text: str, size: int, bold: bool = True) -> int:
-    """Width in pixels of mixed-script text."""
-    if not text:
-        return 0
-    w = 0
-    for ch in text:
-        font = _font_for_char(ch, size, bold)
-        try:
-            if hasattr(font, 'getlength'):
-                w += int(font.getlength(ch))
-            elif hasattr(font, 'getbbox'):
-                b = font.getbbox(ch)
-                w += (b[2] - b[0]) if b else size // 2
-            else:
-                w += size // 2
-        except Exception:
-            w += size // 2
-    return w
-
-
-def _draw_mixed(draw, xy, text: str, size: int, fill=TEXT, anchor='mm', bold: bool = True, max_width: int | None = None):
-    """Draw username with per-character font fallback (emoji, math bold, symbols, Persian)."""
-    if not text:
-        return
-    # Soft truncate by pixel width
-    s = str(text)
-    if max_width:
-        while len(s) > 1 and _measure_mixed(s, size, bold) > max_width:
-            s = s[:-1]
-        if s != str(text) and len(s) > 0:
-            s = s[:-1] + '…' if len(s) > 1 else s
-
-    total_w = _measure_mixed(s, size, bold)
-    x, y = xy
-    # anchor horizontal
-    if anchor in ('mm', 'mt', 'mb'):
-        x = x - total_w // 2
-    elif anchor in ('rt', 'rm', 'rb'):
-        x = x - total_w
-    # vertical: use middle of line roughly
-    cy = y
-    cursor = x
-    for ch in s:
-        # shape Arabic letters individually only if Arabic
-        o = ord(ch)
-        draw_ch = ch
-        if 0x0600 <= o <= 0x06FF:
-            try:
-                import arabic_reshaper
-                draw_ch = arabic_reshaper.reshape(ch)
-            except Exception:
-                draw_ch = ch
-        font = _font_for_char(ch, size, bold)
-        try:
-            # For emoji CBDT fonts size may differ; still draw at baseline
-            draw.text((cursor, cy), draw_ch, font=font, fill=fill, anchor='lm')
-            if hasattr(font, 'getlength'):
-                cursor += int(font.getlength(draw_ch))
-            else:
-                b = font.getbbox(draw_ch) if hasattr(font, 'getbbox') else None
-                cursor += (b[2] - b[0]) if b else size // 2
-        except Exception:
-            cursor += size // 2
-
-
 
 def fa_num(n: int | float | str) -> str:
     if isinstance(n, float):
@@ -249,6 +108,162 @@ def _jalali(dt: datetime | None = None) -> str:
     return f'{weekdays[dt.weekday()]} {fa_num(jy)}/{fa_num(jm):0>2}/{fa_num(jd):0>2}'
 
 
+
+# ── Unicode name rendering (cmap-accurate multi-font fallback) ──────────
+_NAME_FONT_FILES = (
+    'Vazirmatn-Bold.ttf', 'Vazirmatn-Regular.ttf',
+    'NotoSansMath-Regular.ttf',
+    'NotoSansEgyptianHieroglyphs-Regular.ttf',
+    'NotoSansThai-Regular.ttf',
+    'NotoSansSymbols2-Regular.ttf', 'NotoSansSymbols-Regular.ttf',
+    'NotoSans-Bold.ttf', 'NotoSans-Regular.ttf',
+    'DejaVuSans-Bold.ttf', 'DejaVuSans.ttf',
+    'NotoColorEmoji.ttf',
+    'unifont.otf',
+    'unifont_upper.otf',
+)
+_SYSTEM_FONTS = (
+    str(_FONT_DIR / 'unifont.otf'),
+    str(_FONT_DIR / 'unifont_upper.otf'),
+    '/usr/share/fonts/truetype/unifont/unifont.ttf',
+    '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+    '/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc',
+    '/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf',
+    '/usr/share/fonts/truetype/symbola/Symbola.ttf',
+    '/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+)
+_font_obj_cache: dict = {}
+_cmap_cache: dict = {}
+
+
+def _cmap_for(path: str) -> set:
+    if path in _cmap_cache:
+        return _cmap_cache[path]
+    codes: set = set()
+    try:
+        from fontTools.ttLib import TTFont
+        tt = TTFont(path, fontNumber=0)
+        codes = set((tt.getBestCmap() or {}).keys())
+        tt.close()
+    except Exception:
+        pass
+    _cmap_cache[path] = codes
+    return codes
+
+
+def _resolve_font_path(name: str) -> str | None:
+    local = _FONT_DIR / name
+    if local.is_file():
+        return str(local)
+    for alt in (f'/usr/share/fonts/truetype/noto/{name}', f'/usr/share/fonts/truetype/dejavu/{name}'):
+        if Path(alt).is_file():
+            return alt
+    return None
+
+
+def _load_sized(path: str, size: int):
+    key = (path, size)
+    if key in _font_obj_cache:
+        return _font_obj_cache[key]
+    try:
+        sz = 109 if 'moji' in path.lower() else size
+        font = ImageFont.truetype(path, sz)
+        _font_obj_cache[key] = font
+        return font
+    except Exception:
+        _font_obj_cache[key] = None
+        return None
+
+
+def _font_for_char(ch: str, size: int, bold: bool = True):
+    o = ord(ch)
+    preferred = []
+    if 0x0600 <= o <= 0x06FF or 0xFB50 <= o <= 0xFDFF:
+        preferred += ['Vazirmatn-Bold.ttf', 'Vazirmatn-Regular.ttf']
+    if 0x1D400 <= o <= 0x1D7FF:
+        preferred += ['NotoSansMath-Regular.ttf']
+    if 0x13000 <= o <= 0x1342F:
+        preferred += ['NotoSansEgyptianHieroglyphs-Regular.ttf']
+    if 0x0E00 <= o <= 0x0E7F:
+        preferred += ['NotoSansThai-Regular.ttf']
+    if 0x1F300 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF:
+        preferred += ['NotoColorEmoji.ttf']
+    preferred += list(_NAME_FONT_FILES)
+    seen = set()
+    for name in preferred:
+        if name in seen:
+            continue
+        seen.add(name)
+        path = _resolve_font_path(name)
+        if not path or o not in _cmap_for(path):
+            continue
+        font = _load_sized(path, size)
+        if font is not None:
+            return font
+    for path in _SYSTEM_FONTS:
+        if not Path(path).is_file() or o not in _cmap_for(path):
+            continue
+        font = _load_sized(path, size)
+        if font is not None:
+            return font
+    return _font(size, bold)
+
+
+def _measure_mixed(text: str, size: int, bold: bool = True) -> int:
+    if not text:
+        return 0
+    w = 0
+    for ch in text:
+        font = _font_for_char(ch, size, bold)
+        try:
+            if hasattr(font, 'getlength'):
+                w += max(1, int(font.getlength(ch)))
+            else:
+                b = font.getbbox(ch) if hasattr(font, 'getbbox') else None
+                w += max(1, (b[2] - b[0]) if b else size // 2)
+        except Exception:
+            w += size // 2
+    return w
+
+
+def _draw_mixed(draw, xy, text: str, size: int, fill=TEXT, anchor='mm', bold: bool = True, max_width: int | None = None):
+    if not text:
+        return
+    s = str(text)
+    if max_width:
+        while len(s) > 1 and _measure_mixed(s, size, bold) > max_width:
+            s = s[:-1]
+        if len(s) < len(str(text)) and len(s) > 1:
+            s = s[:-1] + '…'
+    total_w = _measure_mixed(s, size, bold)
+    x, y = xy
+    if anchor in ('mm', 'mt', 'mb'):
+        x -= total_w // 2
+    elif anchor in ('rt', 'rm', 'rb'):
+        x -= total_w
+    cursor = float(x)
+    for ch in s:
+        o = ord(ch)
+        draw_ch = ch
+        if 0x0600 <= o <= 0x06FF:
+            try:
+                import arabic_reshaper
+                draw_ch = arabic_reshaper.reshape(ch)
+            except Exception:
+                pass
+        font = _font_for_char(ch, size, bold)
+        try:
+            draw.text((cursor, y), draw_ch, font=font, fill=fill, anchor='lm')
+            if hasattr(font, 'getlength'):
+                cursor += float(font.getlength(draw_ch))
+            else:
+                b = font.getbbox(draw_ch) if hasattr(font, 'getbbox') else None
+                cursor += float((b[2] - b[0]) if b else size // 2)
+        except Exception:
+            cursor += size / 2
+
+
 def _panel(draw, xy, radius=18, fill=CARD, outline=BORDER, width=1):
     draw.rounded_rectangle(xy, radius=radius, fill=fill, outline=outline, width=width)
 
@@ -316,7 +331,7 @@ def render_group_dashboard(
     f_sec = _font(22, True)
     f_body = _font(18, True)
     f_name = _font(20, True)
-    f_msg = _font(17, True)
+    f_msg = _font(20, True)
     f_small = _font(14, True)
     f_tiny = _font(13, True)
     f_axis = _font(13, True)
@@ -483,7 +498,7 @@ def render_group_dashboard(
             _panel(draw, [x1, y1, x2, y2], radius=16, fill=CARD_INNER, outline=accent, width=2)
 
             uid = int(u.get('user_id') or 0)
-            name = (u.get('first_name') or u.get('username') or 'کاربر')[:40]
+            name = (u.get('first_name') or u.get('username') or 'کاربر')[:48]
             cnt = int(u.get('msg_count') or 0)
             pct = (cnt / total_for_pct) * 100.0
             cx = (x1 + x2) // 2
@@ -502,8 +517,8 @@ def render_group_dashboard(
             ny = y1 + 92
             # Name: mixed Unicode (emoji, fancy fonts, Persian) — large bold white
             card_inner_w = x2 - x1 - 16
-            _draw_mixed(draw, (cx, ny), name, size=20, fill=(255, 255, 255), anchor='mm', bold=True, max_width=card_inner_w)
-            _t(draw, (cx, ny + 28), f'تعداد پیام‌ها: {fa_num(cnt)}', f_msg, (255, 255, 255), 'mm')
+            _draw_mixed(draw, (cx, ny), name, size=22, fill=(255, 255, 255), anchor='mm', bold=True, max_width=card_inner_w)
+            _t(draw, (cx, ny + 30), f'تعداد پیام‌ها: {fa_num(cnt)}', f_msg, (255, 255, 255), 'mm')
             _t(draw, (cx, ny + 50), f'فعالیت: {fa_num(round(pct, 1))}٪', f_tiny, MUTED, 'mm')
 
             # progress bar

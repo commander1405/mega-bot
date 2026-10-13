@@ -1,7 +1,10 @@
-"""Persian text-to-speech (free, offline, no API key, no rate limit).
+"""Natural free TTS via Microsoft Edge online voices (edge-tts).
 
-Engine: espeak-ng (fa) → ffmpeg OGG Opus.
-Supports arbitrary-length text (up to several minutes of speech).
+No API key. Neural voices (much less robotic than espeak).
+- Persian: fa-IR-DilaraNeural (default) / fa-IR-FaridNeural
+- English: en-US-JennyNeural (default)
+
+Falls back to espeak-ng only if edge-tts is completely unavailable.
 """
 from __future__ import annotations
 
@@ -18,9 +21,13 @@ log = logging.getLogger(__name__)
 
 DEFAULT_TEXT = 'تست'
 MAX_CHARS = int(os.getenv('TTS_MAX_CHARS', '6000'))
-ESPEAK_SPEED = int(os.getenv('TTS_ESPEAK_SPEED', '130'))
-ESPEAK_PITCH = int(os.getenv('TTS_ESPEAK_PITCH', '45'))
-CHUNK_CHARS = 800
+CHUNK_CHARS = int(os.getenv('TTS_CHUNK_CHARS', '900'))
+
+# Famous natural voices (Microsoft neural — same family many free TTS sites use)
+VOICE_FA = os.getenv('TTS_VOICE_FA', 'fa-IR-DilaraNeural')
+VOICE_FA_MALE = os.getenv('TTS_VOICE_FA_MALE', 'fa-IR-FaridNeural')
+VOICE_EN = os.getenv('TTS_VOICE_EN', 'en-US-JennyNeural')
+VOICE_EN_MALE = os.getenv('TTS_VOICE_EN_MALE', 'en-US-GuyNeural')
 
 
 def _which(cmd: str) -> Optional[str]:
@@ -35,23 +42,21 @@ def normalize_tts_text(text: str) -> str:
     return t.strip()
 
 
-def _wav_to_ogg_opus(wav_path: str, ogg_path: str, timeout: int = 180) -> None:
-    ffmpeg = _which('ffmpeg')
-    if not ffmpeg:
-        raise RuntimeError('ffmpeg not found')
-    r = subprocess.run(
-        [
-            ffmpeg, '-y', '-i', wav_path,
-            '-c:a', 'libopus', '-b:a', '24k', '-vbr', 'on',
-            '-application', 'voip',
-            ogg_path,
-        ],
-        capture_output=True,
-        timeout=timeout,
-    )
-    if r.returncode != 0 or not os.path.isfile(ogg_path) or os.path.getsize(ogg_path) < 50:
-        err = (r.stderr or b'').decode('utf-8', errors='replace')[-400:]
-        raise RuntimeError(f'ffmpeg opus failed: {err}')
+def detect_lang(text: str) -> str:
+    """Simple fa vs en detection for voice selection."""
+    latin = len(re.findall(r'[A-Za-z]', text or ''))
+    arabic = len(re.findall(r'[\u0600-\u06FF]', text or ''))
+    if latin > arabic * 1.2 and latin >= 3:
+        return 'en'
+    return 'fa'
+
+
+def pick_voice(text: str) -> str:
+    lang = detect_lang(text)
+    gender = (os.getenv('TTS_GENDER') or 'female').strip().lower()
+    if lang == 'en':
+        return VOICE_EN_MALE if gender in ('male', 'm', 'مرد') else VOICE_EN
+    return VOICE_FA_MALE if gender in ('male', 'm', 'مرد') else VOICE_FA
 
 
 def _chunk_text(text: str, size: int = CHUNK_CHARS) -> list[str]:
@@ -79,36 +84,34 @@ def _chunk_text(text: str, size: int = CHUNK_CHARS) -> list[str]:
     return chunks or [text[:size]]
 
 
-def _espeak_to_wav(espeak: str, text: str, wav_path: str, timeout: int = 120) -> None:
-    cmd = [
-        espeak,
-        '-v', 'fa',
-        '-s', str(ESPEAK_SPEED),
-        '-p', str(ESPEAK_PITCH),
-        '-w', wav_path,
-        '--stdin',
-    ]
+def _ffmpeg_to_ogg(src: str, ogg: str, timeout: int = 180) -> None:
+    ffmpeg = _which('ffmpeg')
+    if not ffmpeg:
+        raise RuntimeError('ffmpeg not found')
     r = subprocess.run(
-        cmd,
-        input=text.encode('utf-8'),
+        [
+            ffmpeg, '-y', '-i', src,
+            '-c:a', 'libopus', '-b:a', '32k', '-vbr', 'on',
+            '-application', 'voip', ogg,
+        ],
         capture_output=True,
         timeout=timeout,
     )
-    if r.returncode != 0 or not os.path.isfile(wav_path) or os.path.getsize(wav_path) < 44:
-        err = (r.stderr or b'').decode('utf-8', errors='replace')[-300:]
-        raise RuntimeError(f'espeak failed: {err or r.returncode}')
+    if r.returncode != 0 or not os.path.isfile(ogg) or os.path.getsize(ogg) < 50:
+        err = (r.stderr or b'').decode('utf-8', errors='replace')[-400:]
+        raise RuntimeError(f'ffmpeg failed: {err}')
 
 
-def _concat_wavs(wav_paths: list[str], out_path: str) -> None:
-    if len(wav_paths) == 1:
-        shutil.copyfile(wav_paths[0], out_path)
+def _concat_media(paths: list[str], out_path: str) -> None:
+    if len(paths) == 1:
+        shutil.copyfile(paths[0], out_path)
         return
     ffmpeg = _which('ffmpeg')
     if not ffmpeg:
         raise RuntimeError('ffmpeg not found')
     list_path = out_path + '.txt'
     with open(list_path, 'w', encoding='utf-8') as f:
-        for w in wav_paths:
+        for w in paths:
             safe = w.replace("'", "'\\''")
             f.write(f"file '{safe}'\n")
     r = subprocess.run(
@@ -118,54 +121,126 @@ def _concat_wavs(wav_paths: list[str], out_path: str) -> None:
     )
     if r.returncode != 0 or not os.path.isfile(out_path):
         r2 = subprocess.run(
-            [ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', list_path, '-c:a', 'pcm_s16le', out_path],
+            [ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', list_path, '-c:a', 'libmp3lame', '-q:a', '4', out_path],
             capture_output=True,
             timeout=180,
         )
         if r2.returncode != 0 or not os.path.isfile(out_path):
             err = (r2.stderr or r.stderr or b'').decode('utf-8', errors='replace')[-400:]
-            raise RuntimeError(f'wav concat failed: {err}')
+            raise RuntimeError(f'concat failed: {err}')
+
+
+async def _edge_chunk_to_mp3(text: str, voice: str, mp3_path: str) -> None:
+    import edge_tts
+    communicate = edge_tts.Communicate(text, voice)
+    await communicate.save(mp3_path)
+    if not os.path.isfile(mp3_path) or os.path.getsize(mp3_path) < 50:
+        raise RuntimeError('edge-tts empty output')
+
+
+async def synthesize_edge(text: str, voice: str | None = None) -> bytes:
+    """Natural neural TTS (Microsoft Edge voices) — free, no API key."""
+    try:
+        import edge_tts  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError('edge-tts not installed') from exc
+
+    text = normalize_tts_text(text or DEFAULT_TEXT) or DEFAULT_TEXT
+    if len(text) > MAX_CHARS:
+        text = text[:MAX_CHARS]
+    voice = voice or pick_voice(text)
+    chunks = _chunk_text(text, CHUNK_CHARS)
+
+    with tempfile.TemporaryDirectory(prefix='mega-edge-') as td:
+        parts: list[str] = []
+        for i, chunk in enumerate(chunks):
+            part = os.path.join(td, f'p{i:03d}.mp3')
+            try:
+                await asyncio.wait_for(_edge_chunk_to_mp3(chunk, voice, part), timeout=45)
+            except Exception:
+                # brief retry once (transient network)
+                await asyncio.sleep(0.4)
+                await asyncio.wait_for(_edge_chunk_to_mp3(chunk, voice, part), timeout=45)
+            parts.append(part)
+            # gentle pacing to reduce throttling on long jobs
+            if i + 1 < len(chunks):
+                await asyncio.sleep(0.15)
+
+        merged = os.path.join(td, 'merged.mp3')
+        _concat_media(parts, merged)
+
+        ogg = os.path.join(td, 'out.ogg')
+        try:
+            _ffmpeg_to_ogg(merged, ogg)
+            with open(ogg, 'rb') as f:
+                data = f.read()
+            if len(data) >= 50:
+                return data
+        except Exception as exc:
+            log.info('ogg convert failed, using mp3: %s', type(exc).__name__)
+        with open(merged, 'rb') as f:
+            return f.read()
 
 
 def synthesize_espeak(text: str = DEFAULT_TEXT) -> bytes:
+    """Emergency offline fallback (robotic)."""
     espeak = _which('espeak-ng') or _which('espeak')
     if not espeak:
         raise RuntimeError('espeak-ng not installed')
     text = normalize_tts_text(text or DEFAULT_TEXT) or DEFAULT_TEXT
     if len(text) > MAX_CHARS:
         text = text[:MAX_CHARS]
-
-    chunks = _chunk_text(text, CHUNK_CHARS)
-    per_chunk_timeout = max(60, min(300, 30 + len(text) // 20))
-
-    with tempfile.TemporaryDirectory(prefix='mega-tts-') as td:
-        wav_parts: list[str] = []
-        for i, chunk in enumerate(chunks):
-            part = os.path.join(td, f'part_{i:03d}.wav')
-            _espeak_to_wav(espeak, chunk, part, timeout=per_chunk_timeout)
-            wav_parts.append(part)
-
-        merged = os.path.join(td, 'merged.wav')
-        _concat_wavs(wav_parts, merged)
-
+    with tempfile.TemporaryDirectory(prefix='mega-espeak-') as td:
+        wav = os.path.join(td, 'out.wav')
         ogg = os.path.join(td, 'out.ogg')
-        ogg_timeout = max(60, min(300, 30 + len(text) // 15))
-        _wav_to_ogg_opus(merged, ogg, timeout=ogg_timeout)
-
+        r = subprocess.run(
+            [espeak, '-v', 'fa' if detect_lang(text) == 'fa' else 'en', '-s', '130', '-w', wav, '--stdin'],
+            input=text.encode('utf-8'),
+            capture_output=True,
+            timeout=max(60, min(300, 30 + len(text) // 20)),
+        )
+        if r.returncode != 0 or not os.path.isfile(wav):
+            raise RuntimeError('espeak failed')
+        _ffmpeg_to_ogg(wav, ogg)
         with open(ogg, 'rb') as f:
-            data = f.read()
-
-    if len(data) < 50:
-        raise RuntimeError('TTS produced empty audio')
-    return data
+            return f.read()
 
 
 async def synthesize_persian(text: str = DEFAULT_TEXT) -> tuple[bytes, str]:
-    """Return (ogg_bytes, filename). Free offline espeak-ng — no key, no quota."""
-    data = await asyncio.to_thread(synthesize_espeak, text)
-    return data, 'voice.ogg'
+    """Primary: edge neural voice. Fallback: espeak.
+
+    Env:
+      TTS_ENGINE=edge|espeak|auto (default edge)
+      TTS_VOICE_FA / TTS_VOICE_EN / TTS_GENDER=female|male
+    """
+    engine = (os.getenv('TTS_ENGINE') or 'edge').strip().lower()
+    text = normalize_tts_text(text or DEFAULT_TEXT) or DEFAULT_TEXT
+    voice = pick_voice(text)
+    errors: list[str] = []
+
+    if engine in ('edge', 'auto', ''):
+        try:
+            data = await synthesize_edge(text, voice=voice)
+            ext = 'ogg' if data[:4] == b'OggS' else 'mp3'
+            return data, f'voice.{ext}'
+        except Exception as exc:
+            errors.append(f'edge:{type(exc).__name__}:{exc}')
+            log.warning('edge-tts failed: %s', type(exc).__name__)
+            if engine == 'edge':
+                # still try espeak rather than hard-fail if available
+                pass
+
+    if engine in ('espeak', 'auto', 'edge', ''):
+        try:
+            data = await asyncio.to_thread(synthesize_espeak, text)
+            return data, 'voice.ogg'
+        except Exception as exc:
+            errors.append(f'espeak:{type(exc).__name__}')
+
+    raise RuntimeError('TTS failed: ' + '; '.join(errors) if errors else 'no engine')
 
 
 def estimate_duration_sec(text: str) -> int:
     n = len(normalize_tts_text(text) or '')
-    return max(1, int(n / 2.2) + 1)
+    # neural speech ~14–16 chars/sec mixed heuristic
+    return max(1, int(n / 14) + 1)

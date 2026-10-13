@@ -2721,7 +2721,7 @@ class MegaBot:
             return
         if len(body) > tts_mod.MAX_CHARS:
             body = body[: tts_mod.MAX_CHARS]
-            note = f' (متن تا {tts_mod.MAX_CHARS} کاراکتر کوتاه شد)'
+            note = f' (متن خیلی بلند بود؛ تا {tts_mod.MAX_CHARS} کاراکتر پردازش شد)'
         else:
             note = ''
 

@@ -429,6 +429,8 @@ class MegaBot:
             await self.on_callback(update['callback_query'])
         elif 'my_chat_member' in update:
             await self.on_my_chat_member(update['my_chat_member'])
+        elif 'chat_member' in update:
+            await self.on_chat_member(update['chat_member'])
         elif kinds:
             log.info('UPDATE id=%s ignored kinds=%s', uid, kinds)
 
@@ -1596,8 +1598,82 @@ class MegaBot:
         return False
 
 
+
+    async def _send_bot_join_intro(self, chat_id: int) -> None:
+        """Permanent intro when the bot is added to a group (add or invite link)."""
+        if not chat_id or self._is_private_chat_id(chat_id):
+            return
+        # Dedup within 2 minutes (my_chat_member + new_chat_members may both fire)
+        key = f'botjoin:{chat_id}'
+        now = time.time()
+        if not hasattr(self, '_bot_join_sent'):
+            self._bot_join_sent = {}
+        last = self._bot_join_sent.get(chat_id, 0)
+        if now - last < 120:
+            return
+        self._bot_join_sent[chat_id] = now
+        intro = (
+            'سلام! 👋\n'
+            'مرسی که منو به *گروهت* دعوت کردی تا بتونم کمکت کنم گروه رو مدیریت و شاداب نگه دارم.\n\n'
+            'لطفاً *اول از همه من رو ادمین کن* و این دسترسی‌ها رو بده:\n'
+            '• حذف پیام‌ها\n'
+            '• محدود کردن اعضا (سکوت / اخراج)\n'
+            '• پین پیام (اختیاری)\n\n'
+            'بعد از ادمین شدن می‌تونی از دستورات `قفل`، `خوشامد`، `آمار`، `پاک` و بقیه امکانات استفاده کنی.\n\n'
+            '📚 دستورات کامل من رو داخل *پیوی*، از منوی بیشتر ← راهنمای ربات ببین.'
+        )
+        try:
+            kb = inline([[url_button('💬 رفتن به پیوی ربات', 'https://ble.ir/megabalebot')]])
+            await self.safe_send(chat_id, intro, keyboard=kb, permanent=True)
+        except Exception:
+            log.exception('bot-join intro failed chat=%s', chat_id)
+
+
+    async def on_chat_member(self, event: dict) -> None:
+        """Other members' status changes (add / join / leave) when Bale sends chat_member."""
+        try:
+            chat = event.get('chat') or {}
+            chat_id = int(chat.get('id', 0) or 0)
+            if not chat_id or self._is_private_chat_id(chat_id):
+                return
+            new = event.get('new_chat_member') or {}
+            old = event.get('old_chat_member') or {}
+            if not isinstance(new, dict):
+                return
+            user = new.get('user') or new
+            if not isinstance(user, dict):
+                return
+            status = (new.get('status') or '').lower()
+            old_status = ((old.get('status') if isinstance(old, dict) else '') or '').lower()
+            uid = int(user.get('id') or 0)
+            if not uid:
+                return
+            # Bot self handled by my_chat_member
+            if self.bot_id and uid == self.bot_id:
+                if status in ('member', 'administrator', 'restricted') and old_status in ('', 'left', 'kicked', 'none'):
+                    await self._send_bot_join_intro(chat_id)
+                return
+            if user.get('is_bot'):
+                return
+            # User joined / was added
+            joined = status in ('member', 'restricted') and old_status in (
+                '', 'left', 'kicked', 'none',
+            )
+            left = status in ('left', 'kicked') and old_status in (
+                'member', 'administrator', 'restricted', 'creator',
+            )
+            if joined:
+                fake_msg = {'new_chat_members': [user], 'chat': chat}
+                await self.welcome_new_members(fake_msg, chat)
+            elif left:
+                fake_msg = {'left_chat_member': user, 'chat': chat}
+                await self.goodbye_left_member(fake_msg, chat)
+        except Exception:
+            log.exception('on_chat_member failed')
+
+
     async def on_my_chat_member(self, event: dict) -> None:
-        """Promote/demote: log only. Never sendMessage from this handler."""
+        """Bot membership changes: join intro + status cache."""
         try:
             chat = event.get('chat') or {}
             chat_id = int(chat.get('id', 0) or 0)
@@ -1606,40 +1682,21 @@ class MegaBot:
                 new = {}
             status = (new.get('status') or '').lower()
             old = event.get('old_chat_member') or {}
-            old_status = (old.get('status') if isinstance(old, dict) else '') or ''
+            old_status = ((old.get('status') if isinstance(old, dict) else '') or '').lower()
             log.info(
                 'my_chat_member chat=%s old=%s new=%s title=%r',
                 chat_id, old_status, status, chat.get('title'),
             )
-
-                        # Bot was added to a group → permanent intro (never auto-delete)
-            old_status_l = (old_status or '').lower()
-            joined = status in ('member', 'administrator', 'restricted') and old_status_l in (
+            # Bot added to group (invite link OR admin add)
+            joined = status in ('member', 'administrator', 'restricted') and old_status in (
                 '', 'left', 'kicked', 'none',
             )
-            if joined and chat_id and not self._is_private_chat_id(chat_id):
-                intro = (
-                    'سلام! 👋\n'
-                    'مرسی که منو به *گروهت* دعوت کردی تا بتونم کمکت کنم گروه رو مدیریت و شاداب نگه دارم.\n\n'
-                    'لطفاً *اول از همه من رو ادمین کن* و این دسترسی‌ها رو بده:\n'
-                    '• حذف پیام‌ها\n'
-                    '• محدود کردن اعضا (سکوت / اخراج)\n'
-                    '• پین پیام (اختیاری)\n\n'
-                    'بعد از ادمین شدن می‌تونی از دستورات `قفل`، `خوشامد`، `آمار`، `پاک` و بقیه امکانات استفاده کنی.\n\n'
-                    '📚 دستورات کامل من رو داخل *پیوی*، از منوی بیشتر ← راهنمای ربات ببین.'
-                )
-                try:
-                    kb = inline([[url_button('💬 رفتن به پیوی ربات', 'https://ble.ir/megabalebot')]])
-                    await self.safe_send(chat_id, intro, keyboard=kb, permanent=True)
-                except Exception:
-                    log.exception('bot-join intro failed chat=%s', chat_id)
-
-# Diagnostic map: does NOT gate message processing.
+            if joined and chat_id:
+                await self._send_bot_join_intro(chat_id)
             if not hasattr(self, '_bot_member_status'):
                 self._bot_member_status = {}
             if chat_id:
                 self._bot_member_status[chat_id] = status
-            if chat_id:
                 for k in [k for k in list(self._admin_cache.keys()) if k[0] == chat_id]:
                     self._admin_cache.pop(k, None)
                 try:
@@ -1648,6 +1705,7 @@ class MegaBot:
                     log.warning('upsert_group on my_chat_member skipped for %s', chat_id)
         except Exception:
             log.exception('on_my_chat_member failed')
+
 
 
     async def diagnose_group(self, reply_chat_id: int, group_id: int) -> None:
@@ -2009,19 +2067,21 @@ class MegaBot:
                 await self.db.upsert_user(member)
             except Exception:
                 pass
-            if member.get('is_bot'):
-                continue
             muid = int(member.get('id') or 0)
             if not muid:
                 continue
-            # Admins / owner never restricted
+            # Our bot added via new_chat_members (common on Bale when admin adds bot)
+            if self.bot_id and muid == self.bot_id:
+                await self._send_bot_join_intro(chat_id)
+                continue
+            if member.get('is_bot'):
+                continue
+            # Admins / owner are not subject to join-restriction, but still get welcome
             try:
                 is_adm = (muid == OWNER_ID) or await self._is_chat_admin(chat_id, muid)
             except Exception:
                 is_adm = muid == OWNER_ID
-            if is_adm:
-                continue
-            if sec.get('joinrestrict'):
+            if sec.get('joinrestrict') and not is_adm:
                 blocked = await self._apply_join_restriction(chat_id, muid, member, mod)
                 if blocked:
                     continue  # kicked / handled — skip welcome for this user

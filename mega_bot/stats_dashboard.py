@@ -13,21 +13,21 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 # ── palette (from reference) ───────────────────────────────────────────
-BG = (5, 7, 18)
-CARD = (14, 18, 36)
-CARD_INNER = (10, 14, 28)
-BORDER = (48, 42, 90)
-CYAN = (0, 220, 255)
-CYAN_SOFT = (34, 211, 238)
-PURPLE = (168, 85, 247)
-PINK = (236, 72, 153)
-GREEN = (34, 211, 153)
-GOLD = (251, 191, 36)
-ORANGE = (251, 146, 60)
-BLUE = (96, 165, 250)
-TEXT = (245, 247, 255)
-MUTED = (140, 150, 175)
-GRID = (28, 34, 55)
+BG = (3, 4, 12)
+CARD = (10, 14, 30)
+CARD_INNER = (8, 11, 24)
+BORDER = (70, 55, 140)
+CYAN = (0, 245, 255)
+CYAN_SOFT = (20, 230, 255)
+PURPLE = (190, 90, 255)
+PINK = (255, 70, 170)
+GREEN = (40, 255, 180)
+GOLD = (255, 210, 50)
+ORANGE = (255, 160, 50)
+BLUE = (80, 180, 255)
+TEXT = (255, 255, 255)
+MUTED = (175, 185, 210)
+GRID = (36, 42, 70)
 
 W, H = 1280, 1140
 _FA = str.maketrans('0123456789', '۰۱۲۳۴۵۶۷۸۹')
@@ -123,9 +123,9 @@ def _background() -> Image.Image:
     glow = Image.new('RGBA', (W, H), (0, 0, 0, 0))
     g = ImageDraw.Draw(glow)
     # large purple / blue washes like reference
-    g.ellipse([W - 420, -180, W + 180, 320], fill=(90, 40, 180, 55))
-    g.ellipse([-120, 200, 420, 720], fill=(20, 80, 140, 45))
-    g.ellipse([W // 3, H - 280, W // 3 + 500, H + 120], fill=(70, 30, 110, 40))
+    g.ellipse([W - 420, -180, W + 180, 320], fill=(120, 50, 220, 70))
+    g.ellipse([-120, 200, 420, 720], fill=(30, 120, 180, 55))
+    g.ellipse([W // 3, H - 280, W // 3 + 500, H + 120], fill=(100, 40, 160, 50))
     glow = glow.filter(ImageFilter.GaussianBlur(55))
     return Image.alpha_composite(img, glow)
 
@@ -168,15 +168,17 @@ def render_group_dashboard(
     draw = ImageDraw.Draw(img)
     avatars = avatars or {}
 
-    f_title = _font(44, True)
-    f_sub = _font(18)
-    f_kpi = _font(34, True)
-    f_kpi_lbl = _font(15)
-    f_sec = _font(20, True)
-    f_body = _font(16)
-    f_small = _font(13)
-    f_tiny = _font(12)
-    f_axis = _font(12)
+    f_title = _font(48, True)
+    f_sub = _font(20, True)
+    f_kpi = _font(38, True)
+    f_kpi_lbl = _font(16, True)
+    f_sec = _font(22, True)
+    f_body = _font(18, True)
+    f_name = _font(20, True)
+    f_msg = _font(17, True)
+    f_small = _font(14, True)
+    f_tiny = _font(13, True)
+    f_axis = _font(13, True)
 
     counts = stats.get('counts') or {}
     total_msgs = int(stats.get('total_msgs') or 0)
@@ -216,8 +218,8 @@ def render_group_dashboard(
     gap = 14
     n = 5
     card_w = (W - 2 * margin - gap * (n - 1)) // n
-    y0 = 130
-    card_h = 100
+    y0 = 128
+    card_h = 108
     for i, (lbl, val, c1, c2) in enumerate(kpis):
         x2 = W - margin - i * (card_w + gap)
         x1 = x2 - card_w
@@ -228,7 +230,7 @@ def render_group_dashboard(
             _t(draw, (x2 - 18, y0 + 18), fa_num(val), f_kpi, c1, 'rt')
         else:
             _t(draw, (x2 - 18, y0 + 18), str(val), f_kpi, c1, 'rt')
-        _t(draw, (x2 - 18, y0 + 62), lbl, f_kpi_lbl, MUTED, 'rt')
+        _t(draw, (x2 - 18, y0 + 66), lbl, f_kpi_lbl, MUTED, 'rt')
 
     # ═══ 3) HOURLY CHART PANEL ════════════════════════════════════════
     chart_top = 250
@@ -356,10 +358,12 @@ def render_group_dashboard(
             draw = ImageDraw.Draw(img)
 
             # name BELOW avatar with clear gap
-            ny = y1 + 90
-            _t(draw, (cx, ny), name, f_body, TEXT, 'mm')
-            _t(draw, (cx, ny + 24), f'تعداد پیام‌ها: {fa_num(cnt)}', f_tiny, MUTED, 'mm')
-            _t(draw, (cx, ny + 44), f'فعالیت: {fa_num(round(pct, 1))}٪', f_tiny, MUTED, 'mm')
+            ny = y1 + 92
+            # Name: large bold white
+            _t(draw, (cx, ny), name, f_name, (255, 255, 255), 'mm')
+            # Message count: bold, larger, high-contrast
+            _t(draw, (cx, ny + 28), f'تعداد پیام‌ها: {fa_num(cnt)}', f_msg, (255, 255, 255), 'mm')
+            _t(draw, (cx, ny + 50), f'فعالیت: {fa_num(round(pct, 1))}٪', f_tiny, MUTED, 'mm')
 
             # progress bar
             bar_x1, bar_x2 = x1 + 14, x2 - 14
@@ -374,5 +378,5 @@ def render_group_dashboard(
     _t(draw, (W - margin, H - 28), 'Powered by Dk', f_tiny, MUTED, 'rt')
 
     buf = BytesIO()
-    img.convert('RGB').save(buf, format='PNG', optimize=True)
+    img.convert('RGB').save(buf, format='PNG', optimize=False, compress_level=3)
     return buf.getvalue()

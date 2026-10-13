@@ -61,6 +61,8 @@ class MegaBot:
         self._recent_mids: dict[int, deque] = {}
         # Pending purge confirmations: token -> {chat_id, uid, mids, expires}
         self._purge_pending: dict[str, dict[str, Any]] = {}
+        self._ephemeral_tasks: set[asyncio.Task] = set()
+        self._maintenance_cache: tuple[bool, float] = (False, 0.0)
         self._stats_cache: dict | None = None
         self._time_lock_cache: dict[int, tuple[bool, float]] = {}  # chat_id -> (locked, expires_ts)
         self._lock_announce_cooldown: dict[int, float] = {}  # chat_id -> last announce ts
@@ -172,7 +174,7 @@ class MegaBot:
             return keyboard
         return {'inline_keyboard': [[ad_btn]]}
 
-    async def safe_send(self, chat_id: int, text: str, keyboard: dict | None = None, reply_to: int | None = None, parse_mode: str | None = 'Markdown', *, skip_ad: bool = False) -> dict | None:
+    async def safe_send(self, chat_id: int, text: str, keyboard: dict | None = None, reply_to: int | None = None, parse_mode: str | None = 'Markdown', *, skip_ad: bool = False, permanent: bool = False) -> dict | None:
         """Send with progressive fallbacks. Prefer no-reply first for reliability in groups.
 
         Logs every attempt outcome. Uses fast=True (no long retries) so group handlers
@@ -210,7 +212,7 @@ class MegaBot:
                     await self._metric_out(True)
                 except Exception:
                     pass
-                return result
+                return self._maybe_ephemeral_result(chat_id, result, permanent=permanent)
             except Exception as exc:
                 last_exc = exc
                 log.warning(
@@ -252,6 +254,62 @@ class MegaBot:
         # /start@MyBot -> /start
         t = re.sub(r'^(/[\w\u0600-\u06FF]+)@\w+', r'\1', t)
         return t.strip()
+
+
+    def _is_private_chat_id(self, chat_id: int) -> bool:
+        """Bale/Telegram: private chats have positive ids; groups/supergroups negative."""
+        try:
+            return int(chat_id) > 0
+        except Exception:
+            return True
+
+    async def _is_maintenance(self) -> bool:
+        now = time.time()
+        cached, exp = self._maintenance_cache
+        if exp > now:
+            return cached
+        try:
+            val = await self.db.get_setting('maintenance_mode', False)
+            on = bool(val) if not isinstance(val, str) else val.strip().lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            on = False
+        self._maintenance_cache = (on, now + 5.0)
+        return on
+
+    def _schedule_ephemeral_delete(self, chat_id: int, message_id: int | None) -> None:
+        """Delete a group bot message after a random 50–90s delay."""
+        if not message_id or self._is_private_chat_id(chat_id):
+            return
+        delay = random.uniform(50.0, 90.0)
+
+        async def _job() -> None:
+            try:
+                await asyncio.sleep(delay)
+                await self.api.delete_message(chat_id, int(message_id))
+                log.info('ephemeral delete ok chat=%s mid=%s after=%.0fs', chat_id, message_id, delay)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.debug('ephemeral delete fail chat=%s mid=%s: %s', chat_id, message_id, type(exc).__name__)
+
+        try:
+            task = asyncio.create_task(_job())
+            self._ephemeral_tasks.add(task)
+            task.add_done_callback(self._ephemeral_tasks.discard)
+        except Exception:
+            log.debug('could not schedule ephemeral delete', exc_info=True)
+
+    def _maybe_ephemeral_result(self, chat_id: int, result: dict | None, *, permanent: bool) -> dict | None:
+        if permanent or not result or self._is_private_chat_id(chat_id):
+            return result
+        mid = result.get('message_id') if isinstance(result, dict) else None
+        if mid is None and isinstance(result, dict):
+            inner = result.get('result')
+            if isinstance(inner, dict):
+                mid = inner.get('message_id')
+        if mid:
+            self._schedule_ephemeral_delete(chat_id, int(mid))
+        return result
 
     async def safe_edit(self, chat_id: int, message_id: int, text: str, keyboard: dict | None = None) -> None:
         try:
@@ -479,7 +537,24 @@ class MegaBot:
         except Exception:
             log.warning('upsert_user skipped/failed for %s', uid)
 
-        # Media conversion: reply to a photo/video/animation and write "گیف" or "گیف متن".
+
+                # ── Maintenance mode (owner can toggle): block all non-owner interaction
+        if uid and uid != OWNER_ID:
+            try:
+                if await self._is_maintenance():
+                    await self.safe_send(
+                        chat_id,
+                        '🛠️ ربات الان در *حالت تعمیرات* است.\n'
+                        'احتمالاً در حال به‌روزرسانی یا رفع مشکل هستیم.\n'
+                        'لطفاً کمی بعد دوباره سر بزن 🌱',
+                        parse_mode='Markdown',
+                        permanent=False,
+                    )
+                    return
+            except Exception:
+                log.debug('maintenance check failed', exc_info=True)
+
+# Media conversion: reply to a photo/video/animation and write "گیف" or "گیف متن".
         replied = msg.get('reply_to_message') or {}
         if text == 'گیف' or text.startswith('گیف '):
             if not replied:
@@ -1065,6 +1140,18 @@ class MegaBot:
         message = query.get('message') or {}
         chat = message.get('chat') or {}
         chat_id = int(chat.get('id', 0) or 0)
+        if uid and uid != OWNER_ID and not data.startswith('own:'):
+            try:
+                if await self._is_maintenance():
+                    try:
+                        await self.api.answer_callback_query(callback_id, '🛠️ ربات در حالت تعمیرات است', show_alert=True)
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
+        chat = message.get('chat') or {}
+        chat_id = int(chat.get('id', 0) or 0)
         message_id = int(message.get('message_id', 0) or 0)
 
         log.info(
@@ -1524,7 +1611,30 @@ class MegaBot:
                 'my_chat_member chat=%s old=%s new=%s title=%r',
                 chat_id, old_status, status, chat.get('title'),
             )
-            # Diagnostic map: does NOT gate message processing.
+
+                        # Bot was added to a group → permanent intro (never auto-delete)
+            old_status_l = (old_status or '').lower()
+            joined = status in ('member', 'administrator', 'restricted') and old_status_l in (
+                '', 'left', 'kicked', 'none',
+            )
+            if joined and chat_id and not self._is_private_chat_id(chat_id):
+                intro = (
+                    'سلام! 👋\n'
+                    'مرسی که منو به *گروهت* دعوت کردی تا بتونم کمکت کنم گروه رو مدیریت و شاداب نگه دارم.\n\n'
+                    'لطفاً *اول از همه من رو ادمین کن* و این دسترسی‌ها رو بده:\n'
+                    '• حذف پیام‌ها\n'
+                    '• محدود کردن اعضا (سکوت / اخراج)\n'
+                    '• پین پیام (اختیاری)\n\n'
+                    'بعد از ادمین شدن می‌تونی از دستورات `قفل`، `خوشامد`، `آمار`، `پاک` و بقیه امکانات استفاده کنی.\n\n'
+                    '📚 دستورات کامل من رو داخل *پیوی*، از منوی بیشتر ← راهنمای ربات ببین.'
+                )
+                try:
+                    kb = inline([[url_button('💬 رفتن به پیوی ربات', 'https://ble.ir/megabalebot')]])
+                    await self.safe_send(chat_id, intro, keyboard=kb, permanent=True)
+                except Exception:
+                    log.exception('bot-join intro failed chat=%s', chat_id)
+
+# Diagnostic map: does NOT gate message processing.
             if not hasattr(self, '_bot_member_status'):
                 self._bot_member_status = {}
             if chat_id:
@@ -1942,7 +2052,7 @@ class MegaBot:
             rules = await self.db.get_setting(f'rules:{chat_id}')
             keyboard = inline([[('📜 قوانین گروه', 'rules:show')]]) if rules else None
             try:
-                await self.safe_send(chat_id, text, keyboard)
+                await self.safe_send(chat_id, text, keyboard, permanent=True)
             except Exception:
                 log.exception('welcome send failed chat=%s', chat_id)
 
@@ -2072,7 +2182,7 @@ class MegaBot:
                 name=name, uid=muid, group=title, mention=mention, use_mention=True,
             )
         try:
-            await self.safe_send(chat_id, text)
+            await self.safe_send(chat_id, text, permanent=True)
         except Exception:
             log.exception('goodbye send failed chat=%s', chat_id)
             try:
@@ -2920,8 +3030,58 @@ class MegaBot:
             await self._show_owner_monitoring(chat_id, message_id, data)
             return
         if data == 'own:settings':
-            if not owner: return
-            await self.safe_edit(chat_id,message_id,'*تنظیمات مالک*\nنسخه: '+BOT_VERSION+'\nشناسه مالک: `'+str(OWNER_ID)+'`\n\nتنظیمات محرمانه را در config.py یا متغیرهای محیطی Railway تغییر بده.',inline([[('👨‍💻 تیم توسعه','own:team'),('📝 درباره ما','own:about')],[('💚 حمایت مالی','own:donations')],[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]])); return
+            if not owner:
+                return
+            maint = await self._is_maintenance()
+            maint_lbl = '🟢 روشن — خاموش کردن' if maint else '🔴 خاموش — روشن کردن'
+            maint_state = 'فعال' if maint else 'غیرفعال'
+            body = (
+                f'*تنظیمات مالک*\n'
+                f'نسخه: `{BOT_VERSION}`\n'
+                f'شناسه مالک: `{OWNER_ID}`\n\n'
+                f'🛠️ حالت تعمیرات: *{maint_state}*\n'
+                'با روشن بودن، تمام دستورات و تعامل برای کاربران قطع می‌شود '
+                '(فقط مالک می‌تواند ربات را کنترل کند).'
+            )
+            await self.safe_edit(
+                chat_id,
+                message_id,
+                body,
+                inline([
+                    [(f'🛠️ تعمیرات: {maint_lbl}', 'own:maint:toggle')],
+                    [('👨‍💻 تیم توسعه', 'own:team'), ('📝 درباره ما', 'own:about')],
+                    [('💚 حمایت مالی', 'own:donations')],
+                    [('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')],
+                ]),
+            )
+            return
+        if data == 'own:maint:toggle':
+            if not owner:
+                return
+            cur = await self._is_maintenance()
+            new_v = not cur
+            await self.db.set_setting('maintenance_mode', new_v, uid)
+            self._maintenance_cache = (new_v, time.time() + 5.0)
+            if new_v:
+                msg = (
+                    '*حالت تعمیرات روشن شد* 🛠️\n\n'
+                    'از این لحظه کاربران عادی نمی‌توانند از دستورات استفاده کنند.'
+                )
+            else:
+                msg = (
+                    '*حالت تعمیرات خاموش شد* ✅\n\n'
+                    'ربات دوباره برای همه فعال است.'
+                )
+            await self.safe_edit(
+                chat_id,
+                message_id,
+                msg,
+                inline([
+                    [('⚙️ بازگشت به تنظیمات', 'own:settings')],
+                    [('✖️ بستن', 'close')],
+                ]),
+            )
+            return
         if data.startswith('mod:'):
             await self.handle_moderation_callback(uid,chat_id,message_id,data)
 
@@ -4579,12 +4739,13 @@ class MegaBot:
                 members_count=members_count if isinstance(members_count, int) else None,
                 avatars=avatars or None,
             )
-            await self.api.send_photo_bytes(
+            photo_res = await self.api.send_photo_bytes(
                 chat_id,
                 png,
                 filename='group-stats.png',
                 caption=f'📊 داشبورد تحلیلی — {title}',
             )
+            self._maybe_ephemeral_result(chat_id, photo_res if isinstance(photo_res, dict) else None, permanent=False)
         except Exception as exc:
             log.exception('stats dashboard render/send failed')
             # Fallback minimal text so command never dies silently

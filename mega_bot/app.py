@@ -3272,6 +3272,202 @@ class MegaBot:
         ])
         await self.safe_edit(chat_id, message_id, body, kb)
 
+
+    async def _enrich_group_info(self, chat_id: int) -> dict:
+        """Best-effort live info from Bale API; never invent missing fields."""
+        info = {
+            'member_count': None,
+            'owner_id': None,
+            'owner_name': None,
+            'access': 'ناشناخته',
+            'title': None,
+        }
+        try:
+            chat = await asyncio.wait_for(
+                self.api.call('getChat', {'chat_id': chat_id}, retries=0), timeout=4.0,
+            )
+            if isinstance(chat, dict) and isinstance(chat.get('result'), dict):
+                chat = chat['result']
+            if isinstance(chat, dict):
+                info['title'] = (chat.get('title') or chat.get('name') or '') or None
+                info['access'] = 'دسترسی به مشخصات گروه'
+        except Exception as exc:
+            info['access'] = f'بدون دسترسی به getChat ({type(exc).__name__})'
+            return info
+        try:
+            cnt = await asyncio.wait_for(
+                self.api.call('getChatMembersCount', {'chat_id': chat_id}, retries=0), timeout=4.0,
+            )
+            if isinstance(cnt, dict) and 'result' in cnt:
+                cnt = cnt['result']
+            if isinstance(cnt, int):
+                info['member_count'] = cnt
+            elif isinstance(cnt, dict) and isinstance(cnt.get('result'), int):
+                info['member_count'] = int(cnt['result'])
+        except Exception:
+            pass
+        try:
+            admins = await asyncio.wait_for(
+                self.api.call('getChatAdministrators', {'chat_id': chat_id}, retries=0), timeout=5.0,
+            )
+            if isinstance(admins, dict) and 'result' in admins:
+                admins = admins['result']
+            if isinstance(admins, list):
+                for m in admins:
+                    if not isinstance(m, dict):
+                        continue
+                    if (m.get('status') or '').lower() != 'creator':
+                        continue
+                    u = m.get('user') or {}
+                    if isinstance(u, dict) and u.get('id'):
+                        info['owner_id'] = int(u['id'])
+                        info['owner_name'] = (
+                            u.get('first_name') or u.get('name') or ''
+                        )[:60] or None
+                        if u.get('username'):
+                            info['owner_name'] = (
+                                f"{info['owner_name'] or ''} (@{u['username']})"
+                            ).strip()
+                    break
+                if info['access'] == 'دسترسی به مشخصات گروه':
+                    info['access'] = 'دسترسی برقرار'
+        except Exception as exc:
+            if info['access'] == 'دسترسی به مشخصات گروه':
+                info['access'] = f'جزئی (ادمین‌ها: {type(exc).__name__})'
+        return info
+
+    async def _show_owner_groups(self, chat_id: int, message_id: int, page: int = 0) -> None:
+        page = max(0, int(page or 0))
+        per = 4
+        try:
+            total = await self.db.count_known_groups()
+            rows = await self.db.list_known_groups(limit=per, offset=page * per)
+        except Exception:
+            log.exception('list known groups failed')
+            await self.safe_edit(
+                chat_id, message_id,
+                '❌ خواندن لیست گروه‌ها از دیتابیس ناموفق بود.',
+                inline([[('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')]]),
+            )
+            return
+        if total <= 0:
+            body = (
+                '*📋 لیست گروه‌ها*\n\n'
+                'هنوز هیچ گروهی در دیتابیس ثبت نشده.\n'
+                'وقتی ربات در گروهی پیام ببیند یا عضو شود، اینجا ظاهر می‌شود.'
+            )
+            await self.safe_edit(
+                chat_id, message_id, body,
+                inline([[('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')]]),
+            )
+            return
+        pages = max(1, (total + per - 1) // per)
+        if page >= pages:
+            page = pages - 1
+            rows = await self.db.list_known_groups(limit=per, offset=page * per)
+        blocks = [f'*📋 لیست گروه‌ها*\nصفحه {page + 1} از {pages} — مجموع: *{total}*\n']
+        for g in rows:
+            gid = int(g['chat_id'])
+            title = (g.get('title') or '').strip() or 'بدون عنوان'
+            live = await self._enrich_group_info(gid)
+            if live.get('title'):
+                title = live['title']
+            mc = live.get('member_count')
+            mc_s = f'{mc:,}' if isinstance(mc, int) else 'در دسترس نیست'
+            oid = live.get('owner_id')
+            oname = live.get('owner_name')
+            if oid:
+                owner_s = f'{oname or "—"} (`{oid}`)'
+            else:
+                owner_s = 'در دسترس نیست'
+            uname = (g.get('username') or '').strip()
+            uname_s = f'@{uname}' if uname else '—'
+            last = g.get('last_seen')
+            last_s = last.strftime('%Y-%m-%d %H:%M') if last else '—'
+            blocks.append(
+                f'━━━━━━━━━━━━━━\n'
+                f'🏷 *{title}*\n'
+                f'🆔 `{gid}`\n'
+                f'🔗 {uname_s}\n'
+                f'👑 مالک گروه: {owner_s}\n'
+                f'👥 اعضا: {mc_s}\n'
+                f'📡 وضعیت: {live.get("access") or "—"}\n'
+                f'🕒 آخرین فعالیت ثبت‌شده: `{last_s}`'
+            )
+        body = '\n'.join(blocks)
+        if len(body) > 3500:
+            body = body[:3400] + '\n…'
+        nav = []
+        if page > 0:
+            nav.append(('⬅️ قبلی', f'own:groups:{page - 1}'))
+        if page + 1 < pages:
+            nav.append(('بعدی ➡️', f'own:groups:{page + 1}'))
+        kb = []
+        if nav:
+            kb.append(nav)
+        kb.append([('🔄 تازه‌سازی', f'own:groups:{page}')])
+        kb.append([('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')])
+        await self.safe_edit(chat_id, message_id, body, inline(kb))
+
+    async def _show_owner_users(self, chat_id: int, message_id: int, page: int = 0) -> None:
+        page = max(0, int(page or 0))
+        per = 8
+        try:
+            total = await self.db.count_known_users()
+            rows = await self.db.list_known_users(limit=per, offset=page * per)
+        except Exception:
+            log.exception('list known users failed')
+            await self.safe_edit(
+                chat_id, message_id,
+                '❌ خواندن لیست کاربران از دیتابیس ناموفق بود.',
+                inline([[('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')]]),
+            )
+            return
+        if total <= 0:
+            body = (
+                '*👥 کاربران*\n\n'
+                'هنوز کاربری در دیتابیس ثبت نشده.\n'
+                'با تعامل کاربران، رکوردها اینجا جمع می‌شوند.'
+            )
+            await self.safe_edit(
+                chat_id, message_id, body,
+                inline([[('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')]]),
+            )
+            return
+        pages = max(1, (total + per - 1) // per)
+        if page >= pages:
+            page = pages - 1
+            rows = await self.db.list_known_users(limit=per, offset=page * per)
+        lines = [
+            f'*👥 کاربران شناخته‌شده*',
+            f'صفحه {page + 1} از {pages} — مجموع یکتا: *{total}*',
+            '',
+            '_(هر خط یک کاربر با شناسه یکتا؛ بدون دکمه جداگانه)_',
+            '',
+        ]
+        for u in rows:
+            uid = int(u['user_id'])
+            name = (u.get('first_name') or '').strip() or '—'
+            uname = (u.get('username') or '').strip()
+            id_part = f'@{uname}' if uname else f'`{uid}`'
+            last = u.get('last_seen')
+            last_s = last.strftime('%Y-%m-%d %H:%M') if last else 'در دسترس نیست'
+            lines.append(f'• {name} — {id_part} — id:`{uid}` — آخرین: `{last_s}`')
+        body = '\n'.join(lines)
+        if len(body) > 3500:
+            body = body[:3400] + '\n…'
+        nav = []
+        if page > 0:
+            nav.append(('⬅️ قبلی', f'own:users:{page - 1}'))
+        if page + 1 < pages:
+            nav.append(('بعدی ➡️', f'own:users:{page + 1}'))
+        kb = []
+        if nav:
+            kb.append(nav)
+        kb.append([('🔄 تازه‌سازی', f'own:users:{page}')])
+        kb.append([('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')])
+        await self.safe_edit(chat_id, message_id, body, inline(kb))
+
     async def show_admin(self, chat_id: int, uid: int, owner: bool, edit_id: int | None = None, page: int = 0) -> None:
         if not owner:
             admin = await self.db.get_admin(uid)
@@ -3290,6 +3486,7 @@ class MegaBot:
         else:
             items = [
                 ('📊 آمار و گزارش‌ها','adm:stats'),('👤 جست‌وجوی کاربر','adm:search:user'),('👥 جست‌وجوی گروه','adm:search:group'),
+                ('📋 لیست گروه‌ها','own:groups:0'),('👥 کاربران','own:users:0'),
                 ('🎫 بررسی کد پیگیری','adm:case'),('🧾 گزارش فعالیت‌ها','adm:logs'),('🛡️ مدیریت ادمین‌ها','own:admins'),
                 ('📝 ویرایش درباره ما','own:about'),('👨‍💻 تیم توسعه‌دهنده','own:team'),('💚 تنظیمات حمایت مالی','own:donations'),
                 ('📢 افزودن دکمه تبلیغ','adm:ad'),('📨 پیام همگانی','adm:broadcast'),
@@ -3425,6 +3622,27 @@ class MegaBot:
                 await self.safe_send(chat_id, '⛔ فقط مالک.', parse_mode=None)
                 return
             await self._show_owner_monitoring(chat_id, message_id, data)
+            return
+
+        if data.startswith('own:groups'):
+            if not owner:
+                await self.safe_send(chat_id, '⛔ فقط مالک ربات به لیست گروه‌ها دسترسی دارد.', parse_mode=None)
+                return
+            try:
+                page = int(data.rsplit(':', 1)[-1])
+            except ValueError:
+                page = 0
+            await self._show_owner_groups(chat_id, message_id, page)
+            return
+        if data.startswith('own:users'):
+            if not owner:
+                await self.safe_send(chat_id, '⛔ فقط مالک ربات به لیست کاربران دسترسی دارد.', parse_mode=None)
+                return
+            try:
+                page = int(data.rsplit(':', 1)[-1])
+            except ValueError:
+                page = 0
+            await self._show_owner_users(chat_id, message_id, page)
             return
         if data == 'own:settings':
             if not owner:

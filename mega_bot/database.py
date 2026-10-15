@@ -1744,3 +1744,33 @@ class Database:
                 int(jid),
             )
         return int(jid)
+
+
+    # ── Owner panel: known groups & users ───────────────────────────────
+    async def count_known_groups(self) -> int:
+        async with self._pool().acquire() as c:
+            return int(await c.fetchval('SELECT COUNT(*) FROM groups_seen') or 0)
+
+    async def list_known_groups(self, limit: int = 5, offset: int = 0) -> list[dict]:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                'SELECT chat_id, title, username, first_seen, last_seen, messages_count '
+                'FROM groups_seen ORDER BY last_seen DESC NULLS LAST, chat_id '
+                'LIMIT $1 OFFSET $2',
+                int(limit), int(offset),
+            )
+        return [dict(r) for r in rows]
+
+    async def count_known_users(self) -> int:
+        async with self._pool().acquire() as c:
+            return int(await c.fetchval('SELECT COUNT(*) FROM users') or 0)
+
+    async def list_known_users(self, limit: int = 10, offset: int = 0) -> list[dict]:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                'SELECT user_id, username, first_name, first_seen, last_seen, starts_count '
+                'FROM users ORDER BY last_seen DESC NULLS LAST, user_id '
+                'LIMIT $1 OFFSET $2',
+                int(limit), int(offset),
+            )
+        return [dict(r) for r in rows]

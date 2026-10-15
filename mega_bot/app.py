@@ -3485,19 +3485,31 @@ class MegaBot:
             if not items: items = [('📊 آمار و گزارش‌ها','adm:stats')]
         else:
             items = [
-                ('📊 آمار و گزارش‌ها','adm:stats'),('👤 جست‌وجوی کاربر','adm:search:user'),('👥 جست‌وجوی گروه','adm:search:group'),
-                ('📋 لیست گروه‌ها','own:groups:0'),('👥 کاربران','own:users:0'),
-                ('🎫 بررسی کد پیگیری','adm:case'),('🧾 گزارش فعالیت‌ها','adm:logs'),('🛡️ مدیریت ادمین‌ها','own:admins'),
-                ('📝 ویرایش درباره ما','own:about'),('👨‍💻 تیم توسعه‌دهنده','own:team'),('💚 تنظیمات حمایت مالی','own:donations'),
-                ('📢 افزودن دکمه تبلیغ','adm:ad'),('📨 پیام همگانی','adm:broadcast'),
+                ('📋 لیست گروه‌ها','own:groups:0'),
+                ('👥 کاربران','own:users:0'),
+                ('📊 آمار و گزارش‌ها','adm:stats'),
+                ('👤 جست‌وجوی کاربر','adm:search:user'),
+                ('👥 جست‌وجوی گروه','adm:search:group'),
+                ('🎫 بررسی کد پیگیری','adm:case'),
+                ('🧾 گزارش فعالیت‌ها','adm:logs'),
+                ('🛡️ مدیریت ادمین‌ها','own:admins'),
+                ('📝 ویرایش درباره ما','own:about'),
+                ('👨‍💻 تیم توسعه‌دهنده','own:team'),
+                ('💚 تنظیمات حمایت مالی','own:donations'),
+                ('📢 افزودن دکمه تبلیغ','adm:ad'),
+                ('📨 پیام همگانی','adm:broadcast'),
                 ('📡 مانیتورینگ زنده','own:mon'),
-                ('⚙️ تنظیمات مالک','own:settings')]
-        # Exactly three content items per page, plus optional previous/next and back/close.
-        start = page*2
-        rows = [[(label,data)] for label,data in items[start:start+2]]
-        controls=[]
-        if page>0: controls.append(('⬅️ قبلی',f'admin:page:{page-1}'))
-        if start+2<len(items): controls.append(('بعدی ➡️',f'admin:page:{page+1}'))
+                ('⚙️ تنظیمات مالک','own:settings'),
+            ]
+        # Owner/admin panel: 4 items per page for easier discovery
+        per_page = 4
+        start = page * per_page
+        rows = [[(label, data)] for label, data in items[start:start + per_page]]
+        controls = []
+        if page > 0:
+            controls.append(('⬅️ قبلی', f'admin:page:{page - 1}'))
+        if start + per_page < len(items):
+            controls.append(('بعدی ➡️', f'admin:page:{page + 1}'))
         if controls: rows.append(controls)
         rows.append([('↩️ برگشت','home'),('✖️ بستن','close')])
         text = '*پنل مالک MEGA BOT*\nیک بخش رو انتخاب کن.' if owner else '*پنل ادمین MEGA BOT*\nدسترسی‌ها بر اساس مجوزهای تو نمایش داده می‌شوند.'

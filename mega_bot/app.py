@@ -16,6 +16,8 @@ from . import levels as level_mod
 from . import tts as tts_mod
 from . import font_styles as font_mod
 from . import time_literary as time_mod
+from . import hafez_content as hafez_mod
+from . import jokes_content as jokes_mod
 from . import stats_dashboard as dash
 from config import OWNER_ID, BOT_VERSION, SUPPORT_TEXT, DONATION_TEXT
 
@@ -687,6 +689,11 @@ class MegaBot:
                 return
         if text.startswith('/start'):
             await self.safe_send(chat_id, '*سلام! به MEGA BOT خوش اومدی* 🌿\nاز منوی پایین برای دیدن بخش‌ها استفاده کن.', USER_KEYBOARD)
+            if not is_group:
+                try:
+                    await self._deliver_pending_hafez_dm(chat_id, uid)
+                except Exception:
+                    log.debug('pending hafez dm failed', exc_info=True)
             return
         if text.startswith('/admin'):
             if uid != OWNER_ID and not await self.db.is_admin(uid):
@@ -987,6 +994,19 @@ class MegaBot:
                 await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', parse_mode=None)
                 return
             await self._send_group_stats(chat_id, chat)
+            return
+
+        # ── Nickname: reply + «لقب X» / «تنظیم لقب X»
+        if is_group and (text.startswith('لقب ') or text.startswith('تنظیم لقب ')):
+            await self._cmd_set_nickname(chat_id, uid, text, msg)
+            return
+        # ── Hafez fortune
+        if text.strip() in ('فال', 'فال حافظ', 'فال‌حافظ'):
+            await self._cmd_hafez(chat_id, uid, user, msg, is_group=is_group)
+            return
+        # ── Joke
+        if text.strip() in ('جوک', 'جک'):
+            await self._cmd_joke(chat_id, msg)
             return
 
         # ── Font stylizer: «فونت متن» or reply+«فونت»
@@ -1577,6 +1597,25 @@ class MegaBot:
             # Fail closed — do not grant admin on network errors
             self._admin_cache[key] = (False, now + 10)
             return False
+
+
+    async def _get_member_status(self, chat_id: int, uid: int) -> str:
+        """Return 'creator' | 'administrator' | 'member' | 'left' (fail-closed -> member)."""
+        try:
+            result = await asyncio.wait_for(
+                self.api.call('getChatMember', {'chat_id': chat_id, 'user_id': uid}),
+                timeout=4.0,
+            )
+            if isinstance(result, dict) and isinstance(result.get('result'), dict):
+                result = result['result']
+            if not isinstance(result, dict):
+                return 'member'
+            return (result.get('status') or 'member').strip().lower()
+        except Exception:
+            return 'member'
+
+    async def _is_chat_creator(self, chat_id: int, uid: int) -> bool:
+        return (await self._get_member_status(chat_id, uid)) == 'creator'
 
     async def _require_group_admin(self, chat_id: int, uid: int) -> bool:
         """True only for bot owner or real group admin (NOT VIP).
@@ -2347,6 +2386,162 @@ class MegaBot:
             log.exception('time story failed')
             await self.safe_send(chat_id, '❌ خواندن ساعت ممکن نشد.', parse_mode=None)
 
+
+    async def _cmd_set_nickname(self, chat_id: int, uid: int, text: str, msg: dict) -> None:
+        """Set nickname via reply. Owner: anyone; admin: only normal members."""
+        replied = msg.get('reply_to_message') or {}
+        target = replied.get('from') or {}
+        tid = int(target.get('id') or 0)
+        if not tid:
+            await self.safe_send(
+                chat_id,
+                '❓ برای تنظیم لقب، روی پیام کاربر ریپلای کن و بنویس:\n`لقب نام‌مستعار`\nیا `تنظیم لقب نام‌مستعار`',
+                reply_to=msg.get('message_id'),
+            )
+            return
+        if text.startswith('تنظیم لقب '):
+            nick = text[len('تنظیم لقب '):].strip()
+        else:
+            nick = text[len('لقب '):].strip()
+        if not nick or len(nick) > 64:
+            await self.safe_send(chat_id, '❓ لقب باید بین ۱ تا ۶۴ کاراکتر باشد.', reply_to=msg.get('message_id'), parse_mode=None)
+            return
+
+        actor_st = await self._get_member_status(chat_id, uid)
+        is_owner = actor_st == 'creator' or uid == OWNER_ID
+        is_admin = actor_st in ('creator', 'administrator') or uid == OWNER_ID
+        if not is_admin:
+            await self.safe_send(chat_id, '⛔ فقط مالک یا ادمین گروه می‌تواند لقب تنظیم کند.', reply_to=msg.get('message_id'), parse_mode=None)
+            return
+
+        target_st = await self._get_member_status(chat_id, tid)
+        target_is_staff = target_st in ('creator', 'administrator')
+        if target_is_staff and not is_owner:
+            await self.safe_send(
+                chat_id,
+                '⛔ ادمین فقط می‌تواند لقب اعضای عادی را تغییر دهد، نه ادمین‌ها یا مالک.',
+                reply_to=msg.get('message_id'),
+                parse_mode=None,
+            )
+            return
+        try:
+            await self.db.set_nickname(chat_id, tid, nick, set_by=uid)
+        except Exception:
+            log.exception('set_nickname failed')
+            await self.safe_send(chat_id, '❌ ذخیره لقب ناموفق بود.', parse_mode=None)
+            return
+        tname = (target.get('first_name') or str(tid))[:40]
+        await self.safe_send(
+            chat_id,
+            f'✅ لقب *{tname}* تنظیم شد:\n🏷️ `{nick}`',
+            reply_to=msg.get('message_id'),
+        )
+
+    def _hafez_day_bucket(self):
+        """Fortune day resets at 12:00 Asia/Tehran. Return (bucket_date, next_reset_dt)."""
+        from datetime import datetime, timedelta, time as dtime
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo('Asia/Tehran')
+        now = datetime.now(tz)
+        noon = dtime(12, 0)
+        if now.time() < noon:
+            bucket = (now.date() - timedelta(days=1))
+            next_reset = datetime.combine(now.date(), noon, tzinfo=tz)
+        else:
+            bucket = now.date()
+            next_reset = datetime.combine(now.date() + timedelta(days=1), noon, tzinfo=tz)
+        return bucket, next_reset
+
+    def _format_hafez_message(self, fortune: dict) -> str:
+        return (
+            f'📜 *فال حافظ*\n'
+            f'━━━━━━━━━━━━━━\n'
+            f'*{fortune.get("title") or "غزل"}*\n\n'
+            f'{fortune["poem"]}\n\n'
+            f'━━━━━━━━━━━━━━\n'
+            f'🔮 *تعبیر:*\n{fortune["meaning"]}'
+        )
+
+    async def _cmd_hafez(self, chat_id: int, uid: int, user: dict, msg: dict, *, is_group: bool) -> None:
+        bucket, next_reset = self._hafez_day_bucket()
+        try:
+            existing = await self.db.get_hafez_assignment(uid, bucket)
+        except Exception:
+            log.exception('get_hafez_assignment failed')
+            await self.safe_send(chat_id, '❌ خواندن سهمیه فال ممکن نشد.', parse_mode=None)
+            return
+
+        if existing:
+            fortune = hafez_mod.get_by_id(int(existing['fortune_id']))
+            if not fortune:
+                await self.safe_send(chat_id, '❌ فال ذخیره‌شده پیدا نشد.', parse_mode=None)
+                return
+            body = self._format_hafez_message(fortune)
+            body += f'\n\n⏳ سهمیه امروزت استفاده شده. فال بعدی بعد از ساعت ۱۲ ظهر تهران:\n`{next_reset.strftime("%Y/%m/%d %H:%M")}`'
+            await self.safe_send(chat_id, body, reply_to=msg.get('message_id'))
+            return
+
+        try:
+            fid = await self.db.hafez_pick_unused(hafez_mod.all_ids())
+            ok = await self.db.assign_hafez_fortune(uid, bucket, fid)
+            if not ok:
+                # race: re-read
+                existing = await self.db.get_hafez_assignment(uid, bucket)
+                fid = int(existing['fortune_id']) if existing else fid
+            fortune = hafez_mod.get_by_id(fid)
+        except Exception:
+            log.exception('assign hafez failed')
+            await self.safe_send(chat_id, '❌ تخصیص فال ناموفق بود.', parse_mode=None)
+            return
+        if not fortune:
+            await self.safe_send(chat_id, '❌ فال در دسترس نیست.', parse_mode=None)
+            return
+
+        body = self._format_hafez_message(fortune)
+        await self.safe_send(chat_id, body, reply_to=msg.get('message_id'))
+
+        if is_group:
+            # Try DM; if fails, store pending + button
+            try:
+                await self.api.send_message(uid, body, None, None, 'Markdown', fast=True)
+            except Exception:
+                try:
+                    await self.db.set_hafez_pending_dm(uid, int(fortune['id']), bucket)
+                except Exception:
+                    log.debug('pending dm store failed', exc_info=True)
+                uname = (getattr(self, 'bot_username', None) or 'megabalebot').lstrip('@')
+                kb = inline([[url_button('📩 دریافت فال در پیوی', f'https://ble.ir/{uname}')]])
+                await self.safe_send(
+                    chat_id,
+                    'ℹ️ نتونستم فال رو تو پیوی بفرستم. یک‌بار پیوی ربات رو باز کن تا همان فال برات ارسال بشه.',
+                    keyboard=kb,
+                    parse_mode=None,
+                )
+
+    async def _deliver_pending_hafez_dm(self, chat_id: int, uid: int) -> None:
+        pending = await self.db.pop_hafez_pending_dm(uid)
+        if not pending:
+            return
+        fortune = hafez_mod.get_by_id(int(pending['fortune_id']))
+        if not fortune:
+            return
+        body = self._format_hafez_message(fortune)
+        body += '\n\n✅ این همان فال ذخیره‌شدهٔ توست (سهمیهٔ جدید مصرف نشد).'
+        await self.safe_send(chat_id, body)
+
+    async def _cmd_joke(self, chat_id: int, msg: dict) -> None:
+        try:
+            jid = await self.db.joke_pick(jokes_mod.all_ids())
+            joke = jokes_mod.get_by_id(jid)
+            if not joke:
+                await self.safe_send(chat_id, '😂 جوکی در دسترس نیست.', parse_mode=None)
+                return
+            text = f'😂 *جوک {joke.get("cat") or ""}*\n\n{joke["text"]}'.strip()
+            await self.safe_send(chat_id, text, reply_to=msg.get('message_id'))
+        except Exception:
+            log.exception('joke failed')
+            await self.safe_send(chat_id, '❌ ارسال جوک ناموفق بود.', parse_mode=None)
+
     GUIDE_ENTRIES = [
         ('📌 دستورات عمومی',
          '• کیبورد پایین: پشتیبانی، حمایت مالی، تیم توسعه، آمار، منوی بیشتر\n'
@@ -2387,7 +2582,18 @@ class MegaBot:
          '• انگلیسی: صدای Google Translate\n'
          '• متن طولانی پشتیبانی می‌شود\n'
          'دسترسی: همه کاربران'),
-                ('✨ فونت‌ساز',
+                        ('📜 فال حافظ',
+         '• `فال` — یک غزل واقعی حافظ با تعبیر\n'
+         '• هر کاربر روزی یک فال جدید (ریست ۱۲ ظهر تهران)\n'
+         'دسترسی: همه کاربران'),
+        ('😂 جوک',
+         '• `جوک` — جوک فارسی تصادفی بدون تکرار تا حد امکان\n'
+         'دسترسی: همه کاربران'),
+        ('🏷️ لقب',
+         '• ریپلای + `لقب متن` — تنظیم لقب در گروه\n'
+         '• مالک: همه | ادمین: فقط عضو عادی\n'
+         'دسترسی: ادمین/مالک گروه'),
+('✨ فونت‌ساز',
          '• `فونت متن دلخواه` — استایل‌های فارسی و انگلیسی\n'
          '• ریپلای + `فونت` — فونت‌سازی روی همان پیام\n'
          '• صفحه‌بندی ۶تایی، قبلی/بعدی، فونت‌های بیشتر\n'
@@ -2903,18 +3109,43 @@ class MegaBot:
         rank_s = f'#{rank}' if rank else '—'
 
         if mode == 'profile':
-            uname_line = f'@{username}' if username else 'ثبت نشده'
-            body = (
-                f'👤 اطلاعات {mention}:\n\n'
-                f'➖➖➖➖➖➖➖➖➖➖➖➖\n\n'
-                f'🟢 نام : {name}\n\n'
-                f'🟢 ایدی : {uname_line}\n\n'
-                f'🟢 ایدی عددی : `{uid}`\n\n'
-                f'🟢 بیوگرافی:\nدر دسترس نیست\n\n'
-                f'🟢 مجموع پیام‌ها در این گروه: *{total_msgs:,}*\n\n'
-                f'⭐ لول: *{level}* | امتیاز: *{prog["total_xp"]:,}*\n\n'
-                f'➖➖➖➖➖➖➖➖➖➖➖➖'
-            )
+            uname_line = f'@{username}' if username else None
+            nick = None
+            try:
+                nick = await self.db.get_nickname(chat_id, uid)
+            except Exception:
+                log.debug('get_nickname failed', exc_info=True)
+            role_line = ''
+            try:
+                st = await self._get_member_status(chat_id, uid)
+                if st == 'creator':
+                    role_line = '\n\n👑 مالک این گروه'
+                elif st == 'administrator':
+                    role_line = '\n\n🛡️ ادمین این گروه'
+            except Exception:
+                pass
+            lines = [
+                f'👤 اطلاعات {mention}:',
+                '',
+                '➖➖➖➖➖➖➖➖➖➖➖➖',
+                '',
+                f'🟢 نام : {name}',
+            ]
+            if nick:
+                lines += ['', f'🏷️ لقب : {nick}']
+            if uname_line:
+                lines += ['', f'🟢 ایدی : {uname_line}']
+            lines += [
+                '',
+                f'🟢 ایدی عددی : `{uid}`',
+                '',
+                f'🟢 مجموع پیام‌ها در این گروه: *{total_msgs:,}*',
+                '',
+                f'⭐ لول: *{level}* | امتیاز: *{prog["total_xp"]:,}*',
+                '',
+                '➖➖➖➖➖➖➖➖➖➖➖➖',
+            ]
+            body = '\n'.join(lines) + role_line
             await self.safe_send(chat_id, body, reply_to=msg.get('message_id'))
             return
 

@@ -253,6 +253,43 @@ CREATE TABLE IF NOT EXISTS user_group_points (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (chat_id, user_id)
 );
+
+CREATE TABLE IF NOT EXISTS group_nicknames (
+  chat_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  nickname TEXT NOT NULL DEFAULT '',
+  set_by BIGINT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (chat_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS group_nicknames_chat_idx ON group_nicknames (chat_id);
+
+CREATE TABLE IF NOT EXISTS hafez_assignments (
+  user_id BIGINT NOT NULL,
+  day_bucket DATE NOT NULL,
+  fortune_id INTEGER NOT NULL,
+  assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, day_bucket)
+);
+
+CREATE TABLE IF NOT EXISTS hafez_usage (
+  fortune_id INTEGER PRIMARY KEY,
+  times_used INTEGER NOT NULL DEFAULT 0,
+  last_used_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS hafez_pending_dm (
+  user_id BIGINT PRIMARY KEY,
+  fortune_id INTEGER NOT NULL,
+  day_bucket DATE NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS joke_usage (
+  joke_id INTEGER PRIMARY KEY,
+  times_used INTEGER NOT NULL DEFAULT 0,
+  last_used_at TIMESTAMPTZ
+);
 """
 
 class Database:
@@ -1587,3 +1624,123 @@ class Database:
             )
         return int(v2 or 0)
 
+
+
+    # ── Group nicknames ─────────────────────────────────────────────────
+    async def get_nickname(self, chat_id: int, user_id: int) -> str | None:
+        async with self._pool().acquire() as c:
+            row = await c.fetchval(
+                'SELECT nickname FROM group_nicknames WHERE chat_id=$1 AND user_id=$2',
+                int(chat_id), int(user_id),
+            )
+        return (row or '').strip() or None
+
+    async def set_nickname(self, chat_id: int, user_id: int, nickname: str, set_by: int | None = None) -> None:
+        nick = (nickname or '').strip()[:64]
+        async with self._pool().acquire() as c:
+            if not nick:
+                await c.execute(
+                    'DELETE FROM group_nicknames WHERE chat_id=$1 AND user_id=$2',
+                    int(chat_id), int(user_id),
+                )
+                return
+            await c.execute(
+                "INSERT INTO group_nicknames (chat_id, user_id, nickname, set_by, updated_at) "
+                "VALUES ($1,$2,$3,$4,NOW()) "
+                "ON CONFLICT (chat_id, user_id) DO UPDATE "
+                "SET nickname=EXCLUDED.nickname, set_by=EXCLUDED.set_by, updated_at=NOW()",
+                int(chat_id), int(user_id), nick, set_by,
+            )
+
+    # ── Hafez fortune ───────────────────────────────────────────────────
+    async def get_hafez_assignment(self, user_id: int, day_bucket) -> dict | None:
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow(
+                'SELECT fortune_id, day_bucket, assigned_at FROM hafez_assignments '
+                'WHERE user_id=$1 AND day_bucket=$2',
+                int(user_id), day_bucket,
+            )
+        return dict(row) if row else None
+
+    async def assign_hafez_fortune(self, user_id: int, day_bucket, fortune_id: int) -> bool:
+        """Atomically assign. Returns False if already assigned this bucket."""
+        async with self._pool().acquire() as c:
+            async with c.transaction():
+                exists = await c.fetchval(
+                    'SELECT 1 FROM hafez_assignments WHERE user_id=$1 AND day_bucket=$2',
+                    int(user_id), day_bucket,
+                )
+                if exists:
+                    return False
+                await c.execute(
+                    'INSERT INTO hafez_assignments (user_id, day_bucket, fortune_id) VALUES ($1,$2,$3)',
+                    int(user_id), day_bucket, int(fortune_id),
+                )
+                await c.execute(
+                    "INSERT INTO hafez_usage (fortune_id, times_used, last_used_at) "
+                    "VALUES ($1, 1, NOW()) "
+                    "ON CONFLICT (fortune_id) DO UPDATE "
+                    "SET times_used = hafez_usage.times_used + 1, last_used_at = NOW()",
+                    int(fortune_id),
+                )
+        return True
+
+    async def hafez_used_ids(self) -> set:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch('SELECT fortune_id FROM hafez_usage WHERE times_used > 0')
+        return {int(r['fortune_id']) for r in rows}
+
+    async def hafez_pick_unused(self, all_ids: list) -> int:
+        import random
+        async with self._pool().acquire() as c:
+            rows = await c.fetch('SELECT fortune_id, times_used FROM hafez_usage')
+            used_map = {int(r['fortune_id']): int(r['times_used']) for r in rows}
+        unused = [i for i in all_ids if used_map.get(i, 0) <= 0]
+        if unused:
+            return random.choice(unused)
+        if not all_ids:
+            raise RuntimeError('no fortunes')
+        min_u = min(used_map.get(i, 0) for i in all_ids)
+        candidates = [i for i in all_ids if used_map.get(i, 0) <= min_u]
+        return random.choice(candidates)
+
+    async def set_hafez_pending_dm(self, user_id: int, fortune_id: int, day_bucket) -> None:
+        async with self._pool().acquire() as c:
+            await c.execute(
+                "INSERT INTO hafez_pending_dm (user_id, fortune_id, day_bucket, created_at) "
+                "VALUES ($1,$2,$3,NOW()) "
+                "ON CONFLICT (user_id) DO UPDATE "
+                "SET fortune_id=EXCLUDED.fortune_id, day_bucket=EXCLUDED.day_bucket, created_at=NOW()",
+                int(user_id), int(fortune_id), day_bucket,
+            )
+
+    async def pop_hafez_pending_dm(self, user_id: int) -> dict | None:
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow(
+                'DELETE FROM hafez_pending_dm WHERE user_id=$1 RETURNING fortune_id, day_bucket',
+                int(user_id),
+            )
+        return dict(row) if row else None
+
+    # ── Jokes ───────────────────────────────────────────────────────────
+    async def joke_pick(self, all_ids: list) -> int:
+        import random
+        async with self._pool().acquire() as c:
+            rows = await c.fetch('SELECT joke_id, times_used FROM joke_usage')
+            used_map = {int(r['joke_id']): int(r['times_used']) for r in rows}
+        unused = [i for i in all_ids if used_map.get(i, 0) <= 0]
+        if unused:
+            jid = random.choice(unused)
+        else:
+            min_u = min((used_map.get(i, 0) for i in all_ids), default=0)
+            candidates = [i for i in all_ids if used_map.get(i, 0) <= min_u]
+            jid = random.choice(candidates or list(all_ids))
+        async with self._pool().acquire() as c:
+            await c.execute(
+                "INSERT INTO joke_usage (joke_id, times_used, last_used_at) "
+                "VALUES ($1, 1, NOW()) "
+                "ON CONFLICT (joke_id) DO UPDATE "
+                "SET times_used = joke_usage.times_used + 1, last_used_at = NOW()",
+                int(jid),
+            )
+        return int(jid)

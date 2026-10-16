@@ -1788,14 +1788,14 @@ class Database:
                     (int(chat_id),),
                 ),
                 (
-                    'SELECT DISTINCT user_id FROM user_group_activity '
-                    'WHERE chat_id=$1 AND updated_at >= NOW() - INTERVAL '24 hours'',
+                    "SELECT DISTINCT user_id FROM user_group_activity "
+                    "WHERE chat_id=$1 AND updated_at >= NOW() - INTERVAL '24 hours'",
                     (int(chat_id),),
                 ),
                 (
-                    'SELECT DISTINCT user_id FROM usage_events '
-                    'WHERE chat_id=$1 AND user_id IS NOT NULL '
-                    'AND created_at >= NOW() - INTERVAL '24 hours'',
+                    "SELECT DISTINCT user_id FROM usage_events "
+                    "WHERE chat_id=$1 AND user_id IS NOT NULL "
+                    "AND created_at >= NOW() - INTERVAL '24 hours'",
                     (int(chat_id),),
                 ),
             ):

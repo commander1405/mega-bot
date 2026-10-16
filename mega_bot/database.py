@@ -1778,69 +1778,71 @@ class Database:
     # ── Group tag mentions ──────────────────────────────────────────────
     async def list_active_users_24h(self, chat_id: int) -> list[dict]:
         """Users with real recorded activity in this group within ~24 hours."""
+        ids: set[int] = set()
         async with self._pool().acquire() as c:
-            rows = await c.fetch(
-                """
-                SELECT DISTINCT u.user_id, u.username, u.first_name
-                FROM (
-                    SELECT user_id FROM group_user_msgs
-                      WHERE chat_id=$1 AND day >= (CURRENT_DATE - 1) AND msg_count > 0
-                    UNION
-                    SELECT user_id FROM user_group_activity
-                      WHERE chat_id=$1 AND updated_at >= NOW() - INTERVAL '24 hours'
-                    UNION
-                    SELECT user_id FROM usage_events
-                      WHERE chat_id=$1 AND user_id IS NOT NULL
-                        AND created_at >= NOW() - INTERVAL '24 hours'
-                ) a
-                LEFT JOIN users u ON u.user_id = a.user_id
-                WHERE a.user_id IS NOT NULL
-                ORDER BY a.user_id
-                """,
-                int(chat_id),
-            )
-        out = []
-        for r in rows:
-            d = dict(r)
-            if d.get('user_id') is None:
-                continue
-            out.append({
-                'user_id': int(d['user_id']),
-                'username': (d.get('username') or '').strip() or None,
-                'first_name': (d.get('first_name') or '').strip() or '',
-            })
-        return out
+            # Prefer multiple simple queries so a missing optional table does not kill all.
+            for sql, args in (
+                (
+                    'SELECT DISTINCT user_id FROM group_user_msgs '
+                    'WHERE chat_id=$1 AND day >= (CURRENT_DATE - 1) AND msg_count > 0',
+                    (int(chat_id),),
+                ),
+                (
+                    'SELECT DISTINCT user_id FROM user_group_activity '
+                    'WHERE chat_id=$1 AND updated_at >= NOW() - INTERVAL '24 hours'',
+                    (int(chat_id),),
+                ),
+                (
+                    'SELECT DISTINCT user_id FROM usage_events '
+                    'WHERE chat_id=$1 AND user_id IS NOT NULL '
+                    'AND created_at >= NOW() - INTERVAL '24 hours'',
+                    (int(chat_id),),
+                ),
+            ):
+                try:
+                    rows = await c.fetch(sql, *args)
+                    for r in rows:
+                        if r['user_id'] is not None:
+                            ids.add(int(r['user_id']))
+                except Exception:
+                    # table may not exist yet on older DBs
+                    continue
+        return await self._users_by_ids(sorted(ids))
 
     async def list_known_group_members(self, chat_id: int) -> list[dict]:
         """All users ever recorded in this group (not a full membership list)."""
+        ids: set[int] = set()
+        async with self._pool().acquire() as c:
+            for sql in (
+                'SELECT DISTINCT user_id FROM group_user_msgs WHERE chat_id=$1',
+                'SELECT DISTINCT user_id FROM user_group_activity WHERE chat_id=$1',
+                'SELECT DISTINCT user_id FROM usage_events WHERE chat_id=$1 AND user_id IS NOT NULL',
+                'SELECT DISTINCT user_id FROM group_nicknames WHERE chat_id=$1',
+            ):
+                try:
+                    rows = await c.fetch(sql, int(chat_id))
+                    for r in rows:
+                        if r['user_id'] is not None:
+                            ids.add(int(r['user_id']))
+                except Exception:
+                    continue
+        return await self._users_by_ids(sorted(ids))
+
+    async def _users_by_ids(self, user_ids: list[int]) -> list[dict]:
+        if not user_ids:
+            return []
         async with self._pool().acquire() as c:
             rows = await c.fetch(
-                """
-                SELECT DISTINCT u.user_id, u.username, u.first_name
-                FROM (
-                    SELECT user_id FROM group_user_msgs WHERE chat_id=$1
-                    UNION
-                    SELECT user_id FROM user_group_activity WHERE chat_id=$1
-                    UNION
-                    SELECT user_id FROM usage_events
-                      WHERE chat_id=$1 AND user_id IS NOT NULL
-                    UNION
-                    SELECT user_id FROM group_nicknames WHERE chat_id=$1
-                ) a
-                LEFT JOIN users u ON u.user_id = a.user_id
-                WHERE a.user_id IS NOT NULL
-                ORDER BY a.user_id
-                """,
-                int(chat_id),
+                'SELECT user_id, username, first_name FROM users WHERE user_id = ANY($1::bigint[])',
+                user_ids,
             )
-        out = []
-        for r in rows:
-            d = dict(r)
-            if d.get('user_id') is None:
-                continue
+        by_id = {int(r['user_id']): dict(r) for r in rows}
+        out: list[dict] = []
+        for uid in user_ids:
+            r = by_id.get(uid) or {}
             out.append({
-                'user_id': int(d['user_id']),
-                'username': (d.get('username') or '').strip() or None,
-                'first_name': (d.get('first_name') or '').strip() or '',
+                'user_id': int(uid),
+                'username': (r.get('username') or '').strip() or None,
+                'first_name': (r.get('first_name') or '').strip() or '',
             })
         return out

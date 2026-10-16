@@ -3558,18 +3558,6 @@ class MegaBot:
         if action not in ('active', 'all'):
             return
 
-        # Anti double-run (15s)
-        now = time.time()
-        last = self._tag_ops.get(group_id, 0)
-        if now - last < 15:
-            await self.safe_edit(
-                chat_id, message_id,
-                '⏳ یک عملیات تگ اخیراً اجرا شده. چند ثانیه صبر کن.',
-                inline([[('✖️ بستن', 'close')]]),
-            )
-            return
-        self._tag_ops[group_id] = now
-
         kind_label = 'فعال ۲۴ ساعت' if action == 'active' else 'سراسری (شناخته‌شده)'
         await self.safe_edit(
             chat_id, message_id,
@@ -3583,11 +3571,11 @@ class MegaBot:
                 members = await self.db.list_active_users_24h(group_id)
             else:
                 members = await self.db.list_known_group_members(group_id)
-        except Exception:
+        except Exception as exc:
             log.exception('tag member list failed')
             await self.safe_edit(
                 chat_id, message_id,
-                '❌ خواندن فهرست کاربران از دیتابیس ناموفق بود.',
+                f'❌ خواندن فهرست کاربران ناموفق بود: {type(exc).__name__}',
                 inline([[('✖️ بستن', 'close')]]),
             )
             return

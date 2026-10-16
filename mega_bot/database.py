@@ -1774,3 +1774,73 @@ class Database:
                 int(limit), int(offset),
             )
         return [dict(r) for r in rows]
+
+    # ── Group tag mentions ──────────────────────────────────────────────
+    async def list_active_users_24h(self, chat_id: int) -> list[dict]:
+        """Users with real recorded activity in this group within ~24 hours."""
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                """
+                SELECT DISTINCT u.user_id, u.username, u.first_name
+                FROM (
+                    SELECT user_id FROM group_user_msgs
+                      WHERE chat_id=$1 AND day >= (CURRENT_DATE - 1) AND msg_count > 0
+                    UNION
+                    SELECT user_id FROM user_group_activity
+                      WHERE chat_id=$1 AND updated_at >= NOW() - INTERVAL '24 hours'
+                    UNION
+                    SELECT user_id FROM usage_events
+                      WHERE chat_id=$1 AND user_id IS NOT NULL
+                        AND created_at >= NOW() - INTERVAL '24 hours'
+                ) a
+                LEFT JOIN users u ON u.user_id = a.user_id
+                WHERE a.user_id IS NOT NULL
+                ORDER BY a.user_id
+                """,
+                int(chat_id),
+            )
+        out = []
+        for r in rows:
+            d = dict(r)
+            if d.get('user_id') is None:
+                continue
+            out.append({
+                'user_id': int(d['user_id']),
+                'username': (d.get('username') or '').strip() or None,
+                'first_name': (d.get('first_name') or '').strip() or '',
+            })
+        return out
+
+    async def list_known_group_members(self, chat_id: int) -> list[dict]:
+        """All users ever recorded in this group (not a full membership list)."""
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                """
+                SELECT DISTINCT u.user_id, u.username, u.first_name
+                FROM (
+                    SELECT user_id FROM group_user_msgs WHERE chat_id=$1
+                    UNION
+                    SELECT user_id FROM user_group_activity WHERE chat_id=$1
+                    UNION
+                    SELECT user_id FROM usage_events
+                      WHERE chat_id=$1 AND user_id IS NOT NULL
+                    UNION
+                    SELECT user_id FROM group_nicknames WHERE chat_id=$1
+                ) a
+                LEFT JOIN users u ON u.user_id = a.user_id
+                WHERE a.user_id IS NOT NULL
+                ORDER BY a.user_id
+                """,
+                int(chat_id),
+            )
+        out = []
+        for r in rows:
+            d = dict(r)
+            if d.get('user_id') is None:
+                continue
+            out.append({
+                'user_id': int(d['user_id']),
+                'username': (d.get('username') or '').strip() or None,
+                'first_name': (d.get('first_name') or '').strip() or '',
+            })
+        return out

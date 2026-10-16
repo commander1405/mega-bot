@@ -910,6 +910,11 @@ class MegaBot:
             await self._cmd_level_profile(chat_id, uid, user, msg, mode='profile')
             return
 
+        # ── Group-wide tag / mention
+        if is_group and text.strip() == 'تگ':
+            await self._cmd_tag_start(chat_id, uid, msg)
+            return
+
         if is_group and text in ('قفل', 'قفل ها', 'قفل‌ها', 'ضد اسپم', 'ضداسپم', 'پنل قفل'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
                 await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
@@ -1538,6 +1543,9 @@ class MegaBot:
             return
         if data == 'lock:sch' or data.startswith('sch:'):
             await self._handle_schedule_callback(uid, chat_id, message_id, data)
+            return
+        if data.startswith('tag:'):
+            await self._handle_tag_callback(uid, chat_id, message_id, data)
             return
         if (
             data.startswith('grp:') or data.startswith('learn:') or data.startswith('fun:')
@@ -2643,7 +2651,16 @@ class MegaBot:
          '• ⏰ قفل زمان‌بندی‌شده گروه (ساعت شروع/پایان و روزها)\n'
          'هر گروه مستقل است. ربات باید حذف پیام و محدودسازی عضو داشته باشد.\n'
          'دسترسی: فقط ادمین گروه / مالک'),
-        ('⚠️ اخطار، بن و پاک‌سازی',
+                ('📢 تگ گروه',
+         'دستور: `تگ` (فقط در گروه)\n'
+         '• تأیید با دکمه، سپس یکی از:\n'
+         '  👥 تگ افراد فعال در ۲۴ ساعت گذشته\n'
+         '  🌐 تگ سراسری اعضای شناخته‌شده توسط ربات\n'
+         '• منشن با `@یوزرنیم` یا لینک `uid` پشتیبانی‌شده بله\n'
+         '• در صورت طولانی بودن، چند پیام ارسال می‌شود\n'
+         '• فهرست کامل اعضای گروه از API بله در دسترس نیست؛ فقط داده‌های ذخیره‌شده\n'
+         'دسترسی: مالک/ادمین واقعی همان گروه'),
+('⚠️ اخطار، بن و پاک‌سازی',
          'با ریپلای یا `@یوزرنیم`:\n'
          '• `اخطار` / `اخطار ۳` — افزودن اخطار\n'
          '• `حذف اخطار` — کم کردن یک اخطار\n'
@@ -3467,6 +3484,214 @@ class MegaBot:
         kb.append([('🔄 تازه‌سازی', f'own:users:{page}')])
         kb.append([('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')])
         await self.safe_edit(chat_id, message_id, body, inline(kb))
+
+
+    # ── Group tag (تگ) ──────────────────────────────────────────────────
+    _tag_ops: dict[int, float] = {}  # chat_id -> last run ts (anti double-run)
+
+    def _tag_mention_token(self, user: dict) -> str | None:
+        """Build a Bale-compatible mention token. Prefer @username; else [name](uid:id)."""
+        uid = int(user.get('user_id') or user.get('id') or 0)
+        if not uid:
+            return None
+        if self.bot_id and uid == self.bot_id:
+            return None
+        if uid == OWNER_ID:
+            pass  # owner can be tagged
+        uname = (user.get('username') or '').strip().lstrip('@')
+        if uname and uname.lower() not in ('channel', 'group', 'bot'):
+            return f'@{uname}'
+        name = (user.get('first_name') or user.get('name') or '').strip() or f'user{uid}'
+        # strip markdown-breaking chars for link label
+        safe = self._md_escape_name(name)[:40]
+        return f'[{safe}](uid:{uid})'
+
+    async def _cmd_tag_start(self, chat_id: int, uid: int, msg: dict) -> None:
+        if not await self._require_group_admin(chat_id, uid):
+            await self.safe_send(
+                chat_id,
+                '⛔ فقط مالک یا ادمین گروه می‌تواند از دستور تگ استفاده کند.',
+                reply_to=msg.get('message_id'),
+                parse_mode=None,
+            )
+            return
+        body = (
+            '⚠️ آیا از انجام عملیات تگ اطمینان دارید؟\n\n'
+            'این عملیات ممکن است پیام‌های زیادی در گروه ارسال کند. '
+            'لطفاً نوع تگ را انتخاب کنید.'
+        )
+        kb = inline([
+            [('👥 تگ افراد فعال در ۲۴ ساعت گذشته', f'tag:{chat_id}:active')],
+            [('🌐 تگ سراسری (اعضای شناخته‌شده)', f'tag:{chat_id}:all')],
+            [('❌ لغو', f'tag:{chat_id}:cancel')],
+        ])
+        await self.safe_send(chat_id, body, keyboard=kb, reply_to=msg.get('message_id'), parse_mode=None)
+
+    async def _handle_tag_callback(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
+        # data: tag:{group_id}:active|all|cancel
+        parts = data.split(':')
+        if len(parts) < 3:
+            return
+        try:
+            group_id = int(parts[1])
+        except ValueError:
+            return
+        action = parts[2]
+        # Must match the chat where the button was pressed
+        if int(chat_id) != group_id:
+            await self.safe_send(chat_id, '⛔ این عملیات فقط در همان گروه معتبر است.', parse_mode=None)
+            return
+        if not await self._require_group_admin(group_id, uid):
+            await self.safe_edit(
+                chat_id, message_id,
+                '⛔ دسترسی ادمین برای این عملیات لازم است.',
+                inline([[('✖️ بستن', 'close')]]),
+            )
+            return
+        if action == 'cancel':
+            await self.safe_edit(
+                chat_id, message_id,
+                '❌ عملیات تگ لغو شد.',
+                inline([[('✖️ بستن', 'close')]]),
+            )
+            return
+        if action not in ('active', 'all'):
+            return
+
+        # Anti double-run (15s)
+        now = time.time()
+        last = self._tag_ops.get(group_id, 0)
+        if now - last < 15:
+            await self.safe_edit(
+                chat_id, message_id,
+                '⏳ یک عملیات تگ اخیراً اجرا شده. چند ثانیه صبر کن.',
+                inline([[('✖️ بستن', 'close')]]),
+            )
+            return
+        self._tag_ops[group_id] = now
+
+        kind_label = 'فعال ۲۴ ساعت' if action == 'active' else 'سراسری (شناخته‌شده)'
+        await self.safe_edit(
+            chat_id, message_id,
+            f'⏳ در حال آماده‌سازی تگ ({kind_label})…',
+            inline([]),
+        )
+
+        bot_id = getattr(self, 'bot_id', None)
+        try:
+            if action == 'active':
+                members = await self.db.list_active_users_24h(group_id)
+            else:
+                members = await self.db.list_known_group_members(group_id)
+        except Exception:
+            log.exception('tag member list failed')
+            await self.safe_edit(
+                chat_id, message_id,
+                '❌ خواندن فهرست کاربران از دیتابیس ناموفق بود.',
+                inline([[('✖️ بستن', 'close')]]),
+            )
+            return
+
+        # Dedupe + filter bot
+        seen: set[int] = set()
+        tokens: list[str] = []
+        for m in members:
+            mid = int(m.get('user_id') or 0)
+            if not mid or mid in seen:
+                continue
+            if bot_id and mid == bot_id:
+                continue
+            seen.add(mid)
+            tok = self._tag_mention_token(m)
+            if tok:
+                tokens.append(tok)
+
+        if not tokens:
+            msg = (
+                'ℹ️ هیچ کاربر قابل‌تگی پیدا نشد.\n'
+                if action == 'active'
+                else 'ℹ️ عضو شناخته‌شده‌ای برای تگ در دیتابیس نیست.\n'
+            )
+            msg += (
+                'ربات فقط کسانی را می‌تواند تگ کند که قبلاً در این گروه فعالیتشان ثبت شده '
+                'و شناسه معتبر دارند. فهرست کامل اعضای گروه از API بله در دسترس نیست.'
+            )
+            await self.safe_edit(chat_id, message_id, msg, inline([[('✖️ بستن', 'close')]]))
+            return
+
+        # Chunk by character limit (~3500 safe for Bale)
+        max_len = 3500
+        chunks: list[str] = []
+        buf: list[str] = []
+        size = 0
+        for tok in tokens:
+            add = len(tok) + (1 if buf else 0)
+            if buf and size + add > max_len:
+                chunks.append(' '.join(buf))
+                buf = [tok]
+                size = len(tok)
+            else:
+                buf.append(tok)
+                size += add
+        if buf:
+            chunks.append(' '.join(buf))
+
+        sent_ok = 0
+        sent_fail = 0
+        for i, chunk in enumerate(chunks):
+            header = f'📢 تگ ({kind_label}) — بخش {i + 1}/{len(chunks)}\n\n' if len(chunks) > 1 else f'📢 تگ ({kind_label})\n\n'
+            text = header + chunk
+            try:
+                # Markdown for [name](uid:…) tokens; @username is fine either way
+                r = await self.safe_send(chat_id, text, parse_mode='Markdown', permanent=True)
+                if r:
+                    sent_ok += 1
+                else:
+                    sent_fail += 1
+                    # retry plain
+                    r2 = await self.safe_send(chat_id, text, parse_mode=None, permanent=True)
+                    if r2:
+                        sent_ok += 1
+                        sent_fail -= 1
+            except Exception:
+                log.exception('tag chunk send failed')
+                sent_fail += 1
+            if i < len(chunks) - 1:
+                await asyncio.sleep(0.35)
+
+        note = ''
+        if action == 'all':
+            note = (
+                '\n\nℹ️ تگ سراسری فقط شامل اعضای *شناخته‌شده توسط ربات* است '
+                '(نه لزوماً همهٔ اعضای گروه). API بله فهرست کامل اعضا را در اختیار نمی‌گذارد.'
+            )
+        summary = (
+            f'✅ عملیات تگ تمام شد.\n'
+            f'نوع: {kind_label}\n'
+            f'کاربران انتخاب‌شده: *{len(tokens)}*\n'
+            f'پیام‌های ارسال‌شده: *{sent_ok}*'
+            + (f'\nپیام ناموفق: *{sent_fail}*' if sent_fail else '')
+            + note
+        )
+        try:
+            await self.safe_edit(chat_id, message_id, summary, inline([[('✖️ بستن', 'close')]]))
+        except Exception:
+            await self.safe_send(chat_id, summary, permanent=True)
+
+        # Audit (best-effort)
+        try:
+            async with self.db._pool().acquire() as c:
+                await c.execute(
+                    'INSERT INTO audit_logs(actor_id, action, target_type, target_id, details) '
+                    'VALUES($1,$2,$3,$4,$5)',
+                    int(uid),
+                    f'tag_{action}',
+                    'group',
+                    int(group_id),
+                    {'users': len(tokens), 'chunks_ok': sent_ok, 'chunks_fail': sent_fail},
+                )
+        except Exception:
+            log.debug('tag audit failed', exc_info=True)
 
     async def show_admin(self, chat_id: int, uid: int, owner: bool, edit_id: int | None = None, page: int = 0) -> None:
         if not owner:

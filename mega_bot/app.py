@@ -241,14 +241,13 @@ class MegaBot:
         return None
 
     @staticmethod
-    def _is_channel_chat(self, chat: dict | None) -> bool:
+    def _is_channel_chat(chat: dict | None) -> bool:
         """True for broadcast channels — no commands/welcome/leave there."""
         if not chat:
             return False
         t = (chat.get('type') or '').lower().strip()
         if t in ('channel', 'broadcast'):
             return True
-        # Some gateways mark channels with sender_chat only; id alone is unreliable.
         return False
 
     def _donation_announce_channel(self) -> str:
@@ -257,9 +256,9 @@ class MegaBot:
         env = (os.getenv('DONATION_ANNOUNCE_CHANNEL') or '').strip()
         if env:
             return env
-        # Default: https://ble.ir/darkknight_studio
         return '@darkknight_studio'
 
+    @staticmethod
     def _is_group_chat(chat: dict) -> bool:
         t = (chat.get('type') or '').lower().strip()
         if t in ('group', 'supergroup', 'megagroup', 'chat'):

@@ -3921,39 +3921,56 @@ class MegaBot:
         self,
         chat_id: int,
         data: bytes,
-        filename: str = 'sticker.png',
+        filename: str = 'sticker.webp',
         caption: str | None = None,
     ) -> bool:
-        """Always try to put the image in the chat. Returns True if any method worked."""
-        cap = caption or 'استیکر آماده‌شده'
-        # 1) Document — most reliable for arbitrary PNG in Bale
-        try:
-            await self.api.send_document_file(chat_id, data, filename=filename, caption=cap)
-            return True
-        except Exception as exc:
-            log.warning('sticker deliver document failed: %s', exc)
-        # 2) Photo
-        try:
-            await self.api.send_photo_bytes(
-                chat_id, data,
-                filename='sticker.png' if not filename.endswith('.png') else filename,
-                caption=cap,
-            )
-            return True
-        except Exception as exc:
-            log.warning('sticker deliver photo failed: %s', exc)
-        # 3) sendSticker last (only works if server accepts file as sticker)
+        """Prefer real sticker message; only then fall back to document/photo."""
+        # 1) sendSticker with binary (WEBP/PNG) — must be first
         try:
             await self.api.send_sticker_file(chat_id, data, filename)
             return True
         except Exception as exc:
-            log.warning('sticker deliver sendSticker failed: %s', exc)
-        await self.safe_send(
-            chat_id,
-            '⚠️ پردازش شد ولی نمایش فایل در چت ممکن نشد. دوباره به‌صورت *سند* بفرست.',
-            parse_mode='Markdown',
-        )
+            log.warning('sendSticker(bytes) failed: %s', exc)
+        # 2) photo (visible but not sticker UI)
+        try:
+            await self.api.send_photo_bytes(
+                chat_id, data,
+                filename='sticker.png',
+                caption=caption or 'پیش‌نمایش استیکر (هنوز به‌صورت استیکر رسمی نیست)',
+            )
+            return True
+        except Exception as exc:
+            log.warning('sendPhoto sticker preview failed: %s', exc)
+        # 3) document last resort
+        try:
+            await self.api.send_document_file(
+                chat_id, data, filename=filename,
+                caption=caption or 'فایل استیکر',
+            )
+            return True
+        except Exception as exc:
+            log.warning('sendDocument sticker failed: %s', exc)
+        await self.safe_send(chat_id, '⚠️ نمایش استیکر در چت ممکن نشد.', parse_mode=None)
         return False
+
+    async def _send_sticker_from_set(self, chat_id: int, set_name: str) -> bool:
+        """After create/add, fetch set and send last sticker as real sticker."""
+        try:
+            info = await self.api.get_sticker_set(set_name)
+            if isinstance(info, dict) and 'stickers' not in info and isinstance(info.get('result'), dict):
+                info = info['result']
+            stickers = (info or {}).get('stickers') or []
+            if not stickers:
+                return False
+            last = stickers[-1]
+            fid = last.get('file_id') if isinstance(last, dict) else None
+            if not fid:
+                return False
+            await self.api.send_sticker_by_id(chat_id, fid)
+            return True
+        except Exception as exc:
+            log.warning('send from set failed: %s', exc)
+            return False
 
     def _sticker_file_help(self) -> str:
         return (
@@ -4136,9 +4153,18 @@ class MegaBot:
                     + 'استیکر بالا در چت هم برات فرستاده شد. '
                     + 'می‌توانی فایل بعدی را بفرستی یا کار را تمام کنی.'
                 )
+                # Real sticker message via file_id from the set
+                sent_as_sticker = await self._send_sticker_from_set(chat_id, set_name)
+                if not sent_as_sticker:
+                    await self._deliver_sticker_preview(chat_id, prepared, out_name)
+                note = (
+                    'استیکر به‌صورت استیکر رسمی در چت ارسال شد.'
+                    if sent_as_sticker
+                    else 'ثبت بسته انجام شد؛ اگر به‌صورت استیکر دیده نشد، API بله sendSticker را محدود کرده.'
+                )
                 await self.safe_send(
                     chat_id,
-                    ok_msg,
+                    ok_msg + chr(10) + note,
                     inline([
                         [('➕ افزودن استیکر دیگر', 'stk:more')],
                         [('✅ پایان', 'stk:done'), ('🎨 منوی استیکر', 'stk:menu')],

@@ -482,6 +482,10 @@ class BaleAPI:
         })
 
     # ── Stickers ────────────────────────────────────────────────────────
+    async def send_sticker_by_id(self, chat_id: int, file_id: str) -> dict:
+        """Send an existing sticker by file_id (true sticker message)."""
+        return await self.call('sendSticker', {'chat_id': int(chat_id), 'sticker': file_id}, retries=0)
+
     async def send_sticker_file(self, chat_id: int, data: bytes, filename: str = 'sticker.png') -> dict:
         session = await self._ensure_session()
         form = aiohttp.FormData()

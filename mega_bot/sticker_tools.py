@@ -1,4 +1,4 @@
-"""Prepare static stickers for Bale (Telegram-compatible static sticker rules)."""
+"""Static sticker prep: 512x512 transparent canvas, PNG (and WEBP if available)."""
 from __future__ import annotations
 
 import io
@@ -8,13 +8,28 @@ from pathlib import Path
 from PIL import Image
 
 MAX_INPUT_BYTES = 30 * 1024 * 1024
-MAX_STICKER_SIDE = 512
+SIDE = 512
 MAX_STATIC_BYTES = 512 * 1024
 ALLOWED_EXT = {'.png', '.jpg', '.jpeg', '.webp', '.gif'}
 
 
+def _fit_on_canvas(img: Image.Image) -> Image.Image:
+    """Scale image so longest side is 512, pad to exactly 512x512 with transparency."""
+    img = img.convert('RGBA')
+    w, h = img.size
+    if w < 1 or h < 1:
+        raise ValueError('ابعاد تصویر نامعتبر است.')
+    scale = SIDE / max(w, h)
+    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+    if (nw, nh) != (w, h):
+        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+    canvas = Image.new('RGBA', (SIDE, SIDE), (0, 0, 0, 0))
+    canvas.paste(img, ((SIDE - nw) // 2, (SIDE - nh) // 2), img)
+    return canvas
+
+
 def prepare_static_sticker(data: bytes, filename: str = 'sticker.png') -> tuple[bytes, str]:
-    """Return PNG bytes where the longer side is exactly 512px, size <= 512KB when possible."""
+    """Return sticker bytes. Prefer WEBP 512x512; fallback PNG 512x512."""
     if not data:
         raise ValueError('فایل خالی است.')
     if len(data) > MAX_INPUT_BYTES:
@@ -24,43 +39,40 @@ def prepare_static_sticker(data: bytes, filename: str = 'sticker.png') -> tuple[
         img.load()
     except Exception as exc:
         raise ValueError(f'فایل تصویر معتبر نیست ({type(exc).__name__}).') from exc
-
     if getattr(img, 'is_animated', False):
         try:
             img.seek(0)
         except Exception:
             pass
-    img = img.convert('RGBA')
+    canvas = _fit_on_canvas(img)
 
-    w, h = img.size
-    if w < 1 or h < 1:
-        raise ValueError('ابعاد تصویر نامعتبر است.')
+    # Try lossless WEBP (best for sendSticker on Telegram-like APIs)
+    try:
+        out = io.BytesIO()
+        canvas.save(out, format='WEBP', lossless=True, quality=100, method=6)
+        raw = out.getvalue()
+        if 0 < len(raw) <= MAX_STATIC_BYTES:
+            return raw, 'sticker.webp'
+        out = io.BytesIO()
+        canvas.save(out, format='WEBP', quality=80, method=4)
+        raw = out.getvalue()
+        if 0 < len(raw) <= MAX_STATIC_BYTES * 2:
+            return raw, 'sticker.webp'
+    except Exception:
+        pass
 
-    # Scale so the longer side is exactly 512
-    if w >= h:
-        nw, nh = MAX_STICKER_SIDE, max(1, round(h * (MAX_STICKER_SIDE / w)))
-    else:
-        nh, nw = MAX_STICKER_SIDE, max(1, round(w * (MAX_STICKER_SIDE / h)))
-    if (nw, nh) != (w, h):
-        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
-
-    # PNG first (required by classic png_sticker)
+    # PNG with optional quantization
     for colors in (None, 256, 128, 64):
         out = io.BytesIO()
         if colors:
-            quantized = img.quantize(colors=colors, method=Image.Quantize.MEDIANCUT).convert('RGBA')
-            quantized.save(out, format='PNG', optimize=True)
+            q = canvas.quantize(colors=colors, method=Image.Quantize.MEDIANCUT).convert('RGBA')
+            q.save(out, format='PNG', optimize=True)
         else:
-            img.save(out, format='PNG', optimize=True)
+            canvas.save(out, format='PNG', optimize=True)
         raw = out.getvalue()
         if len(raw) <= MAX_STATIC_BYTES:
             return raw, 'sticker.png'
-
-    # Last resort: WEBP under 512KB (some gateways accept as document preview)
-    out = io.BytesIO()
-    img.save(out, format='WEBP', quality=70, method=4)
-    raw = out.getvalue()
-    return raw, 'sticker.webp'
+    return raw, 'sticker.png'
 
 
 def extract_zip_images(data: bytes, max_files: int = 40) -> list[tuple[str, bytes]]:
@@ -70,8 +82,6 @@ def extract_zip_images(data: bytes, max_files: int = 40) -> list[tuple[str, byte
         zf = zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile as exc:
         raise ValueError('فایل ZIP معتبر نیست.') from exc
-    if len(zf.namelist()) > 400:
-        raise ValueError('تعداد فایل داخل ZIP زیاد است.')
     out: list[tuple[str, bytes]] = []
     total = 0
     for info in zf.infolist():
@@ -81,8 +91,6 @@ def extract_zip_images(data: bytes, max_files: int = 40) -> list[tuple[str, byte
         if name.startswith('/') or '..' in Path(name).parts:
             continue
         if Path(name).suffix.lower() not in ALLOWED_EXT:
-            continue
-        if info.file_size > MAX_INPUT_BYTES:
             continue
         total += info.file_size
         if total > MAX_INPUT_BYTES * 3:

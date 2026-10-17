@@ -405,32 +405,6 @@ class BaleAPI:
             payload['parse_mode'] = parse_mode
         return await self.call('sendVideo', payload, retries=0)
 
-    async def send_sticker_file(
-        self,
-        chat_id: int,
-        data: bytes,
-        filename: str = 'sticker.png',
-    ) -> dict:
-        """Upload and send a sticker/document so the user can see/save it."""
-        session = await self._ensure_session()
-        form = aiohttp.FormData()
-        form.add_field('chat_id', str(chat_id))
-        ctype = 'image/png' if filename.endswith('.png') else 'image/webp'
-        form.add_field('sticker', data, filename=filename, content_type=ctype)
-        async with session.post(
-            self.base + 'sendSticker',
-            data=form,
-            timeout=aiohttp.ClientTimeout(total=120, connect=20),
-        ) as response:
-            raw = await response.text()
-            try:
-                result = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise BaleAPIError(f'sendSticker non-JSON HTTP {response.status}') from exc
-            if response.status >= 400 or not result.get('ok', False):
-                raise BaleAPIError(f"sendSticker: {result.get('description', result)}")
-            return result.get('result', result)
-
     async def send_document_file(
         self,
         chat_id: int,
@@ -507,28 +481,59 @@ class BaleAPI:
             'permissions': permissions,
         })
 
-    # ── Stickers (Bale mirrors Telegram Bot API style where available) ──
-    async def upload_sticker_file(self, user_id: int, data: bytes, filename: str = 'sticker.webp') -> dict:
-        """uploadStickerFile — returns File with file_id."""
+    # ── Stickers ────────────────────────────────────────────────────────
+    async def send_sticker_file(self, chat_id: int, data: bytes, filename: str = 'sticker.png') -> dict:
         session = await self._ensure_session()
         form = aiohttp.FormData()
-        form.add_field('user_id', str(int(user_id)))
-        ctype = 'image/webp' if filename.endswith('.webp') else 'image/png'
-        form.add_field('png_sticker', data, filename=filename, content_type=ctype)
-        # Some servers expect sticker field name "sticker"
+        form.add_field('chat_id', str(chat_id))
+        ctype = 'image/png' if filename.endswith('.png') else 'image/webp'
+        form.add_field('sticker', data, filename=filename, content_type=ctype)
         async with session.post(
-            self.base + 'uploadStickerFile',
-            data=form,
-            timeout=aiohttp.ClientTimeout(total=120, connect=20),
+            self.base + 'sendSticker', data=form,
+            timeout=aiohttp.ClientTimeout(total=90, connect=20),
         ) as response:
             raw = await response.text()
             try:
                 result = json.loads(raw)
             except json.JSONDecodeError as exc:
-                raise BaleAPIError(f'uploadStickerFile non-JSON HTTP {response.status}') from exc
-            if response.status >= 400 or not result.get('ok', False):
-                raise BaleAPIError(f"uploadStickerFile: {result.get('description', result)}")
+                raise BaleAPIError(f'sendSticker non-JSON HTTP {response.status}') from exc
+            if not result.get('ok'):
+                raise BaleAPIError(f"sendSticker: {result.get('description', result)}")
             return result.get('result', result)
+
+    async def upload_sticker_file(self, user_id: int, data: bytes, filename: str = 'sticker.png') -> str:
+        """uploadStickerFile — Balethon uses field name `sticker`. Returns file_id."""
+        session = await self._ensure_session()
+        errors: list[str] = []
+        for field in ('sticker', 'png_sticker'):
+            form = aiohttp.FormData()
+            form.add_field('user_id', str(int(user_id)))
+            # modern API may want sticker_format=static
+            form.add_field('sticker_format', 'static')
+            ctype = 'image/png' if filename.endswith('.png') else 'image/webp'
+            form.add_field(field, data, filename=filename, content_type=ctype)
+            try:
+                async with session.post(
+                    self.base + 'uploadStickerFile', data=form,
+                    timeout=aiohttp.ClientTimeout(total=120, connect=20),
+                ) as response:
+                    raw = await response.text()
+                    try:
+                        result = json.loads(raw)
+                    except json.JSONDecodeError:
+                        errors.append(f'{field}:non-json:{response.status}')
+                        continue
+                    if result.get('ok'):
+                        file_obj = result.get('result') or {}
+                        fid = file_obj.get('file_id') if isinstance(file_obj, dict) else None
+                        if fid:
+                            return str(fid)
+                        errors.append(f'{field}:no-file_id:{result}')
+                    else:
+                        errors.append(f"{field}:{result.get('description', result)}")
+            except Exception as exc:
+                errors.append(f'{field}:{type(exc).__name__}:{exc}')
+        raise BaleAPIError('uploadStickerFile failed: ' + ' | '.join(errors[:5]))
 
     async def create_new_sticker_set(
         self,
@@ -539,40 +544,57 @@ class BaleAPI:
         emojis: str,
         filename: str = 'sticker.png',
     ) -> bool:
-        """Try several Bale/Telegram-compatible multipart shapes."""
+        """Classic Telegram-style: png_sticker multipart + emojis. Also try file_id path."""
         session = await self._ensure_session()
         errors: list[str] = []
-        field_names = ['png_sticker', 'sticker']
-        if filename.endswith('.webp'):
-            field_names = ['png_sticker', 'sticker', 'webp_sticker']
-        for field in field_names:
+
+        # Path A: upload first, then create with file_id string
+        try:
+            fid = await self.upload_sticker_file(user_id, data, filename)
+            payload = {
+                'user_id': int(user_id),
+                'name': name,
+                'title': title,
+                'emojis': emojis,
+                'png_sticker': fid,
+            }
+            result = await self.call('createNewStickerSet', payload, retries=0)
+            if result is True or result is False:
+                return bool(result)
+            if isinstance(result, dict) and result.get('ok'):
+                return True
+            # call() usually returns result field already
+            if result:
+                return True
+        except Exception as exc:
+            errors.append(f'upload+id:{self._redact(str(exc))}')
+
+        # Path B: multipart png_sticker bytes
+        for field in ('png_sticker', 'sticker'):
             form = aiohttp.FormData()
             form.add_field('user_id', str(int(user_id)))
             form.add_field('name', name)
             form.add_field('title', title)
             form.add_field('emojis', emojis)
-            ctype = 'image/png' if filename.endswith('.png') else (
-                'image/webp' if filename.endswith('.webp') else 'application/octet-stream'
-            )
+            ctype = 'image/png' if filename.endswith('.png') else 'image/webp'
             form.add_field(field, data, filename=filename, content_type=ctype)
             try:
                 async with session.post(
-                    self.base + 'createNewStickerSet',
-                    data=form,
+                    self.base + 'createNewStickerSet', data=form,
                     timeout=aiohttp.ClientTimeout(total=120, connect=20),
                 ) as response:
                     raw = await response.text()
                     try:
                         result = json.loads(raw)
                     except json.JSONDecodeError:
-                        errors.append(f'{field}:HTTP{response.status}:non-json')
+                        errors.append(f'{field}:non-json')
                         continue
                     if result.get('ok'):
                         return True
-                    errors.append(f"{field}:{result.get('description') or result}")
+                    errors.append(f"{field}:{result.get('description', result)}")
             except Exception as exc:
                 errors.append(f'{field}:{type(exc).__name__}')
-        raise BaleAPIError('createNewStickerSet failed: ' + ' | '.join(errors[:4]))
+        raise BaleAPIError('createNewStickerSet failed: ' + ' | '.join(errors[:6]))
 
     async def add_sticker_to_set(
         self,
@@ -584,6 +606,18 @@ class BaleAPI:
     ) -> bool:
         session = await self._ensure_session()
         errors: list[str] = []
+        try:
+            fid = await self.upload_sticker_file(user_id, data, filename)
+            result = await self.call(
+                'addStickerToSet',
+                {'user_id': int(user_id), 'name': name, 'emojis': emojis, 'png_sticker': fid},
+                retries=0,
+            )
+            if result is True or (isinstance(result, dict) and result.get('ok')) or result:
+                return True
+        except Exception as exc:
+            errors.append(f'upload+id:{self._redact(str(exc))}')
+
         for field in ('png_sticker', 'sticker'):
             form = aiohttp.FormData()
             form.add_field('user_id', str(int(user_id)))
@@ -593,8 +627,7 @@ class BaleAPI:
             form.add_field(field, data, filename=filename, content_type=ctype)
             try:
                 async with session.post(
-                    self.base + 'addStickerToSet',
-                    data=form,
+                    self.base + 'addStickerToSet', data=form,
                     timeout=aiohttp.ClientTimeout(total=120, connect=20),
                 ) as response:
                     raw = await response.text()
@@ -605,10 +638,10 @@ class BaleAPI:
                         continue
                     if result.get('ok'):
                         return True
-                    errors.append(f"{field}:{result.get('description') or result}")
+                    errors.append(f"{field}:{result.get('description', result)}")
             except Exception as exc:
                 errors.append(f'{field}:{type(exc).__name__}')
-        raise BaleAPIError('addStickerToSet failed: ' + ' | '.join(errors[:4]))
+        raise BaleAPIError('addStickerToSet failed: ' + ' | '.join(errors[:6]))
 
     async def get_sticker_set(self, name: str) -> dict:
         return await self.call('getStickerSet', {'name': name}, retries=0)
@@ -616,3 +649,4 @@ class BaleAPI:
     async def delete_sticker_from_set(self, sticker_file_id: str) -> bool:
         r = await self.call('deleteStickerFromSet', {'sticker': sticker_file_id}, retries=0)
         return bool(r)
+

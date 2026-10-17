@@ -1566,7 +1566,18 @@ class MegaBot:
             await self._handle_schedule_callback(uid, chat_id, message_id, data)
             return
         if data.startswith('stk:'):
-            await self._handle_sticker_callback(uid, chat_id, message_id, data)
+            try:
+                await self._handle_sticker_callback(uid, chat_id, message_id, data)
+            except Exception as exc:
+                log.exception('sticker callback failed data=%s', data)
+                try:
+                    await self.safe_send(
+                        chat_id,
+                        f'❌ عملیات استیکر ناموفق بود: `{self._short(exc)}`',
+                        parse_mode='Markdown',
+                    )
+                except Exception:
+                    pass
             return
         if data.startswith('tag:'):
             await self._handle_tag_callback(uid, chat_id, message_id, data)
@@ -3912,26 +3923,37 @@ class MegaBot:
         data: bytes,
         filename: str = 'sticker.png',
         caption: str | None = None,
-    ) -> None:
-        """Best-effort: send sticker so user always sees the result in PV."""
-        # 1) sendSticker
+    ) -> bool:
+        """Always try to put the image in the chat. Returns True if any method worked."""
+        cap = caption or 'استیکر آماده‌شده'
+        # 1) Document — most reliable for arbitrary PNG in Bale
+        try:
+            await self.api.send_document_file(chat_id, data, filename=filename, caption=cap)
+            return True
+        except Exception as exc:
+            log.warning('sticker deliver document failed: %s', exc)
+        # 2) Photo
+        try:
+            await self.api.send_photo_bytes(
+                chat_id, data,
+                filename='sticker.png' if not filename.endswith('.png') else filename,
+                caption=cap,
+            )
+            return True
+        except Exception as exc:
+            log.warning('sticker deliver photo failed: %s', exc)
+        # 3) sendSticker last (only works if server accepts file as sticker)
         try:
             await self.api.send_sticker_file(chat_id, data, filename)
-            return
+            return True
         except Exception as exc:
-            log.info('sendSticker failed: %s', exc)
-        # 2) document
-        try:
-            await self.api.send_document_file(chat_id, data, filename=filename, caption=caption or 'استیکر')
-            return
-        except Exception as exc:
-            log.info('sendDocument sticker failed: %s', exc)
-        # 3) photo
-        try:
-            await self.api.send_photo_bytes(chat_id, data, filename=filename if filename.endswith('.png') else 'sticker.png', caption=caption or 'استیکر')
-        except Exception as exc:
-            log.warning('all sticker deliver methods failed: %s', exc)
-            await self.safe_send(chat_id, 'نتوانستم فایل استیکر را در چت نمایش بدهم.', parse_mode=None)
+            log.warning('sticker deliver sendSticker failed: %s', exc)
+        await self.safe_send(
+            chat_id,
+            '⚠️ پردازش شد ولی نمایش فایل در چت ممکن نشد. دوباره به‌صورت *سند* بفرست.',
+            parse_mode='Markdown',
+        )
+        return False
 
     def _sticker_file_help(self) -> str:
         return (

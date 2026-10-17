@@ -38,24 +38,30 @@ def prepare_static_sticker(data: bytes, filename: str = 'sticker.png') -> tuple[
     if scale != 1.0:
         nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
         img = img.resize((nw, nh), Image.Resampling.LANCZOS)
-    # Prefer WEBP
+    # Prefer PNG for Bale createNewStickerSet / addStickerToSet compatibility
     out = io.BytesIO()
-    quality = 90
-    while quality >= 40:
-        out.seek(0)
-        out.truncate(0)
-        img.save(out, format='WEBP', quality=quality, method=4)
-        if out.tell() <= MAX_STATIC_BYTES:
+    img.save(out, format='PNG', optimize=True)
+    raw = out.getvalue()
+    if len(raw) <= MAX_STATIC_BYTES:
+        return raw, 'sticker.png'
+    # Compress via WEBP then re-export PNG if still large
+    wout = io.BytesIO()
+    quality = 85
+    while quality >= 35:
+        wout.seek(0)
+        wout.truncate(0)
+        img.save(wout, format='WEBP', quality=quality, method=4)
+        if wout.tell() <= MAX_STATIC_BYTES:
             break
         quality -= 10
-    raw = out.getvalue()
-    if len(raw) > MAX_STATIC_BYTES * 2:
-        # fallback PNG
+    try:
+        wimg = Image.open(io.BytesIO(wout.getvalue())).convert('RGBA')
         out = io.BytesIO()
-        img.save(out, format='PNG', optimize=True)
+        wimg.save(out, format='PNG', optimize=True)
         raw = out.getvalue()
         return raw, 'sticker.png'
-    return raw, 'sticker.webp'
+    except Exception:
+        return wout.getvalue(), 'sticker.webp'
 
 
 def extract_zip_images(data: bytes, max_files: int = 50) -> list[tuple[str, bytes]]:

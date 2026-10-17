@@ -3905,6 +3905,34 @@ class MegaBot:
             await self.safe_edit(chat_id, message_id, '✅ ساخت/ویرایش بسته تمام شد.', inline([[('🎨 منوی استیکر', 'stk:menu'), ('🏠 خانه', 'home')]]))
             return
 
+
+    async def _deliver_sticker_preview(
+        self,
+        chat_id: int,
+        data: bytes,
+        filename: str = 'sticker.png',
+        caption: str | None = None,
+    ) -> None:
+        """Best-effort: send sticker so user always sees the result in PV."""
+        # 1) sendSticker
+        try:
+            await self.api.send_sticker_file(chat_id, data, filename)
+            return
+        except Exception as exc:
+            log.info('sendSticker failed: %s', exc)
+        # 2) document
+        try:
+            await self.api.send_document_file(chat_id, data, filename=filename, caption=caption or 'استیکر')
+            return
+        except Exception as exc:
+            log.info('sendDocument sticker failed: %s', exc)
+        # 3) photo
+        try:
+            await self.api.send_photo_bytes(chat_id, data, filename=filename if filename.endswith('.png') else 'sticker.png', caption=caption or 'استیکر')
+        except Exception as exc:
+            log.warning('all sticker deliver methods failed: %s', exc)
+            await self.safe_send(chat_id, 'نتوانستم فایل استیکر را در چت نمایش بدهم.', parse_mode=None)
+
     def _sticker_file_help(self) -> str:
         return (
             'فایل *عکس* را به‌صورت *فایل/سند* بفرست (نه به‌صورت عکس فشرده).\n\n'
@@ -4025,9 +4053,12 @@ class MegaBot:
             st['out_name'] = out_name
             st['step'] = 'stk_emoji'
             self.states[uid] = st
+            # Always show the processed sticker in chat
+            await self._deliver_sticker_preview(chat_id, prepared, out_name)
             await self.safe_send(
                 chat_id,
-                '✅ فایل آماده شد. حالا یک ایموجی مرتبط با این استیکر بفرست (مثلاً 😎).',
+                '✅ فایل آماده شد و همین‌جا برات فرستادم.\n'
+                'حالا یک ایموجی مرتبط با این استیکر بفرست (مثلاً 😎).',
                 inline([[('❌ لغو', 'stk:menu')]]),
             )
             return True
@@ -4050,6 +4081,8 @@ class MegaBot:
                 await self.safe_send(chat_id, 'وضعیت ساخت ناقص بود؛ از منو دوباره شروع کن.', parse_mode=None)
                 return True
             await self.safe_send(chat_id, '⏳ در حال ثبت استیکر در بله…', parse_mode=None)
+            # Always deliver the sticker asset to the user first
+            await self._deliver_sticker_preview(chat_id, prepared, out_name, caption='استیکر آماده‌شده')
             ok = False
             err = ''
             try:
@@ -4074,34 +4107,36 @@ class MegaBot:
                 st['step'] = 'stk_file'
                 st['mode'] = 'add'
                 self.states[uid] = st
+                ok_msg = (
+                    '🥳 ثبت در API بله موفق بود.' + chr(10)
+                    + f'نام فنی بسته: `{set_name}`' + chr(10)
+                    + f'ایموجی: {emoji}' + chr(10) + chr(10)
+                    + 'استیکر بالا در چت هم برات فرستاده شد. '
+                    + 'می‌توانی فایل بعدی را بفرستی یا کار را تمام کنی.'
+                )
                 await self.safe_send(
                     chat_id,
-                    f'🥳 استیکر به بسته اضافه شد.\n'
-                    f'نام فنی بسته: `{set_name}`\n\n'
-                    'می‌توانی فایل بعدی را بفرستی یا کار را تمام کنی.',
+                    ok_msg,
                     inline([
                         [('➕ افزودن استیکر دیگر', 'stk:more')],
                         [('✅ پایان', 'stk:done'), ('🎨 منوی استیکر', 'stk:menu')],
                     ]),
                 )
             else:
-                # fallback: deliver file
-                try:
-                    await self.api.send_document_file(
-                        chat_id, prepared, filename=out_name,
-                        caption='استیکر پردازش شد اما ثبت خودکار در بسته بله موفق نبود. فایل آماده را ذخیره/اضافه دستی کن.',
-                    )
-                except Exception:
-                    try:
-                        await self.api.send_photo_bytes(chat_id, prepared, caption='خروجی استیکر')
-                    except Exception as exc2:
-                        err = err or self._short(exc2)
+                fail_msg = '⚠️ ثبت خودکار بسته در API بله ناموفق بود'
+                if err:
+                    fail_msg += ':' + chr(10) + '`' + str(err) + '`'
+                else:
+                    fail_msg += '.'
+                fail_msg += (
+                    chr(10) + chr(10)
+                    + 'استیکر پردازش‌شده در پیام بالا برات ارسال شد؛ '
+                    + 'می‌توانی آن را ذخیره کنی. افزودن مستقیم به مجموعه شخصی '
+                    + 'فقط وقتی API بله createNewStickerSet را بپذیرد ممکن است.'
+                )
                 await self.safe_send(
                     chat_id,
-                    '⚠️ ثبت خودکار بسته/استیکر در API بله ناموفق بود'
-                    + (f':\n`{err}`' if err else '.')
-                    + '\nفایل آماده‌شده (در صورت امکان) برایت ارسال شد. '
-                    'افزودن خودکار به استیکرهای شخصی فقط در صورت پشتیبانی سرور بله ممکن است.',
+                    fail_msg,
                     inline([[('🎨 منوی استیکر', 'stk:menu'), ('🏠 خانه', 'home')]]),
                 )
                 self.states.pop(uid, None)

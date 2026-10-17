@@ -6,11 +6,11 @@ class PureLogicTests(unittest.TestCase):
         rows = USER_KEYBOARD['keyboard']
         self.assertEqual(sum(len(row) for row in rows), 5)
         labels = [button['text'] for row in rows for button in row]
-        self.assertIn('🆘 پشتیبانی', labels)
-        self.assertIn('💚 حمایت مالی', labels)
-        self.assertIn('👨‍💻 تیم توسعه', labels)
-        self.assertIn('📊 آمار و اطلاعات', labels)
-        self.assertIn('منوی بیشتر', labels)
+        self.assertIn('🛰️ ارتباط با مگا', labels)
+        self.assertIn('💜 پشتیبانی از توسعه', labels)
+        self.assertIn('🧑‍💻 سازندگان مگا', labels)
+        self.assertIn('📊 مرکز اطلاعات', labels)
+        self.assertIn('🧩 امکانات بیشتر', labels)
 
     def test_case_code_range_has_9000_codes(self):
         self.assertEqual(len(range(1000, 10000)), 9000)

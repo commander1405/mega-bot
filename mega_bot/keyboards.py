@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-# Main reply keyboard: four features formerly hidden under "منوی بیشتر" plus
-# one entry to the secondary menu. Keep this as a persistent Bale keyboard.
+# Main reply keyboard — MEGA private UI labels (logic unchanged; text is display-only).
 USER_KEYBOARD = {
     'keyboard': [
-        [{'text': '🆘 پشتیبانی'}, {'text': '💚 حمایت مالی'}],
-        [{'text': '👨‍💻 تیم توسعه'}, {'text': '📊 آمار و اطلاعات'}],
-        [{'text': 'منوی بیشتر'}],
+        [{'text': '🛰️ ارتباط با مگا'}, {'text': '💜 پشتیبانی از توسعه'}],
+        [{'text': '🧑‍💻 سازندگان مگا'}, {'text': '📊 مرکز اطلاعات'}],
+        [{'text': '🧩 امکانات بیشتر'}],
     ],
     'resize_keyboard': True,
     'is_persistent': True,
@@ -43,24 +42,25 @@ def menu_page(items: list[tuple[str, str]], page: int, prefix: str, back: str = 
         controls.append(('بعدی ➡️', f'{prefix}:page:{page+1}'))
     if controls:
         rows.append(controls[:2])
-    rows.append([('↩️ برگشت', f'{prefix}:back:{back}'), ('✖️ بستن', 'close')])
+    rows.append([('↩️ بازگشت', f'{prefix}:back:{back}'), ('✖️ بستن', 'close')])
     return inline(rows)
 
 
 def main_admin_menu(owner: bool = False) -> dict:
+    # Callbacks unchanged (adm:/own:); labels only.
     items = [
-        ('📊 آمار و گزارش‌ها', 'adm:stats'),
-        ('👤 جست‌وجوی کاربر', 'adm:search:user'),
-        ('👥 جست‌وجوی گروه', 'adm:search:group'),
-        ('🎫 بررسی کد پیگیری', 'adm:case'),
-        ('🧾 گزارش فعالیت‌ها', 'adm:logs'),
+        ('📈 گزارش عملکرد', 'adm:stats'),
+        ('🔎 یافتن کاربر', 'adm:search:user'),
+        ('🔎 یافتن گروه', 'adm:search:group'),
+        ('🎫 رهگیری پرونده', 'adm:case'),
+        ('🧾 رخدادهای اخیر', 'adm:logs'),
     ]
     if owner:
         items += [
-            ('🛡️ مدیریت ادمین‌ها', 'own:admins'),
-            ('📝 ویرایش درباره ما', 'own:about'),
-            ('👨‍💻 تیم توسعه‌دهنده', 'own:team'),
-            ('⚙️ تنظیمات مالک', 'own:settings'),
+            ('🛡️ مدیران ربات', 'own:admins'),
+            ('🌑 ویرایش هویت مگا', 'own:about'),
+            ('🧑‍💻 ویرایش سازندگان', 'own:team'),
+            ('⚙️ مرکز کنترل مالک', 'own:settings'),
         ]
     return menu_page(items, 0, 'admin', 'home')
 
@@ -68,7 +68,7 @@ def main_admin_menu(owner: bool = False) -> dict:
 def user_actions(target_type: str, target_id: int, can_ban: bool) -> dict:
     rows = []
     if can_ban:
-        rows.append([('⛔ محدودسازی', f'mod:ban:{target_type}:{target_id}')])
-    rows.append([('♻️ رفع محدودیت', f'mod:unban:{target_type}:{target_id}')])
-    rows.append([('↩️ برگشت', f'adm:search:{target_type}'), ('✖️ بستن', 'close')])
+        rows.append([('⛔ اعمال محدودیت', f'mod:ban:{target_type}:{target_id}')])
+    rows.append([('♻️ برداشتن محدودیت', f'mod:unban:{target_type}:{target_id}')])
+    rows.append([('↩️ بازگشت', f'adm:search:{target_type}'), ('✖️ بستن', 'close')])
     return inline(rows)

@@ -672,8 +672,8 @@ class MegaBot:
         except Exception:
             log.warning('is_restricted(user) skipped')
             restricted_user = None
-        if restricted_user and uid != OWNER_ID and not await self.db.is_admin(uid) and text not in ('تیم من',) and not text.startswith('/admin') and not text.startswith('/owner'):
-            await self.safe_send(chat_id, f"*⛔ دسترسی تو به قابلیت‌های MEGA BOT محدود شده است.*\nکد پیگیری: `#{restricted_user['case_code']}`\nبرای بررسی دلیل و مدت، بخش *تیم من* را باز کن.", USER_KEYBOARD)
+        if restricted_user and uid != OWNER_ID and not await self.db.is_admin(uid) and text not in ('تیم من', '🪪 پرونده من', 'پرونده من') and not text.startswith('/admin') and not text.startswith('/owner'):
+            await self.safe_send(chat_id, f"*⛔ دسترسی تو به قابلیت‌های MEGA BOT محدود شده است.*\nکد پیگیری: `#{restricted_user['case_code']}`\nبرای بررسی دلیل و مدت، بخش *پرونده من* را باز کن.", USER_KEYBOARD)
             return
 
         # Keep group-level restriction enforced for bot features.
@@ -688,7 +688,7 @@ class MegaBot:
                 await self.safe_send(chat_id, f"*⛔ این گروه توسط مدیریت محدود شده است.*\nکد پیگیری: `#{restricted_group['case_code']}`", reply_to=msg.get('message_id'))
                 return
         if text.startswith('/start'):
-            await self.safe_send(chat_id, '*سلام! به MEGA BOT خوش اومدی* 🌿\nاز منوی پایین برای دیدن بخش‌ها استفاده کن.', USER_KEYBOARD)
+            await self.safe_send(chat_id, '*سلام؛ به MEGA BOT خوش آمدی* 🌑\nاز کیبورد پایین، بخش موردنظرت را انتخاب کن.', USER_KEYBOARD)
             if not is_group:
                 try:
                     await self._deliver_pending_hafez_dm(chat_id, uid)
@@ -767,35 +767,35 @@ class MegaBot:
             if handled:
                 return
 
-        if text == '🆘 پشتیبانی' or text == 'پشتیبانی':
-            await self.safe_send(chat_id, '*پشتیبانی*\n' + SUPPORT_TEXT, USER_KEYBOARD)
+        if text in ('🛰️ ارتباط با مگا', '🆘 پشتیبانی', 'پشتیبانی', 'ارتباط با مگا'):
+            await self.safe_send(chat_id, '*ارتباط با مگا*\n' + SUPPORT_TEXT, USER_KEYBOARD)
             return
-        if text == '💚 حمایت مالی' or text == 'حمایت مالی':
+        if text in ('💜 پشتیبانی از توسعه', '💚 حمایت مالی', 'حمایت مالی', 'پشتیبانی از توسعه'):
             await self.show_donation_intro(chat_id)
             return
-        if text == '👨‍💻 تیم توسعه' or text == 'تیم توسعه':
+        if text in ('🧑‍💻 سازندگان مگا', '👨‍💻 تیم توسعه', 'تیم توسعه', 'سازندگان مگا'):
             team = await self.db.get_team()
-            body = '*تیم توسعه‌دهنده*\n\n' + ('\n'.join(f"*{m['name']}* — {m['title']}\n{m['description']}" for m in team) if team else 'هنوز عضوی ثبت نشده است.')
+            body = '*سازندگان مگا*\n\n' + ('\n'.join(f"*{m['name']}* — {m['title']}\n{m['description']}" for m in team) if team else 'هنوز عضوی ثبت نشده است.')
             await self.safe_send(chat_id, body, USER_KEYBOARD)
             return
-        if text == '📊 آمار و اطلاعات' or text == 'آمار و اطلاعات':
+        if text in ('📊 مرکز اطلاعات', '📊 آمار و اطلاعات', 'آمار و اطلاعات', 'مرکز اطلاعات'):
             await self.safe_send(chat_id, self.stats_text(await self.db.stats()), USER_KEYBOARD)
             return
-        if text == 'منوی بیشتر':
-            await self.safe_send(chat_id, '*منوی بیشتر*\nبخش موردنظرت رو انتخاب کن.', inline([
-                [('ℹ️ درباره ما','more:about'),('📚 راهنمای ربات','more:guide')],
-                [('🎫 تیم من / پیگیری','more:my_cases')],
-                [('↩️ برگشت','home'),('✖️ بستن','close')]
+        if text in ('🧩 امکانات بیشتر', 'امکانات بیشتر'):
+            await self.safe_send(chat_id, '*امکانات بیشتر*\nیکی از بخش‌های زیر را انتخاب کن.', inline([
+                [('🌑 هویت مگا', 'ui:about'), ('📚 راهنمای استفاده', 'ui:guide')],
+                [('🪪 پرونده من', 'ui:cases')],
+                [('↩️ بازگشت', 'home'), ('✖️ بستن', 'close')]
             ]), USER_KEYBOARD)
             return
-        if text == 'درباره ما':
+        if text in ('درباره ما', '🌑 هویت مگا', 'هویت مگا'):
             about = await self.db.get_setting('about', 'MEGA BOT یک ربات اجتماعی برای بله است.')
-            await self.safe_send(chat_id, f'*درباره MEGA BOT*\n\n{about}', USER_KEYBOARD)
+            await self.safe_send(chat_id, f'*هویت مگا*\n\n{about}', USER_KEYBOARD)
             return
-        if text == 'راهنما ربات':
+        if text in ('راهنما ربات', '📚 راهنمای استفاده', 'راهنمای استفاده', 'راهنمای ربات'):
             await self.show_guide(chat_id, 0)
             return
-        if text == 'تیم من':
+        if text in ('تیم من', '🪪 پرونده من', 'پرونده من'):
             await self.my_cases(chat_id, uid)
             return
         if text == 'پین' and msg.get('reply_to_message'):
@@ -1275,12 +1275,15 @@ class MegaBot:
                 )
                 return
 
+        if data.startswith('ui:'):
+            # Private-only UI callbacks → same handlers as legacy more:*
+            data = 'more:' + data.split(':', 1)[1]
         if data.startswith('more:'):
             key = data.split(':', 1)[1]
             if key == 'about':
                 about = await self.db.get_setting('about', 'MEGA BOT یک ربات اجتماعی برای بله است.')
                 await self.safe_edit(
-                    chat_id, message_id, f'*درباره MEGA BOT*\n\n{about}',
+                    chat_id, message_id, f'*هویت مگا*\n\n{about}',
                     inline([[('↩️ برگشت', 'more:menu'), ('✖️ بستن', 'close')]]),
                 )
             elif key == 'guide':
@@ -1289,23 +1292,23 @@ class MegaBot:
                 await self.my_cases(chat_id, uid)
             elif key == 'menu':
                 await self.safe_edit(
-                    chat_id, message_id, '*منوی بیشتر*\nبخش موردنظرت رو انتخاب کن.',
+                    chat_id, message_id, '*امکانات بیشتر*\nیکی از بخش‌های زیر را انتخاب کن.',
                     inline([
-                        [('ℹ️ درباره ما', 'more:about'), ('📚 راهنمای ربات', 'more:guide')],
-                        [('🎫 تیم من / پیگیری', 'more:my_cases')],
-                        [('↩️ برگشت', 'home'), ('✖️ بستن', 'close')],
+                        [('🌑 هویت مگا', 'ui:about'), ('📚 راهنمای استفاده', 'ui:guide')],
+                        [('🪪 پرونده من', 'ui:cases')],
+                        [('↩️ بازگشت', 'home'), ('✖️ بستن', 'close')],
                     ]),
                 )
             elif key == 'support':
                 await self.safe_edit(
                     chat_id, message_id, '*پشتیبانی*\n' + SUPPORT_TEXT,
-                    inline([[('↩️ برگشت', 'home'), ('✖️ بستن', 'close')]]),
+                    inline([[('↩️ بازگشت', 'home'), ('✖️ بستن', 'close')]]),
                 )
             elif key == 'donate':
                 await self.show_donation_intro(chat_id, message_id)
             elif key == 'team':
                 team = await self.db.get_team()
-                body = '*تیم توسعه‌دهنده*\n\n' + (
+                body = '*سازندگان مگا*\n\n' + (
                     '\n'.join(f"*{m['name']}* — {m['title']}\n{m['description']}" for m in team)
                     if team else 'هنوز عضوی ثبت نشده است.'
                 )
@@ -1316,12 +1319,12 @@ class MegaBot:
             elif key == 'stats':
                 await self.safe_edit(
                     chat_id, message_id, self.stats_text(await self.db.stats()),
-                    inline([[('↩️ برگشت', 'home'), ('✖️ بستن', 'close')]]),
+                    inline([[('↩️ بازگشت', 'home'), ('✖️ بستن', 'close')]]),
                 )
             else:
                 await self.safe_edit(
                     chat_id, message_id, 'این بخش در دسترس نیست.',
-                    inline([[('↩️ برگشت', 'home'), ('✖️ بستن', 'close')]]),
+                    inline([[('↩️ بازگشت', 'home'), ('✖️ بستن', 'close')]]),
                 )
             return
 
@@ -1681,7 +1684,7 @@ class MegaBot:
             '• محدود کردن اعضا (سکوت / اخراج)\n'
             '• پین پیام (اختیاری)\n\n'
             'بعد از ادمین شدن می‌تونی از دستورات `قفل`، `خوشامد`، `آمار`، `پاک` و بقیه امکانات استفاده کنی.\n\n'
-            '📚 دستورات کامل من رو داخل *پیوی*، از منوی بیشتر ← راهنمای ربات ببین.'
+            '📚 دستورات کامل من رو داخل *پیوی*، از امکانات بیشتر ← راهنمای استفاده ببین.'
         )
         try:
             kb = inline([[url_button('💬 رفتن به پیوی ربات', 'https://ble.ir/megabalebot')]])
@@ -2552,7 +2555,7 @@ class MegaBot:
 
     GUIDE_ENTRIES = [
         ('📌 دستورات عمومی',
-         '• کیبورد پایین: پشتیبانی، حمایت مالی، تیم توسعه، آمار، منوی بیشتر\n'
+         '• کیبورد پایین: پشتیبانی، حمایت مالی، تیم توسعه، آمار، امکانات بیشتر\n'
          '• `/start` — شروع و نمایش منو\n'
          '• `راهنما ربات` یا دکمه 📚 راهنمای ربات\n'
          '• `درباره ما` — معرفی ربات\n'
@@ -2715,7 +2718,7 @@ class MegaBot:
             controls.append(('بعدی ➡️', f'guide:page:{page + 1}'))
         if controls:
             rows.append(controls)
-        rows.append([('↩️ برگشت', 'home'), ('✖️ بستن', 'close')])
+        rows.append([('↩️ بازگشت', 'home'), ('✖️ بستن', 'close')])
         kb = inline(rows)
         if edit_id:
             await self.safe_edit(chat_id, edit_id, text, kb)
@@ -2764,7 +2767,7 @@ class MegaBot:
         text = f'*حمایت مالی MEGA BOT*\n\n{intro}'
         keyboard = inline([
             [('💚 بله، حمایت می‌کنم', 'donate:yes'), ('نه، ممنون', 'donate:cancel')],
-            [('↩️ برگشت', 'home'), ('✖️ بستن', 'close')],
+            [('↩️ بازگشت', 'home'), ('✖️ بستن', 'close')],
         ])
         if edit_id:
             await self.safe_edit(chat_id, edit_id, text, keyboard)
@@ -2982,7 +2985,7 @@ class MegaBot:
             log.debug('Donor success notice failed for %s: %s', donation.get('user_id'), type(exc).__name__)
 
     def stats_text(self, s: dict) -> str:
-        return (f"*📊 آمار MEGA BOT*\n\n*👤 کل کاربران:* {s['users']}\n*🆕 کاربران جدید امروز:* {s['new_today']}\n"
+        return (f"*📊 مرکز اطلاعات مگا*\n\n*👤 کل کاربران:* {s['users']}\n*🆕 کاربران جدید امروز:* {s['new_today']}\n"
                 f"*👥 گروه‌های ثبت‌شده:* {s['groups']}\n*🙋 کاربران استفاده‌کننده در گروه‌ها:* {s['group_users']}\n"
                 f"*⛔ محدودیت فعال کاربران:* {s['banned_users']}\n*🚫 گروه‌های محدود:* {s['banned_groups']}\n"
                 f"*💚 مجموع حمایت مالی:* {s['donations']} تومان\n\n*ℹ️ نسخه {BOT_VERSION}*")
@@ -3698,21 +3701,21 @@ class MegaBot:
             if not items: items = [('📊 آمار و گزارش‌ها','adm:stats')]
         else:
             items = [
-                ('📋 لیست گروه‌ها','own:groups:0'),
-                ('👥 کاربران','own:users:0'),
-                ('📊 آمار و گزارش‌ها','adm:stats'),
-                ('👤 جست‌وجوی کاربر','adm:search:user'),
-                ('👥 جست‌وجوی گروه','adm:search:group'),
-                ('🎫 بررسی کد پیگیری','adm:case'),
-                ('🧾 گزارش فعالیت‌ها','adm:logs'),
-                ('🛡️ مدیریت ادمین‌ها','own:admins'),
-                ('📝 ویرایش درباره ما','own:about'),
-                ('👨‍💻 تیم توسعه‌دهنده','own:team'),
-                ('💚 تنظیمات حمایت مالی','own:donations'),
-                ('📢 افزودن دکمه تبلیغ','adm:ad'),
+                ('📋 فهرست گروه‌ها','own:groups:0'),
+                ('👥 فهرست کاربران','own:users:0'),
+                ('📈 گزارش عملکرد','adm:stats'),
+                ('🔎 یافتن کاربر','adm:search:user'),
+                ('🔎 یافتن گروه','adm:search:group'),
+                ('🎫 رهگیری پرونده','adm:case'),
+                ('🧾 رخدادهای اخیر','adm:logs'),
+                ('🛡️ مدیران ربات','own:admins'),
+                ('🌑 ویرایش هویت مگا','own:about'),
+                ('🧑‍💻 ویرایش سازندگان','own:team'),
+                ('💜 تنظیم حمایت مالی','own:donations'),
+                ('📢 دکمه تبلیغ','adm:ad'),
                 ('📨 پیام همگانی','adm:broadcast'),
-                ('📡 مانیتورینگ زنده','own:mon'),
-                ('⚙️ تنظیمات مالک','own:settings'),
+                ('📡 پایش زنده','own:mon'),
+                ('⚙️ مرکز کنترل مالک','own:settings'),
             ]
         # Owner/admin panel: 4 items per page for easier discovery
         per_page = 4
@@ -3724,8 +3727,8 @@ class MegaBot:
         if start + per_page < len(items):
             controls.append(('بعدی ➡️', f'admin:page:{page + 1}'))
         if controls: rows.append(controls)
-        rows.append([('↩️ برگشت','home'),('✖️ بستن','close')])
-        text = '*پنل مالک MEGA BOT*\nیک بخش رو انتخاب کن.' if owner else '*پنل ادمین MEGA BOT*\nدسترسی‌ها بر اساس مجوزهای تو نمایش داده می‌شوند.'
+        rows.append([('↩️ بازگشت', 'home'),('✖️ بستن','close')])
+        text = '*مرکز کنترل مالک*\nبخش موردنظر را انتخاب کن.' if owner else '*پنل ادمین MEGA BOT*\nدسترسی‌ها بر اساس مجوزهای تو نمایش داده می‌شوند.'
         if edit_id: await self.safe_edit(chat_id,edit_id,text,inline(rows))
         else: await self.safe_send(chat_id,text,inline(rows))
 
@@ -6884,7 +6887,7 @@ class MegaBot:
         if not rows:
             await self.safe_send(chat_id,'*تیم من / پیگیری*\nپرونده‌ای برای حساب تو ثبت نشده است.',USER_KEYBOARD); return
         text='*تیم من / پیگیری پرونده‌ها*\n\n'+'\n\n'.join(f"*#{r['case_code']}* — {'فعال' if r['active'] else 'پایان‌یافته'}\nدلیل: {r['reason']}\nمدت: {'دائمی' if r['permanent'] else str(r['duration_days'])+' روز'}" for r in rows)
-        await self.safe_send(chat_id,text,inline([[('↩️ برگشت','home'),('✖️ بستن','close')]]))
+        await self.safe_send(chat_id,text,inline([[('↩️ بازگشت', 'home'),('✖️ بستن','close')]]))
 
     async def start_ttt(self, chat_id: int, creator: int, name: str) -> None:
         gid=secrets.token_hex(3)
@@ -6933,7 +6936,7 @@ class MegaBot:
             [('▶️ استارت توسط شروع‌کننده','one:start:'+gid)],
             [('🙋 عضویت در هرکی تک بیاره','one:join:'+gid),('🚪 خروج','one:leave:'+gid)],
             [('🗑️ حذف بازی','game:cancel:'+gid)],
-            [('↩️ برگشت','home'),('✖️ بستن','close')]
+            [('↩️ بازگشت', 'home'),('✖️ بستن','close')]
         ]))
 
     async def handle_one_callback(self, query: dict, data: str) -> None:
@@ -6963,4 +6966,4 @@ class MegaBot:
         return '*🎲 هرکی تک بیاره*\n\nبازیکنان:\n'+'\n'.join(f"• `{pid}` — {name}" for pid,name in players.items())+'\n\nسازنده می‌تواند بازی را شروع کند.'
 
     def one_keyboard(self, gid: str, game: dict) -> dict:
-        return inline([[('▶️ استارت توسط شروع‌کننده','one:start:'+gid)],[('🙋 عضویت','one:join:'+gid),('🚪 خروج','one:leave:'+gid)],[('🗑️ حذف بازی','game:cancel:'+gid)],[('↩️ برگشت','home'),('✖️ بستن','close')]])
+        return inline([[('▶️ استارت توسط شروع‌کننده','one:start:'+gid)],[('🙋 عضویت','one:join:'+gid),('🚪 خروج','one:leave:'+gid)],[('🗑️ حذف بازی','game:cancel:'+gid)],[('↩️ بازگشت', 'home'),('✖️ بستن','close')]])

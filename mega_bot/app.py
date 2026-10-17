@@ -241,6 +241,25 @@ class MegaBot:
         return None
 
     @staticmethod
+    def _is_channel_chat(self, chat: dict | None) -> bool:
+        """True for broadcast channels — no commands/welcome/leave there."""
+        if not chat:
+            return False
+        t = (chat.get('type') or '').lower().strip()
+        if t in ('channel', 'broadcast'):
+            return True
+        # Some gateways mark channels with sender_chat only; id alone is unreliable.
+        return False
+
+    def _donation_announce_channel(self) -> str:
+        """Target channel for approved donation public posts (username or chat id)."""
+        import os
+        env = (os.getenv('DONATION_ANNOUNCE_CHANNEL') or '').strip()
+        if env:
+            return env
+        # Default: https://ble.ir/darkknight_studio
+        return '@darkknight_studio'
+
     def _is_group_chat(chat: dict) -> bool:
         t = (chat.get('type') or '').lower().strip()
         if t in ('group', 'supergroup', 'megagroup', 'chat'):
@@ -428,6 +447,10 @@ class MegaBot:
                 pass
         kinds = [k for k in ('message', 'callback_query', 'my_chat_member', 'edited_message', 'chat_member') if k in update]
         log.info('UPDATE id=%s kinds=%s', uid, kinds or list(update.keys())[:6])
+        if 'channel_post' in update or 'edited_channel_post' in update:
+            # Ignore channel activity entirely (no commands / auto replies)
+            log.info('UPDATE id=%s channel_post ignored', uid)
+            return
         if 'message' in update:
             await self.on_message(update['message'])
         elif 'callback_query' in update:
@@ -443,6 +466,12 @@ class MegaBot:
         chat = msg.get('chat') or {}
         chat_id = int(chat.get('id', 0) or 0)
         if not chat_id:
+            return
+
+        # Channels: never run commands, welcome, leave, or group features.
+        # Only explicit admin/owner broadcasts (sent via API) may post there.
+        if self._is_channel_chat(chat):
+            log.info('channel message ignored chat=%s type=%s', chat_id, chat.get('type'))
             return
 
         # Pure service events — do not run the full pipeline (critical after bot is
@@ -1787,7 +1816,7 @@ class MegaBot:
             joined = status in ('member', 'administrator', 'restricted') and old_status in (
                 '', 'left', 'kicked', 'none',
             )
-            if joined and chat_id:
+            if joined and chat_id and not self._is_channel_chat(chat):
                 await self._send_bot_join_intro(chat_id)
             if not hasattr(self, '_bot_member_status'):
                 self._bot_member_status = {}
@@ -2145,6 +2174,8 @@ class MegaBot:
         return t
 
     async def welcome_new_members(self, msg: dict, chat: dict) -> None:
+        if self._is_channel_chat(chat):
+            return
         members = msg.get('new_chat_members') or []
         chat_id = int(chat.get('id') or 0)
         if not chat_id or not members:
@@ -2300,6 +2331,8 @@ class MegaBot:
         return kicked
 
     async def goodbye_left_member(self, msg: dict, chat: dict) -> None:
+        if self._is_channel_chat(chat):
+            return
         left = msg.get('left_chat_member') or {}
         chat_id = int(chat.get('id') or 0)
         if not chat_id or not left:
@@ -2970,6 +3003,30 @@ class MegaBot:
         announcement = self.build_donation_announcement(donation)
         keyboard = self.donation_broadcast_keyboard()
         sent = failed = 0
+        channel_ok = False
+        # Public post to studio channel (not private DMs)
+        channel_target = self._donation_announce_channel()
+        try:
+            await self.api.send_message(
+                channel_target,
+                announcement,
+                reply_markup=keyboard,
+                parse_mode='Markdown',
+            )
+            channel_ok = True
+            log.info('donation #%s announced to channel %s', donation_id, channel_target)
+        except Exception as exc:
+            log.warning(
+                'donation channel announce failed target=%s: %s',
+                channel_target, self._short(exc),
+            )
+            # retry without keyboard / parse_mode
+            try:
+                await self.api.send_message(channel_target, announcement, parse_mode=None)
+                channel_ok = True
+            except Exception as exc2:
+                log.warning('donation channel announce retry failed: %s', self._short(exc2))
+
         try:
             targets = await self.db.private_user_ids()
         except Exception:
@@ -3003,7 +3060,8 @@ class MegaBot:
             message_id,
             f'✅ حمایت `#{donation_id}` تأیید شد.\n'
             f'مبلغ {amount:,} تومان به آمار اضافه شد.\n'
-            f'ارسال خصوصی: {sent} موفق، {failed} ناموفق.',
+            f'ارسال خصوصی: {sent} موفق، {failed} ناموفق.\n'
+            f'کانال همگانی ({channel_target}): {"✅ ارسال شد" if channel_ok else "❌ ناموفق — ربات باید در کانال ادمین باشد"}.',
             None,
         )
         # Always notify the donor on successful approval.

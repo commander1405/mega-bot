@@ -245,10 +245,8 @@ class MegaBot:
         """True for broadcast channels — no commands/welcome/leave there."""
         if not chat:
             return False
-        t = (chat.get('type') or '').lower().strip()
-        if t in ('channel', 'broadcast'):
-            return True
-        return False
+        ctype = (chat.get('type') or '').lower().strip()
+        return ctype in ('channel', 'broadcast')
 
     def _donation_announce_channel(self) -> str:
         """Target channel for approved donation public posts (username or chat id)."""

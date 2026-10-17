@@ -5,7 +5,7 @@ USER_KEYBOARD = {
     'keyboard': [
         [{'text': '🛰️ ارتباط با مگا'}, {'text': '💜 پشتیبانی از توسعه'}],
         [{'text': '🧑‍💻 سازندگان مگا'}, {'text': '📊 مرکز اطلاعات'}],
-        [{'text': '🧩 امکانات بیشتر'}],
+        [{'text': '🎨 ساخت استیکر'}, {'text': '🧩 امکانات بیشتر'}],
     ],
     'resize_keyboard': True,
     'is_persistent': True,

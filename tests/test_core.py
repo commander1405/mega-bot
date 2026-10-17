@@ -4,12 +4,13 @@ from mega_bot.keyboards import USER_KEYBOARD
 class PureLogicTests(unittest.TestCase):
     def test_main_keyboard_has_five_buttons_and_expected_layout(self):
         rows = USER_KEYBOARD['keyboard']
-        self.assertEqual(sum(len(row) for row in rows), 5)
+        self.assertEqual(sum(len(row) for row in rows), 6)
         labels = [button['text'] for row in rows for button in row]
         self.assertIn('🛰️ ارتباط با مگا', labels)
         self.assertIn('💜 پشتیبانی از توسعه', labels)
         self.assertIn('🧑‍💻 سازندگان مگا', labels)
         self.assertIn('📊 مرکز اطلاعات', labels)
+        self.assertIn('🎨 ساخت استیکر', labels)
         self.assertIn('🧩 امکانات بیشتر', labels)
 
     def test_case_code_range_has_9000_codes(self):

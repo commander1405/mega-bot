@@ -264,6 +264,18 @@ CREATE TABLE IF NOT EXISTS group_nicknames (
 );
 CREATE INDEX IF NOT EXISTS group_nicknames_chat_idx ON group_nicknames (chat_id);
 
+CREATE TABLE IF NOT EXISTS user_sticker_packs (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  set_name TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  sticker_count INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (user_id, set_name)
+);
+CREATE INDEX IF NOT EXISTS user_sticker_packs_user_idx ON user_sticker_packs (user_id);
+
 CREATE TABLE IF NOT EXISTS hafez_assignments (
   user_id BIGINT NOT NULL,
   day_bucket DATE NOT NULL,
@@ -1846,3 +1858,32 @@ class Database:
                 'first_name': (r.get('first_name') or '').strip() or '',
             })
         return out
+
+    async def list_sticker_packs(self, user_id: int) -> list[dict]:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                'SELECT id, set_name, title, sticker_count, created_at, updated_at '
+                'FROM user_sticker_packs WHERE user_id=$1 ORDER BY updated_at DESC',
+                int(user_id),
+            )
+        return [dict(r) for r in rows]
+
+    async def upsert_sticker_pack(self, user_id: int, set_name: str, title: str, count_delta: int = 1) -> None:
+        async with self._pool().acquire() as c:
+            await c.execute(
+                """INSERT INTO user_sticker_packs(user_id, set_name, title, sticker_count)
+                   VALUES($1,$2,$3,$4)
+                   ON CONFLICT(user_id, set_name) DO UPDATE SET
+                     title=EXCLUDED.title,
+                     sticker_count=user_sticker_packs.sticker_count + $4,
+                     updated_at=NOW()""",
+                int(user_id), set_name, title or set_name, int(count_delta),
+            )
+
+    async def delete_sticker_pack_row(self, user_id: int, set_name: str) -> bool:
+        async with self._pool().acquire() as c:
+            r = await c.execute(
+                'DELETE FROM user_sticker_packs WHERE user_id=$1 AND set_name=$2',
+                int(user_id), set_name,
+            )
+        return r != 'DELETE 0'

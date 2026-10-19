@@ -882,7 +882,7 @@ class MegaBot:
             return
         if text == 'پین' and msg.get('reply_to_message'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self.safe_send(chat_id, '⛔ فقط ادمین گروه می‌تواند پیام را پین کند.')
+                await self.safe_send(chat_id, '⛔ پین پیام فقط برای مدیران گروه فعاله.')
                 return
             try:
                 await self.api.pin_message(chat_id, int(msg['reply_to_message']['message_id']))
@@ -895,7 +895,7 @@ class MegaBot:
                 await self.safe_send(chat_id, 'فقط ادمین گروه یا مالک ربات می‌تواند قوانین را تنظیم کند.')
                 return
             await self.db.set_setting(f'rules:{chat_id}', text[len('تنظیم قوانین '):].strip(), uid)
-            await self.safe_send(chat_id, '✅ قوانین گروه ذخیره شد.')
+            await self.safe_send(chat_id, '✅ قوانین گروه با موفقیت ذخیره شد.')
             return
         if text == 'قوانین' and self._is_group_chat(chat):
             await self.safe_send(chat_id, 'میخوای قوانین این گروه رو ببینی؟', inline([[('بله','rules:yes'),('خیر','rules:no')], [('✖️ بستن','close')]]))
@@ -933,7 +933,7 @@ class MegaBot:
             return
         if is_group and text in ('ویژه',) and msg.get('reply_to_message'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self.safe_send(chat_id, '⛔ فقط ادمین گروه می‌تواند ویژه اضافه کند.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.safe_send(chat_id, '⛔ افزودن کاربر ویژه فقط برای مدیران گروه است.', reply_to=msg.get('message_id'), parse_mode=None)
                 return
             target = (msg.get('reply_to_message') or {}).get('from') or {}
             tid = int(target.get('id') or 0)
@@ -999,7 +999,7 @@ class MegaBot:
 
         if is_group and text in ('قفل', 'قفل ها', 'قفل‌ها', 'ضد اسپم', 'ضداسپم', 'پنل قفل'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.safe_send(chat_id, '⛔ این بخش مخصوص مدیران گروه است.', reply_to=msg.get('message_id'), parse_mode=None)
                 return
             await self._show_locks_panel(chat_id, message_id=None)
             return
@@ -1007,7 +1007,7 @@ class MegaBot:
         # ── Welcome panel
         if is_group and text in ('خوشامد', 'خوش آمد', 'خوشامد ها', 'خوشامدها', 'پنل خوشامد'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.safe_send(chat_id, '⛔ این بخش مخصوص مدیران گروه است.', reply_to=msg.get('message_id'), parse_mode=None)
                 return
             await self._show_welcome_panel(chat_id, message_id=None)
             return
@@ -1015,7 +1015,7 @@ class MegaBot:
         # ── Goodbye / farewell panel (exact phrases; avoid social_reply conflict)
         if is_group and text in ('خداحافظی', 'تنظیم خداحافظی', 'بدرقه', 'پنل بدرقه', 'پنل خداحافظی', 'پنل خدافظ', 'خدافظی'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.safe_send(chat_id, '⛔ این بخش مخصوص مدیران گروه است.', reply_to=msg.get('message_id'), parse_mode=None)
                 return
             await self._show_goodbye_panel(chat_id, message_id=None)
             return
@@ -1027,13 +1027,13 @@ class MegaBot:
         # ── Group settings panel
         if is_group and text in ('تنظیمات گروه', 'پنل گروه', 'امنیت گروه'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.safe_send(chat_id, '⛔ این بخش مخصوص مدیران گروه است.', reply_to=msg.get('message_id'), parse_mode=None)
                 return
             await self._show_group_panel(chat_id, uid)
             return
         if is_group and text.startswith('خوشامدگویی '):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.safe_send(chat_id, '⛔ این بخش مخصوص مدیران گروه است.', reply_to=msg.get('message_id'), parse_mode=None)
                 return
             body = text[len('خوشامدگویی '):].strip()
             if body in ('خاموش', 'off', 'غیرفعال'):
@@ -1054,7 +1054,7 @@ class MegaBot:
             return
         if is_group and text.startswith('خداحافظی '):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.safe_send(chat_id, '⛔ این بخش مخصوص مدیران گروه است.', reply_to=msg.get('message_id'), parse_mode=None)
                 return
             body = text[len('خداحافظی '):].strip()
             if body in ('خاموش', 'off', 'غیرفعال'):
@@ -1078,7 +1078,7 @@ class MegaBot:
         # ── Group stats
         if is_group and text in ('آمار', 'امار', 'آمار گروه', 'آمارگروه', 'امار گروه'):
             if not await self._require_group_admin(chat_id, uid):
-                await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', parse_mode=None)
+                await self.safe_send(chat_id, '⛔ این بخش مخصوص مدیران گروه است.', parse_mode=None)
                 return
             await self._send_group_stats(chat_id, chat)
             return
@@ -3122,11 +3122,28 @@ class MegaBot:
             log.debug('Donor success notice failed for %s: %s', donation.get('user_id'), type(exc).__name__)
 
     def stats_text(self, s: dict) -> str:
-        return (f"*📊 مرکز اطلاعات مگا*\n\n*👤 کل کاربران:* {s['users']}\n*🆕 کاربران جدید امروز:* {s['new_today']}\n"
-                f"*👥 گروه‌های ثبت‌شده:* {s['groups']}\n*🙋 کاربران استفاده‌کننده در گروه‌ها:* {s['group_users']}\n"
-                f"*⛔ محدودیت فعال کاربران:* {s['banned_users']}\n*🚫 گروه‌های محدود:* {s['banned_groups']}\n"
-                f"*💚 مجموع حمایت مالی:* {s['donations']} تومان\n\n*ℹ️ نسخه {BOT_VERSION}*")
-
+        users = s.get('users', 0)
+        new_today = s.get('new_today', 0)
+        new_month = s.get('new_month', 0)
+        active_month = s.get('active_month', 0)
+        groups = s.get('groups', 0)
+        banned_u = s.get('banned_users', 0)
+        banned_g = s.get('banned_groups', 0)
+        donations = s.get('donations', 0)
+        return (
+            '*📊 مرکز اطلاعات مگا*'
+            + chr(10) + '━━━━━━━━━━━━━━━━━━'
+            + chr(10) + f'*👤 کاربران پیوی (کل):* {users}'
+            + chr(10) + f'*🆕 کاربران جدید امروز (پیوی):* {new_today}'
+            + chr(10) + f'*📅 کاربران جدید این ماه (پیوی):* {new_month}'
+            + chr(10) + f'*⚡ فعال این ماه (پیوی):* {active_month}'
+            + chr(10) + f'*👥 گروه‌های ثبت‌شده:* {groups}'
+            + chr(10) + f'*⛔ محدودیت فعال کاربران:* {banned_u}'
+            + chr(10) + f'*🚫 گروه‌های محدود:* {banned_g}'
+            + chr(10) + f'*💚 مجموع حمایت مالی:* {donations} تومان'
+            + chr(10) + '━━━━━━━━━━━━━━━━━━'
+            + chr(10) + f'*ℹ️ نسخه {BOT_VERSION}*'
+        )
 
 
 
@@ -4780,7 +4797,7 @@ class MegaBot:
         if not await self._require_group_admin(chat_id, uid):
             await self.safe_send(
                 chat_id,
-                '⛔ فقط مدیران گروه می‌توانند از دستور پاک استفاده کنند!',
+                '⛔ دستور پاک فقط برای مدیران گروه در دسترسه.',
                 reply_to=msg.get('message_id'),
                 parse_mode=None,
             )
@@ -4873,7 +4890,7 @@ class MegaBot:
             await self.safe_send(chat_id, '⛔ فقط کسی که درخواست داده می‌تواند تأیید کند.', parse_mode=None)
             return
         if not await self._require_group_admin(chat_id, uid):
-            await self.safe_send(chat_id, '⛔ برای این کار باید مدیر گروه یا کاربر ویژه باشی!', parse_mode=None)
+            await self.safe_send(chat_id, '⛔ این دستور فقط برای مدیران گروه یا کاربران ویژه است.', parse_mode=None)
             return
         if decision == 'no':
             self._purge_pending.pop(token, None)
@@ -5009,7 +5026,7 @@ class MegaBot:
 
         is_admin = await self._has_group_mod_power(chat_id, uid)
         if not is_admin:
-            await self.safe_send(chat_id, '⛔ برای این کار باید مدیر گروه یا کاربر ویژه باشی!', reply_to=msg.get('message_id'), parse_mode=None)
+            await self.safe_send(chat_id, '⛔ این دستور فقط برای مدیران گروه یا کاربران ویژه است.', reply_to=msg.get('message_id'), parse_mode=None)
             return True
 
         # Clear ALL warns in group — no target needed
@@ -5118,11 +5135,11 @@ class MegaBot:
                 await self.db.log(uid, 'group_unmute', 'user', target_uid, {'chat_id': chat_id})
             elif action == 'ban':
                 await self.api.ban_chat_member(chat_id, target_uid)
-                await self.safe_send(chat_id, f'✅ انجام شد! ⛔ کاربر {target_name} از گروه بن شد.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.safe_send(chat_id, f'✅ کاربر {target_name} از گروه بن شد.', reply_to=msg.get('message_id'), parse_mode=None)
                 await self.db.log(uid, 'group_ban', 'user', target_uid, {'chat_id': chat_id})
             elif action == 'unban':
                 await self.api.unban_chat_member(chat_id, target_uid)
-                await self.safe_send(chat_id, f'✅ انجام شد! بن کاربر {target_name} برداشته شد.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.safe_send(chat_id, f'✅ بن کاربر {target_name} برداشته شد.', reply_to=msg.get('message_id'), parse_mode=None)
                 await self.db.log(uid, 'group_unban', 'user', target_uid, {'chat_id': chat_id})
             elif action == 'kick':
                 await self.api.ban_chat_member(chat_id, target_uid, int(time.time()) + 45)
@@ -6351,7 +6368,7 @@ class MegaBot:
 
     async def _handle_schedule_callback(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
         if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-            await self.safe_send(chat_id, '⛔ این بخش فقط برای مدیران گروه فعاله!', parse_mode=None)
+            await self.safe_send(chat_id, '⛔ این بخش مخصوص مدیران گروه است.', parse_mode=None)
             return
         if data in ('lock:sch', 'sch:panel'):
             await self._show_schedule_panel(chat_id, message_id)

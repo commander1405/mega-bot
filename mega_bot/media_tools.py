@@ -12,13 +12,25 @@ GIF_MAX_SIDE = 480
 GIF_FPS = 8
 GIF_MAX_FRAMES = 48
 
+# Same family as stats dashboard (Vazirmatn Bold) — never reverse with bidi.
+_FONT_DIR = Path(__file__).resolve().parent / 'assets' / 'fonts'
 _BOLD_FONT_CANDIDATES = (
-    '/usr/share/fonts/SlidesCarnival/google/Noto Sans Arabic/static/NotoSansArabic-Bold.ttf',
-    '/usr/share/fonts/SlidesCarnival/google/Noto Sans Arabic/static/NotoSansArabic-ExtraBold.ttf',
+    str(_FONT_DIR / 'Vazirmatn-Bold.ttf'),
+    str(_FONT_DIR / 'Vazirmatn-Regular.ttf'),
     '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
     '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
-    '/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf',
 )
+
+
+def _shape_fa(text: str) -> str:
+    """Arabic reshape only — no bidi.get_display (that reverses with LTR anchors)."""
+    if not text:
+        return ''
+    try:
+        import arabic_reshaper
+        return arabic_reshaper.reshape(str(text))
+    except Exception:
+        return str(text)
 
 
 def _font(size: int):
@@ -73,14 +85,15 @@ def _overlay(image: Image.Image, text: str) -> Image.Image:
     """Bold, bright white text, always horizontal, auto-shrink, never leave the frame."""
     if not (text or '').strip():
         return image
+    text = (text or '').strip()
     image = image.convert('RGBA')
     draw = ImageDraw.Draw(image)
     margin = max(6, int(min(image.width, image.height) * 0.04))
     max_width = max(20, image.width - 2 * margin)
     max_height = max(20, int(image.height * 0.42))  # text block may use up to ~42% of height
 
-    # Slightly larger than before (~0.16 of height)
-    size = max(16, int(image.height * 0.16))
+    # ~5% larger than previous baseline, bold Vazirmatn
+    size = max(18, int(image.height * 0.168))
     lines: list[str] = []
     font = _font(size)
     stroke = max(2, size // 12)
@@ -122,12 +135,13 @@ def _overlay(image: Image.Image, text: str) -> Image.Image:
     outline = (0, 0, 0, 255)
 
     for i, ln in enumerate(lines):
-        box = draw.textbbox((0, 0), ln, font=font, stroke_width=stroke)
+        shaped = _shape_fa(ln)
+        box = draw.textbbox((0, 0), shaped, font=font, stroke_width=stroke)
         tw = box[2] - box[0]
         th = box[3] - box[1]
         x = (image.width - tw) // 2
         x = max(margin, min(image.width - tw - margin, x))
-        draw.text((x, y), ln, font=font, fill=fill, stroke_width=stroke, stroke_fill=outline)
+        draw.text((x, y), shaped, font=font, fill=fill, stroke_width=stroke, stroke_fill=outline)
         y += th + gap
 
     return image.convert('RGB')

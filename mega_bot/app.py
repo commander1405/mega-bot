@@ -19,7 +19,6 @@ from . import time_literary as time_mod
 from . import hafez_content as hafez_mod
 from . import jokes_content as jokes_mod
 from . import stats_dashboard as dash
-from . import sticker_tools as stick_tools
 from config import OWNER_ID, BOT_VERSION, SUPPORT_TEXT, DONATION_TEXT
 
 log = logging.getLogger(__name__)
@@ -304,11 +303,11 @@ class MegaBot:
         *,
         delay: float | None = None,
     ) -> None:
-        """Delete a group bot message after delay (default random 50–90s)."""
+        """Delete a group bot message after delay (default random 30–60s)."""
         if not message_id or self._is_private_chat_id(chat_id):
             return
         if delay is None:
-            delay = random.uniform(50.0, 90.0)
+            delay = random.uniform(30.0, 60.0)
         else:
             delay = max(0.5, float(delay))
 
@@ -730,12 +729,33 @@ class MegaBot:
         except Exception:
             log.warning('is_restricted(user) skipped')
             restricted_user = None
-        # Sticker FSM (PV) — also handles document-only messages
-        if uid and await self._sticker_state_message(uid, chat_id, msg, text):
-            return
 
-        if restricted_user and uid != OWNER_ID and not await self.db.is_admin(uid) and text not in ('تیم من', '🪪 پرونده من', 'پرونده من') and not text.startswith('/admin') and not text.startswith('/owner'):
-            await self.safe_send(chat_id, f"*⛔ دسترسی تو به قابلیت‌های MEGA BOT محدود شده است.*\nکد پیگیری: `#{restricted_user['case_code']}`\nبرای بررسی دلیل و مدت، بخش *پرونده من* را باز کن.", USER_KEYBOARD)
+        if (
+            restricted_user
+            and uid != OWNER_ID
+            and not await self.db.is_admin(uid)
+            and text not in ('تیم من', '🪪 پرونده من', 'پرونده من')
+            and not text.startswith('/admin')
+            and not text.startswith('/owner')
+        ):
+            # Only notify in private chat, at most once per hour — never spam groups
+            if (not is_group) and self._is_private_chat_id(chat_id):
+                if not hasattr(self, '_ban_notice_ts'):
+                    self._ban_notice_ts = {}
+                last = float(self._ban_notice_ts.get(uid) or 0)
+                if time.time() - last >= 3600:
+                    self._ban_notice_ts[uid] = time.time()
+                    code = restricted_user.get('case_code') or '?'
+                    notice = (
+                        '*⛔ دسترسی تو به قابلیت‌های MEGA BOT محدود شده است.*'
+                        + chr(10)
+                        + f'کد پیگیری: `#{code}`'
+                        + chr(10)
+                        + 'برای بررسی دلیل و مدت، بخش *پرونده من* را باز کن.'
+                    )
+                    await self.safe_send(
+                        chat_id, notice, USER_KEYBOARD, permanent=True,
+                    )
             return
 
         # Keep group-level restriction enforced for bot features.
@@ -829,9 +849,6 @@ class MegaBot:
             if handled:
                 return
 
-        if await self._sticker_state_message(uid, chat_id, msg, text):
-            return
-
         if text in ('🛰️ ارتباط با مگا', '🆘 پشتیبانی', 'پشتیبانی', 'ارتباط با مگا'):
             await self.safe_send(chat_id, '*ارتباط با مگا*\n' + SUPPORT_TEXT, USER_KEYBOARD)
             return
@@ -862,16 +879,6 @@ class MegaBot:
             return
         if text in ('تیم من', '🪪 پرونده من', 'پرونده من'):
             await self.my_cases(chat_id, uid)
-            return
-        if text in ('🎨 ساخت استیکر', 'ساخت استیکر'):
-            if not self._is_private_chat(chat):
-                await self.safe_send(
-                    chat_id,
-                    '🎨 ساخت استیکر فقط در گفت‌وگوی خصوصی با ربات در دسترس است.',
-                    parse_mode=None,
-                )
-                return
-            await self._sticker_menu(chat_id, uid)
             return
         if text == 'پین' and msg.get('reply_to_message'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
@@ -1622,20 +1629,6 @@ class MegaBot:
         if data == 'lock:sch' or data.startswith('sch:'):
             await self._handle_schedule_callback(uid, chat_id, message_id, data)
             return
-        if data.startswith('stk:'):
-            try:
-                await self._handle_sticker_callback(uid, chat_id, message_id, data)
-            except Exception as exc:
-                log.exception('sticker callback failed data=%s', data)
-                try:
-                    await self.safe_send(
-                        chat_id,
-                        f'❌ عملیات استیکر ناموفق بود: `{self._short(exc)}`',
-                        parse_mode='Markdown',
-                    )
-                except Exception:
-                    pass
-            return
         if data.startswith('tag:'):
             await self._handle_tag_callback(uid, chat_id, message_id, data)
             return
@@ -1654,6 +1647,29 @@ class MegaBot:
             inline([[('↩️ منوی اصلی', 'home'), ('✖️ بستن', 'close')]]),
         )
 
+
+
+    def _get_user_state(self, uid: int, chat_id: int | None = None) -> dict | None:
+        """Chat-scoped FSM state so PV flows never leak into groups."""
+        st = self.states.get(uid)
+        if not st:
+            return None
+        if chat_id is not None and st.get('chat_id') is not None and int(st['chat_id']) != int(chat_id):
+            return None
+        return st
+
+    def _set_user_state(self, uid: int, chat_id: int, data: dict) -> None:
+        data = dict(data)
+        data['chat_id'] = int(chat_id)
+        self.states[uid] = data
+
+    def _clear_user_state(self, uid: int, chat_id: int | None = None) -> None:
+        st = self.states.get(uid)
+        if not st:
+            return
+        if chat_id is not None and st.get('chat_id') is not None and int(st['chat_id']) != int(chat_id):
+            return
+        self.states.pop(uid, None)
 
     def _is_admin_identity(self, uid: int) -> bool:
         return uid == OWNER_ID
@@ -3812,517 +3828,6 @@ class MegaBot:
             return False
         ctype = (chat.get('type') or '').lower()
         return ctype in ('private', 'pv', '') and int(chat.get('id') or 0) > 0
-
-    async def _sticker_menu(self, chat_id: int, uid: int, edit_id: int | None = None) -> None:
-        body = (
-            'سلام! من بازوی *ساخت استیکر* هستم 😊\n'
-            'از این بخش می‌توانی عکس را به استیکر تبدیل کنی و بسته‌های شخصی‌ات را مدیریت کنی.\n\n'
-            'گزینه موردنظر را انتخاب کن.'
-        )
-        kb = inline([
-            [('🆕 ساخت بسته استیکر جدید', 'stk:new')],
-            [('➕ اضافه کردن استیکر به بسته', 'stk:add')],
-            [('🗑 حذف استیکر از بسته', 'stk:del_one')],
-            [('✏️ ویرایش بسته استیکر', 'stk:edit')],
-            [('💣 حذف بسته استیکر', 'stk:del_pack')],
-            [('↩️ بازگشت', 'home')],
-        ])
-        if edit_id:
-            await self.safe_edit(chat_id, edit_id, body, kb)
-        else:
-            await self.safe_send(chat_id, body, kb)
-
-    async def _handle_sticker_callback(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
-        if chat_id < 0:
-            await self.safe_send(chat_id, 'ساخت استیکر فقط در پیوی فعال است.', parse_mode=None)
-            return
-        parts = data.split(':')
-        action = parts[1] if len(parts) > 1 else ''
-        if action == 'menu' or action == 'back':
-            self.states.pop(uid, None)
-            await self._sticker_menu(chat_id, uid, message_id)
-            return
-        if action == 'new':
-            await self.safe_edit(
-                chat_id, message_id,
-                'ساخت بسته استیکر به دو صورت ممکن است:\n'
-                '• افزودن تکی استیکرها\n'
-                '• استفاده از فایل ZIP برای چند تصویر\n\n'
-                'کدام روش را می‌خواهی؟',
-                inline([
-                    [('تکی‌تکی', 'stk:new_single'), ('زیپ', 'stk:new_zip')],
-                    [('↩️ بازگشت', 'stk:menu')],
-                ]),
-            )
-            return
-        if action == 'new_single':
-            self.states[uid] = {'step': 'stk_name', 'mode': 'create', 'chat_id': chat_id}
-            await self.safe_edit(
-                chat_id, message_id,
-                '😍 برای ساخت بسته جدید آماده‌ای؟\n'
-                'اسم بسته استیکر را بفرست (انگلیسی/اعداد/زیرخط، بدون فاصله؛ حداکثر ۴۰ کاراکتر).',
-                inline([[('❌ لغو', 'stk:menu')]]),
-            )
-            return
-        if action == 'new_zip':
-            self.states[uid] = {'step': 'stk_name', 'mode': 'zip', 'chat_id': chat_id}
-            await self.safe_edit(
-                chat_id, message_id,
-                'اسم بسته استیکر را بفرست، سپس فایل ZIP تصاویر را ارسال می‌کنی.',
-                inline([[('❌ لغو', 'stk:menu')]]),
-            )
-            return
-        if action == 'add':
-            packs = await self.db.list_sticker_packs(uid)
-            if not packs:
-                await self.safe_edit(
-                    chat_id, message_id,
-                    'هنوز بسته‌ای ثبت نشده. اول «ساخت بسته جدید» را بزن.',
-                    inline([[('🆕 ساخت بسته', 'stk:new'), ('↩️ بازگشت', 'stk:menu')]]),
-                )
-                return
-            rows = [[(f"{p['title'] or p['set_name']} ({p['sticker_count']})", f"stk:pick_add:{p['set_name']}")] for p in packs[:20]]
-            rows.append([('↩️ بازگشت', 'stk:menu')])
-            await self.safe_edit(chat_id, message_id, 'بسته موردنظر را انتخاب کن:', inline(rows))
-            return
-        if action == 'pick_add' and len(parts) > 2:
-            set_name = ':'.join(parts[2:])
-            self.states[uid] = {'step': 'stk_file', 'mode': 'add', 'set_name': set_name, 'chat_id': chat_id, 'title': set_name}
-            await self.safe_edit(
-                chat_id, message_id,
-                self._sticker_file_help(),
-                inline([[('❌ لغو', 'stk:menu')]]),
-            )
-            return
-        if action == 'del_one':
-            packs = await self.db.list_sticker_packs(uid)
-            if not packs:
-                await self.safe_edit(chat_id, message_id, 'بسته‌ای برای حذف استیکر نیست.', inline([[('↩️ بازگشت', 'stk:menu')]]))
-                return
-            rows = [[(p['title'] or p['set_name'], f"stk:list_del:{p['set_name']}")] for p in packs[:15]]
-            rows.append([('↩️ بازگشت', 'stk:menu')])
-            await self.safe_edit(chat_id, message_id, 'بسته را انتخاب کن تا استیکرهایش فهرست شوند:', inline(rows))
-            return
-        if action == 'list_del' and len(parts) > 2:
-            set_name = ':'.join(parts[2:])
-            try:
-                info = await self.api.get_sticker_set(set_name)
-                if isinstance(info, dict) and 'result' in info:
-                    info = info['result']
-                stickers = (info or {}).get('stickers') or []
-            except Exception as exc:
-                await self.safe_edit(
-                    chat_id, message_id,
-                    f'نتوانستم فهرست استیکر را از API بگیرم.\n`{self._short(exc)}`\n'
-                    'ممکن است بله این متد را محدود کرده باشد.',
-                    inline([[('↩️ بازگشت', 'stk:menu')]]),
-                )
-                return
-            if not stickers:
-                await self.safe_edit(chat_id, message_id, 'استیکری در این بسته دیده نشد.', inline([[('↩️ بازگشت', 'stk:menu')]]))
-                return
-            rows = []
-            for i, s in enumerate(stickers[:30]):
-                fid = s.get('file_id') or ''
-                emoji = (s.get('emoji') or '🔲')[:4]
-                if fid:
-                    rows.append([(f'{i+1}. {emoji}', f'stk:rm:{fid[:60]}')])
-            rows.append([('↩️ بازگشت', 'stk:menu')])
-            await self.safe_edit(chat_id, message_id, 'استیکر موردنظر برای حذف را انتخاب کن:', inline(rows))
-            return
-        if action == 'rm' and len(parts) > 2:
-            fid = ':'.join(parts[2:])
-            try:
-                ok = await self.api.delete_sticker_from_set(fid)
-                msg = '✅ استیکر از بسته حذف شد.' if ok else 'حذف انجام نشد.'
-            except Exception as exc:
-                msg = f'❌ حذف ناموفق: `{self._short(exc)}`'
-            await self.safe_edit(chat_id, message_id, msg, inline([[('↩️ منوی استیکر', 'stk:menu')]]))
-            return
-        if action == 'edit':
-            packs = await self.db.list_sticker_packs(uid)
-            if not packs:
-                await self.safe_edit(chat_id, message_id, 'بسته‌ای برای ویرایش نیست.', inline([[('↩️ بازگشت', 'stk:menu')]]))
-                return
-            lines = ['*بسته‌های ثبت‌شده در مگا:*\n']
-            for pck in packs[:20]:
-                lines.append(f"• `{pck['set_name']}` — {pck['title']} ({pck['sticker_count']} استیکر)")
-            lines.append(
-                '\n⚠️ تغییر عنوان رسمی بسته در بله فقط در صورت پشتیبانی API ممکن است. '
-                'برای افزودن استیکر از «اضافه کردن استیکر» استفاده کن.'
-            )
-            await self.safe_edit(chat_id, message_id, '\n'.join(lines), inline([[('↩️ بازگشت', 'stk:menu')]]))
-            return
-        if action == 'del_pack':
-            packs = await self.db.list_sticker_packs(uid)
-            if not packs:
-                await self.safe_edit(chat_id, message_id, 'بسته‌ای برای حذف نیست.', inline([[('↩️ بازگشت', 'stk:menu')]]))
-                return
-            rows = [[(f"🗑 {p['title'] or p['set_name']}", f"stk:confirm_del:{p['set_name']}")] for p in packs[:15]]
-            rows.append([('↩️ بازگشت', 'stk:menu')])
-            await self.safe_edit(
-                chat_id, message_id,
-                'حذف از فهرست مگا (و در صورت پشتیبانی API از بله). بسته را انتخاب کن:',
-                inline(rows),
-            )
-            return
-        if action == 'confirm_del' and len(parts) > 2:
-            set_name = ':'.join(parts[2:])
-            await self.safe_edit(
-                chat_id, message_id,
-                f'⚠️ حذف ثبت بسته `{set_name}` از دیتابیس مگا؟\n'
-                '(حذف کامل بسته از سرور بله ممکن است در API در دسترس نباشد.)',
-                inline([
-                    [('✅ بله، حذف کن', f'stk:do_del:{set_name}')],
-                    [('❌ انصراف', 'stk:menu')],
-                ]),
-            )
-            return
-        if action == 'do_del' and len(parts) > 2:
-            set_name = ':'.join(parts[2:])
-            try:
-                await self.db.delete_sticker_pack_row(uid, set_name)
-                msg = f'✅ ثبت بسته `{set_name}` از مگا حذف شد.'
-            except Exception as exc:
-                msg = f'❌ خطا: `{self._short(exc)}`'
-            await self.safe_edit(chat_id, message_id, msg, inline([[('↩️ منوی استیکر', 'stk:menu')]]))
-            return
-        if action == 'more':
-            # continue adding after create
-            st = self.states.get(uid) or {}
-            set_name = st.get('set_name')
-            if not set_name:
-                await self._sticker_menu(chat_id, uid, message_id)
-                return
-            self.states[uid] = {
-                'step': 'stk_file', 'mode': 'add', 'set_name': set_name,
-                'title': st.get('title') or set_name, 'chat_id': chat_id,
-            }
-            await self.safe_edit(chat_id, message_id, self._sticker_file_help(), inline([[('❌ لغو', 'stk:menu')]]))
-            return
-        if action == 'done':
-            self.states.pop(uid, None)
-            await self.safe_edit(chat_id, message_id, '✅ ساخت/ویرایش بسته تمام شد.', inline([[('🎨 منوی استیکر', 'stk:menu'), ('🏠 خانه', 'home')]]))
-            return
-
-
-    async def _deliver_sticker_preview(
-        self,
-        chat_id: int,
-        data: bytes,
-        filename: str = 'sticker.webp',
-        caption: str | None = None,
-    ) -> bool:
-        """Prefer real sticker message; only then fall back to document/photo."""
-        # 1) sendSticker with binary (WEBP/PNG) — must be first
-        try:
-            await self.api.send_sticker_file(chat_id, data, filename)
-            return True
-        except Exception as exc:
-            log.warning('sendSticker(bytes) failed: %s', exc)
-        # 2) photo (visible but not sticker UI)
-        try:
-            await self.api.send_photo_bytes(
-                chat_id, data,
-                filename='sticker.png',
-                caption=caption or 'پیش‌نمایش استیکر (هنوز به‌صورت استیکر رسمی نیست)',
-            )
-            return True
-        except Exception as exc:
-            log.warning('sendPhoto sticker preview failed: %s', exc)
-        # 3) document last resort
-        try:
-            await self.api.send_document_file(
-                chat_id, data, filename=filename,
-                caption=caption or 'فایل استیکر',
-            )
-            return True
-        except Exception as exc:
-            log.warning('sendDocument sticker failed: %s', exc)
-        await self.safe_send(chat_id, '⚠️ نمایش استیکر در چت ممکن نشد.', parse_mode=None)
-        return False
-
-    async def _send_sticker_from_set(self, chat_id: int, set_name: str) -> bool:
-        """After create/add, fetch set and send last sticker as real sticker."""
-        try:
-            info = await self.api.get_sticker_set(set_name)
-            if isinstance(info, dict) and 'stickers' not in info and isinstance(info.get('result'), dict):
-                info = info['result']
-            stickers = (info or {}).get('stickers') or []
-            if not stickers:
-                return False
-            last = stickers[-1]
-            fid = last.get('file_id') if isinstance(last, dict) else None
-            if not fid:
-                return False
-            await self.api.send_sticker_by_id(chat_id, fid)
-            return True
-        except Exception as exc:
-            log.warning('send from set failed: %s', exc)
-            return False
-
-    def _sticker_file_help(self) -> str:
-        return (
-            'فایل *عکس* را به‌صورت *فایل/سند* بفرست (نه به‌صورت عکس فشرده).\n\n'
-            'فرمت‌های پیشنهادی: PNG، JPEG، WEBP\n'
-            'ضلع بزرگ‌تر به‌صورت خودکار ۵۱۲ پیکسل می‌شود.\n'
-            f'سقف ورودی حدود {stick_tools.MAX_INPUT_BYTES // (1024*1024)} مگابایت است؛ '
-            'خروجی استاتیک برای API معمولاً زیر ۵۱۲ کیلوبایت نگه داشته می‌شود.\n'
-            'پس‌زمینه شفاف بهتر است.\n\n'
-            '⚠️ استیکر متحرک TGS/WEBM فقط در صورت پشتیبانی واقعی API بله قابل ثبت در بسته است؛ '
-            'در غیر این صورت فایل پردازش‌شده برایت ارسال می‌شود.'
-        )
-
-    def _normalize_pack_name(self, raw: str, bot_username: str | None) -> str:
-        import re
-        s = (raw or '').strip().lower().replace(' ', '_')
-        s = re.sub(r'[^a-z0-9_]', '', s)
-        if not s or not s[0].isalpha():
-            s = 'pack_' + (s or 'x')
-        s = s[:40].rstrip('_')
-        bot_u = (bot_username or 'megabalebot').lstrip('@').lower()
-        suffix = f'_by_{bot_u}'
-        if not s.endswith(suffix):
-            s = s[: max(1, 64 - len(suffix))] + suffix
-        return s[:64]
-
-    async def _sticker_state_message(self, uid: int, chat_id: int, msg: dict, text: str) -> bool:
-        """Handle FSM for sticker maker. Returns True if consumed."""
-        st = self.states.get(uid)
-        if not st or not str(st.get('step', '')).startswith('stk'):
-            return False
-        if chat_id < 0:
-            self.states.pop(uid, None)
-            return False
-        step = st.get('step')
-        if step == 'stk_name':
-            if not text or text.startswith('/'):
-                await self.safe_send(chat_id, 'لطفاً یک نام متنی برای بسته بفرست.', parse_mode=None)
-                return True
-            bot_username = None
-            try:
-                me = await self.api.call('getMe', {}, retries=0)
-                if isinstance(me, dict):
-                    bot_username = (me.get('username') or (me.get('result') or {}).get('username'))
-            except Exception:
-                pass
-            set_name = self._normalize_pack_name(text, bot_username)
-            title = text.strip()[:64] or set_name
-            mode = st.get('mode') or 'create'
-            if mode == 'zip':
-                self.states[uid] = {
-                    'step': 'stk_zip', 'mode': 'zip', 'set_name': set_name,
-                    'title': title, 'chat_id': chat_id,
-                }
-                await self.safe_send(
-                    chat_id,
-                    f'نام بسته: `{set_name}`\nحالا فایل ZIP تصاویر را به‌صورت سند بفرست.',
-                    inline([[('❌ لغو', 'stk:menu')]]),
-                )
-            else:
-                self.states[uid] = {
-                    'step': 'stk_file', 'mode': 'create', 'set_name': set_name,
-                    'title': title, 'chat_id': chat_id,
-                }
-                await self.safe_send(chat_id, self._sticker_file_help(), inline([[('❌ لغو', 'stk:menu')]]))
-            return True
-
-        if step in ('stk_file', 'stk_zip'):
-            # file expected — if user sent text, remind
-            doc = msg.get('document') or {}
-            photo = msg.get('photo')
-            anim = msg.get('animation')
-            file_id = None
-            fname = 'sticker.png'
-            fsize = 0
-            if isinstance(doc, dict) and doc.get('file_id'):
-                file_id = doc['file_id']
-                fname = doc.get('file_name') or fname
-                fsize = int(doc.get('file_size') or 0)
-            elif isinstance(anim, dict) and anim.get('file_id'):
-                file_id = anim['file_id']
-                fname = anim.get('file_name') or 'anim.gif'
-                fsize = int(anim.get('file_size') or 0)
-            elif isinstance(photo, list) and photo:
-                # discourage compressed photo but accept largest
-                best = max(photo, key=lambda p: int(p.get('file_size') or 0))
-                file_id = best.get('file_id')
-                fsize = int(best.get('file_size') or 0)
-                fname = 'photo.jpg'
-                await self.safe_send(
-                    chat_id,
-                    '⚠️ بهتر است تصویر را به‌صورت *فایل* بفرستی نه عکس فشرده. فعلاً همین را پردازش می‌کنم…',
-                )
-            if not file_id:
-                await self.safe_send(chat_id, 'یک فایل تصویر یا ZIP به‌صورت سند بفرست.', parse_mode=None)
-                return True
-            if fsize and fsize > stick_tools.MAX_INPUT_BYTES:
-                await self.safe_send(chat_id, 'حجم فایل بیش از سقف مجاز ورودی است.', parse_mode=None)
-                return True
-            try:
-                raw, _name = await self.api.get_file_bytes(file_id, max_bytes=stick_tools.MAX_INPUT_BYTES)
-            except Exception as exc:
-                await self.safe_send(chat_id, f'دانلود فایل ناموفق بود: `{self._short(exc)}`')
-                return True
-            if step == 'stk_zip':
-                await self._sticker_process_zip(uid, chat_id, raw, st)
-                return True
-            # single image path → ask emoji
-            try:
-                prepared, out_name = stick_tools.prepare_static_sticker(raw, fname)
-            except ValueError as exc:
-                await self.safe_send(chat_id, f'❌ {exc}', parse_mode=None)
-                return True
-            except Exception as exc:
-                log.exception('sticker prepare')
-                await self.safe_send(chat_id, f'پردازش تصویر ناموفق: `{self._short(exc)}`')
-                return True
-            st['prepared'] = prepared
-            st['out_name'] = out_name
-            st['step'] = 'stk_emoji'
-            self.states[uid] = st
-            # Always show the processed sticker in chat
-            await self._deliver_sticker_preview(chat_id, prepared, out_name)
-            await self.safe_send(
-                chat_id,
-                '✅ فایل آماده شد و همین‌جا برات فرستادم.\n'
-                'حالا یک ایموجی مرتبط با این استیکر بفرست (مثلاً 😎).',
-                inline([[('❌ لغو', 'stk:menu')]]),
-            )
-            return True
-
-        if step == 'stk_emoji':
-            # take first emoji-ish chars from text
-            emoji = (text or '').strip()
-            if not emoji:
-                await self.safe_send(chat_id, 'یک ایموجی بفرست.', parse_mode=None)
-                return True
-            # keep first grapheme cluster approx
-            emoji = emoji[:8]
-            prepared = st.get('prepared')
-            out_name = st.get('out_name') or 'sticker.webp'
-            set_name = st.get('set_name')
-            title = st.get('title') or set_name
-            mode = st.get('mode') or 'create'
-            if not prepared or not set_name:
-                self.states.pop(uid, None)
-                await self.safe_send(chat_id, 'وضعیت ساخت ناقص بود؛ از منو دوباره شروع کن.', parse_mode=None)
-                return True
-            await self.safe_send(chat_id, '⏳ در حال ثبت استیکر در بله…', parse_mode=None)
-            # Always deliver the sticker asset to the user first
-            await self._deliver_sticker_preview(chat_id, prepared, out_name, caption='استیکر آماده‌شده')
-            ok = False
-            err = ''
-            try:
-                if mode == 'create' and not st.get('created'):
-                    ok = await self.api.create_new_sticker_set(
-                        uid, set_name, title, prepared, emoji, out_name,
-                    )
-                    st['created'] = True
-                else:
-                    ok = await self.api.add_sticker_to_set(
-                        uid, set_name, prepared, emoji, out_name,
-                    )
-            except Exception as exc:
-                err = self._short(exc)
-                log.warning('sticker API failed: %s', err)
-            if ok:
-                try:
-                    await self.db.upsert_sticker_pack(uid, set_name, title, 1)
-                except Exception:
-                    log.exception('upsert sticker pack')
-                st['prepared'] = None
-                st['step'] = 'stk_file'
-                st['mode'] = 'add'
-                self.states[uid] = st
-                ok_msg = (
-                    '🥳 ثبت در API بله موفق بود.' + chr(10)
-                    + f'نام فنی بسته: `{set_name}`' + chr(10)
-                    + f'ایموجی: {emoji}' + chr(10) + chr(10)
-                    + 'استیکر بالا در چت هم برات فرستاده شد. '
-                    + 'می‌توانی فایل بعدی را بفرستی یا کار را تمام کنی.'
-                )
-                # Real sticker message via file_id from the set
-                sent_as_sticker = await self._send_sticker_from_set(chat_id, set_name)
-                if not sent_as_sticker:
-                    await self._deliver_sticker_preview(chat_id, prepared, out_name)
-                note = (
-                    'استیکر به‌صورت استیکر رسمی در چت ارسال شد.'
-                    if sent_as_sticker
-                    else 'ثبت بسته انجام شد؛ اگر به‌صورت استیکر دیده نشد، API بله sendSticker را محدود کرده.'
-                )
-                await self.safe_send(
-                    chat_id,
-                    ok_msg + chr(10) + note,
-                    inline([
-                        [('➕ افزودن استیکر دیگر', 'stk:more')],
-                        [('✅ پایان', 'stk:done'), ('🎨 منوی استیکر', 'stk:menu')],
-                    ]),
-                )
-            else:
-                fail_msg = '⚠️ ثبت خودکار بسته در API بله ناموفق بود'
-                if err:
-                    fail_msg += ':' + chr(10) + '`' + str(err) + '`'
-                else:
-                    fail_msg += '.'
-                fail_msg += (
-                    chr(10) + chr(10)
-                    + 'استیکر پردازش‌شده در پیام بالا برات ارسال شد؛ '
-                    + 'می‌توانی آن را ذخیره کنی. افزودن مستقیم به مجموعه شخصی '
-                    + 'فقط وقتی API بله createNewStickerSet را بپذیرد ممکن است.'
-                )
-                await self.safe_send(
-                    chat_id,
-                    fail_msg,
-                    inline([[('🎨 منوی استیکر', 'stk:menu'), ('🏠 خانه', 'home')]]),
-                )
-                self.states.pop(uid, None)
-            return True
-        return False
-
-    async def _sticker_process_zip(self, uid: int, chat_id: int, raw: bytes, st: dict) -> None:
-        try:
-            files = stick_tools.extract_zip_images(raw, max_files=40)
-        except ValueError as exc:
-            await self.safe_send(chat_id, f'❌ {exc}', parse_mode=None)
-            return
-        if not files:
-            await self.safe_send(chat_id, 'تصویر مجازی داخل ZIP پیدا نشد.', parse_mode=None)
-            return
-        set_name = st.get('set_name')
-        title = st.get('title') or set_name
-        ok_n = 0
-        fail_n = 0
-        created = False
-        for idx, (fname, data) in enumerate(files):
-            try:
-                prepared, out_name = stick_tools.prepare_static_sticker(data, fname)
-            except Exception:
-                fail_n += 1
-                continue
-            emoji = '⭐'
-            try:
-                if not created:
-                    await self.api.create_new_sticker_set(uid, set_name, title, prepared, emoji, out_name)
-                    created = True
-                    ok_n += 1
-                else:
-                    await self.api.add_sticker_to_set(uid, set_name, prepared, emoji, out_name)
-                    ok_n += 1
-            except Exception:
-                fail_n += 1
-            await asyncio.sleep(0.25)
-        if ok_n:
-            try:
-                await self.db.upsert_sticker_pack(uid, set_name, title, ok_n)
-            except Exception:
-                pass
-        self.states.pop(uid, None)
-        await self.safe_send(
-            chat_id,
-            f'نتیجه ZIP:\n✅ موفق: *{ok_n}*\n❌ ناموفق: *{fail_n}*\nبسته: `{set_name}`',
-            inline([[('🎨 منوی استیکر', 'stk:menu')]]),
-        )
 
     async def show_admin(self, chat_id: int, uid: int, owner: bool, edit_id: int | None = None, page: int = 0) -> None:
         if not owner:

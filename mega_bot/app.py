@@ -5381,11 +5381,17 @@ class MegaBot:
         await self.safe_edit(chat_id, message_id, '⏳ در حال پاک‌سازی...', None)
         ok, fail = await self._delete_mids(chat_id, mids)
         total = ok + fail
-        await self.safe_send(
-            chat_id,
-            f'✅ نتیجه پاک‌سازی\n🗑 پاک شد: {ok}\n⚠️ پاک نشد: {fail}\n📌 مجموع تلاش: {total}',
-            parse_mode=None,
+        try:
+            await self.api.delete_message(chat_id, message_id)
+        except Exception:
+            pass
+        notice = (
+            '✅ نتیجه پاک‌سازی' + chr(10)
+            + f'🗑 پاک شد: {ok}' + chr(10)
+            + f'⚠️ پاک نشد: {fail}' + chr(10)
+            + f'📌 مجموع تلاش: {total}'
         )
+        await self._send_short_notice(chat_id, notice, seconds=5.0, parse_mode=None)
 
     async def _resolve_mod_target(
         self, chat_id: int, text_arg: str, replied: dict, entities: list | None = None,

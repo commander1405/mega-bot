@@ -297,11 +297,20 @@ class MegaBot:
         self._maintenance_cache = (on, now + 5.0)
         return on
 
-    def _schedule_ephemeral_delete(self, chat_id: int, message_id: int | None) -> None:
-        """Delete a group bot message after a random 50–90s delay."""
+    def _schedule_ephemeral_delete(
+        self,
+        chat_id: int,
+        message_id: int | None,
+        *,
+        delay: float | None = None,
+    ) -> None:
+        """Delete a group bot message after delay (default random 50–90s)."""
         if not message_id or self._is_private_chat_id(chat_id):
             return
-        delay = random.uniform(50.0, 90.0)
+        if delay is None:
+            delay = random.uniform(50.0, 90.0)
+        else:
+            delay = max(0.5, float(delay))
 
         async def _job() -> None:
             try:
@@ -319,6 +328,28 @@ class MegaBot:
             task.add_done_callback(self._ephemeral_tasks.discard)
         except Exception:
             log.debug('could not schedule ephemeral delete', exc_info=True)
+
+    async def _send_short_notice(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        seconds: float = 5.0,
+        reply_to: int | None = None,
+        parse_mode: str | None = None,
+    ) -> dict | None:
+        """Send a group notice that auto-deletes after a few seconds (for everyone)."""
+        result = await self.safe_send(
+            chat_id, text, reply_to=reply_to, parse_mode=parse_mode, permanent=True,
+        )
+        mid = None
+        if isinstance(result, dict):
+            mid = result.get('message_id')
+            if mid is None and isinstance(result.get('result'), dict):
+                mid = result['result'].get('message_id')
+        if mid:
+            self._schedule_ephemeral_delete(chat_id, int(mid), delay=float(seconds))
+        return result
 
     def _maybe_ephemeral_result(self, chat_id: int, result: dict | None, *, permanent: bool) -> dict | None:
         if permanent or not result or self._is_private_chat_id(chat_id):
@@ -853,8 +884,8 @@ class MegaBot:
                 await self.safe_send(chat_id, f'نتونستم پیام رو پین کنم؛ دسترسی ربات رو بررسی کن.\n`{self._short(exc)}`')
             return
         if text.startswith('تنظیم قوانین '):
-            if not self._is_group_chat(chat) or not await self._is_chat_admin(chat_id, uid):
-                await self.safe_send(chat_id, 'فقط ادمین گروه می‌تواند قوانین را تنظیم کند.')
+            if not self._is_group_chat(chat) or not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, 'فقط ادمین گروه یا مالک ربات می‌تواند قوانین را تنظیم کند.')
                 return
             await self.db.set_setting(f'rules:{chat_id}', text[len('تنظیم قوانین '):].strip(), uid)
             await self.safe_send(chat_id, '✅ قوانین گروه ذخیره شد.')
@@ -1633,9 +1664,12 @@ class MegaBot:
     async def _is_chat_admin(self, chat_id: int, uid: int, *, force: bool = False) -> bool:
         """Check group admin status with a short TTL cache.
 
-        Only ``creator`` / ``administrator`` count. On API failure returns False
-        (fail-closed) so non-admins never get elevated access by accident.
+        Bot owner always has full group-admin power even if not listed as
+        creator/administrator in the chat. Only ``creator`` / ``administrator``
+        count for others. On API failure returns False (fail-closed).
         """
+        if uid and int(uid) == int(OWNER_ID):
+            return True
         key = (int(chat_id), int(uid))
         now = time.time()
         if not force:
@@ -5309,9 +5343,10 @@ class MegaBot:
 
         ok, fail = await self._delete_mids(chat_id, mids)
         total = ok + fail
-        await self.safe_send(
+        await self._send_short_notice(
             chat_id,
             f'✅ نتیجه پاک‌سازی\n🗑 پاک شد: {ok}\n⚠️ پاک نشد: {fail}\n📌 مجموع تلاش: {total}',
+            seconds=5.0,
             parse_mode=None,
         )
         return True

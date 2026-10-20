@@ -187,7 +187,8 @@ class MegaBot:
         Groups stay text-first; mod actions use MessageHub.send_event explicitly.
         """
         keyboard = await self._with_ad_keyboard(keyboard, skip_ad=skip_ad)
-        # PV: always try photo+caption for richer UX
+        # PV: photo only for important menus/results — never for سلام / social / emoji
+        # Groups: never auto-attach photos here (mod actions call msg.send_event explicitly)
         if (
             not force_text
             and self._is_private_chat_id(chat_id)
@@ -195,15 +196,16 @@ class MegaBot:
             and hasattr(self, 'msg')
         ):
             try:
-                from .messaging import pick_pv_asset
-                key = event_key or pick_pv_asset(text)
-                result = await self.msg.send_event(
-                    chat_id, key, text,
-                    keyboard=keyboard, reply_to=reply_to,
-                    parse_mode=parse_mode, permanent=permanent,
-                )
-                if result is not None:
-                    return result
+                from .messaging import pick_pv_asset, should_attach_asset
+                if should_attach_asset(text, event_key):
+                    key = event_key or pick_pv_asset(text)
+                    result = await self.msg.send_event(
+                        chat_id, key, text,
+                        keyboard=keyboard, reply_to=reply_to,
+                        parse_mode=parse_mode, permanent=permanent,
+                    )
+                    if result is not None:
+                        return result
             except Exception as exc:
                 log.debug('PV asset send failed, text fallback: %s', type(exc).__name__)
         plain = (text or '').replace('*', '').replace('`', '').replace('_', '')
@@ -1262,7 +1264,7 @@ class MegaBot:
             stats = {}
         reply = self.social_reply(text, stats)
         if reply:
-            await self.safe_send(chat_id, reply, reply_to=msg.get('message_id'))
+            await self.safe_send(chat_id, reply, force_text=True, reply_to=msg.get('message_id'))
 
     async def on_callback(self, query: dict) -> None:
         """Route every inline-button click to a visible outcome.

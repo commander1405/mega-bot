@@ -62,45 +62,92 @@ TEXT_ONLY_EVENTS = frozenset({
     # Reserved — PV always uses icons via pick_pv_asset / send_event
 })
 
+def is_casual_text(text: str) -> bool:
+    """True for greetings / emoji / short social replies — never attach icons."""
+    import re
+    t = (text or '').strip()
+    if not t:
+        return True
+    # strip markdown noise
+    plain = re.sub(r'[*`_]', '', t).strip()
+    low = plain.lower()
+    casual_keys = (
+        'سلام', 'سلامم', 'درود', 'دورد', 'خداحافظ', 'خدافظ', 'بدرود',
+        'شب خوش', 'صبح بخیر', 'خوبی', 'خوبم', 'چخبر', 'چه خبر',
+        'مرسی', 'ممنون', '😂', '😄', '🌿', '🌱', '🍃', '🌙',
+        'رفیق', 'چه خبرا', 'حالت چطور',
+    )
+    # pure/short emoji or very short social
+    if len(plain) <= 40:
+        for k in casual_keys:
+            if k in plain or k in low:
+                return True
+    # emoji-only or almost only emoji
+    no_emoji = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27bf\uFE0F]', '', plain)
+    if len(plain) <= 12 and len(no_emoji.strip()) <= 2:
+        return True
+    return False
+
+
+def should_attach_asset(text: str, event_key: str | None = None) -> bool:
+    """Only important operational / menu messages get icons — not social chatter."""
+    if event_key and event_key not in (
+        'ordinary_reply', 'greeting', 'goodbye', 'learning_list',
+        'conversation', 'callback_text', 'casual',
+    ):
+        # explicit operational event from caller
+        if event_key in EVENT_ASSETS:
+            return True
+    if is_casual_text(text or ''):
+        return False
+    # important PV menus / results
+    raw = text or ''
+    important = (
+        'مرکز اطلاعات', 'آمار', 'حمایت', 'تومان', 'راهنما', 'امکانات بیشتر',
+        'هویت مگا', 'پرونده', 'پنل', 'مالک', 'مدیر', 'بن', 'اخطار', 'سکوت',
+        'تنظیم', 'قفل', 'همگانی', 'خطا', 'موفق', 'نسخه', 'donation',
+        'ارتباط با مگا', 'سازندگان', 'ویژه',
+    )
+    return any(k in raw for k in important)
+
+
 def pick_pv_asset(text: str) -> str:
-    """Choose a neon icon for private-chat replies based on caption content."""
+    """Choose a neon icon for important private-chat replies only."""
     s = (text or '').lower()
     raw = text or ''
     rules = [
-        (('بن', 'مسدود', 'ban'), 'user_banned'),
-        (('رفع بن', 'آنبن', 'انبن', 'unban'), 'user_unbanned'),
-        (('اخطار', 'warn'), 'user_warned'),
-        (('سکوت', 'mute'), 'user_muted'),
-        (('حذف سکوت', 'unmute'), 'user_unmuted'),
-        (('اخراج', 'کیک', 'kick'), 'user_kicked'),
-        (('خطا', 'ناموفق', '❌', 'مشکل'), 'operation_error'),
-        (('موفق', '✅', 'ذخیره شد', 'انجام شد'), 'operation_success'),
-        (('صبر', 'پردازش', '⏳', 'در حال'), 'processing'),
+        (('بن', 'مسدود'), 'user_banned'),
+        (('رفع بن', 'آنبن', 'انبن'), 'user_unbanned'),
+        (('اخطار',), 'user_warned'),
+        (('حذف سکوت',), 'user_unmuted'),
+        (('سکوت',), 'user_muted'),
+        (('اخراج', 'کیک'), 'user_kicked'),
+        (('خطا', 'ناموفق', 'مشکل'), 'operation_error'),
+        (('موفق', 'ذخیره شد', 'انجام شد'), 'operation_success'),
+        (('پردازش',), 'processing'),
         (('آمار', 'مرکز اطلاعات', 'داشبورد'), 'stats_report'),
-        (('راهنما', 'راهنمای'), 'help'),
-        (('حمایت', 'تومان', 'donate'), 'support'),
-        (('تشکر', 'ممنون'), 'thanks'),
-        (('ویژه', 'vip'), 'vip'),
-        (('تنظیم', 'settings'), 'settings'),
-        (('زمان', 'زمان‌بندی'), 'schedule'),
-        (('همگانی', 'broadcast'), 'broadcast'),
-        (('لیست یادگیری', 'یادگیری'), 'learning_list'),
-        (('پیشنهاد',), 'suggestion'),
-        (('لیست', 'فهرست', 'امکانات'), 'list_menu'),
-        (('سلام', 'خوش آمد'), 'logo'),
-        (('محدود', '⛔'), 'shield'),
-        (('هدیه', 'تخفیف'), 'gift'),
-        (('تقدیر', 'ستاره'), 'award'),
+        (('راهنما',), 'help'),
+        (('حمایت', 'تومان'), 'support'),
+        (('ویژه',), 'vip'),
+        (('تنظیم',), 'settings'),
+        (('زمان‌بندی', 'زمانب'), 'schedule'),
+        (('همگانی',), 'broadcast'),
+        (('یادگیری',), 'learning_list'),
+        (('امکانات', 'فهرست', 'لیست'), 'list_menu'),
+        (('محدود',), 'shield'),
+        (('سازندگان', 'تیم'), 'brand'),
+        (('هویت', 'درباره'), 'logo'),
+        (('ارتباط', 'پشتیبانی'), 'system_notice'),
     ]
     for keys, asset in rules:
         for k in keys:
-            if k.lower() in s or k in raw:
+            if k in raw or k in s:
                 return asset
     return 'logo'
 
 
 
-_SETTINGS_KEY = 'asset_file_ids'
+_SETTINGS_KEY = 'asset_file_ids_v3'
 
 
 def asset_path(event_key: str) -> Path | None:

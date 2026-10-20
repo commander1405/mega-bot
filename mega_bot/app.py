@@ -180,14 +180,32 @@ class MegaBot:
             return keyboard
         return {'inline_keyboard': [[ad_btn]]}
 
-    async def safe_send(self, chat_id: int, text: str, keyboard: dict | None = None, reply_to: int | None = None, parse_mode: str | None = 'Markdown', *, skip_ad: bool = False, permanent: bool = False) -> dict | None:
+    async def safe_send(self, chat_id: int, text: str, keyboard: dict | None = None, reply_to: int | None = None, parse_mode: str | None = 'Markdown', *, skip_ad: bool = False, permanent: bool = False, force_text: bool = False, event_key: str | None = None) -> dict | None:
         """Send with progressive fallbacks. Prefer no-reply first for reliability in groups.
 
-        Logs every attempt outcome. Uses fast=True (no long retries) so group handlers
-        cannot burn the 15s update budget on a single stuck TCP connect.
-        When ads are enabled, attaches the ad URL button to inline keyboards.
+        In private chats, attaches a neon asset photo (file_id-cached) unless force_text=True.
+        Groups stay text-first; mod actions use MessageHub.send_event explicitly.
         """
         keyboard = await self._with_ad_keyboard(keyboard, skip_ad=skip_ad)
+        # PV: always try photo+caption for richer UX
+        if (
+            not force_text
+            and self._is_private_chat_id(chat_id)
+            and (text or '').strip()
+            and hasattr(self, 'msg')
+        ):
+            try:
+                from .messaging import pick_pv_asset
+                key = event_key or pick_pv_asset(text)
+                result = await self.msg.send_event(
+                    chat_id, key, text,
+                    keyboard=keyboard, reply_to=reply_to,
+                    parse_mode=parse_mode, permanent=permanent,
+                )
+                if result is not None:
+                    return result
+            except Exception as exc:
+                log.debug('PV asset send failed, text fallback: %s', type(exc).__name__)
         plain = (text or '').replace('*', '').replace('`', '').replace('_', '')
         # IMPORTANT: try WITHOUT reply_to first — reply_to is a common Bale failure mode
         # and previously caused the whole handler to sit on a long timeout before fallback.

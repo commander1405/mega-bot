@@ -366,6 +366,7 @@ class BaleAPI:
         caption: str | None = None,
         reply_markup: dict | None = None,
         parse_mode: str | None = None,
+        reply_to: int | None = None,
     ) -> dict:
         session = await self._ensure_session()
         form = aiohttp.FormData()
@@ -376,6 +377,8 @@ class BaleAPI:
             form.add_field('parse_mode', parse_mode)
         if reply_markup is not None:
             form.add_field('reply_markup', json.dumps(reply_markup, ensure_ascii=False))
+        if reply_to is not None:
+            form.add_field('reply_to_message_id', str(int(reply_to)))
         form.add_field('photo', data, filename=filename, content_type='image/png')
         async with session.post(
             self.base + 'sendPhoto',
@@ -391,7 +394,7 @@ class BaleAPI:
                 raise BaleAPIError(f"sendPhoto: HTTP {response.status}: {result.get('description', result)}")
             return result.get('result', result)
 
-    async def send_photo(self, chat_id: int, photo: str, caption: str | None = None, reply_markup: dict | None = None, parse_mode: str | None = None) -> dict:
+    async def send_photo(self, chat_id: int, photo: str, caption: str | None = None, reply_markup: dict | None = None, parse_mode: str | None = None, reply_to: int | None = None) -> dict:
         payload: dict[str, Any] = {'chat_id': chat_id, 'photo': photo}
         if caption:
             payload['caption'] = caption
@@ -399,6 +402,8 @@ class BaleAPI:
             payload['reply_markup'] = reply_markup
         if parse_mode:
             payload['parse_mode'] = parse_mode
+        if reply_to is not None:
+            payload['reply_to_message_id'] = int(reply_to)
         return await self.call('sendPhoto', payload, retries=0)
 
     async def send_video(self, chat_id: int, video: str, caption: str | None = None, reply_markup: dict | None = None, parse_mode: str | None = None) -> dict:

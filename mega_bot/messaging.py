@@ -52,13 +52,44 @@ EVENT_ASSETS: dict[str, str] = {
 
 # Events that intentionally stay text-only (documented mapping)
 TEXT_ONLY_EVENTS = frozenset({
-    'ordinary_reply',
-    'greeting',
-    'goodbye',
-    'learning_list',
-    'conversation',
-    'callback_text',
+    # Reserved — PV always uses icons via pick_pv_asset / send_event
 })
+
+def pick_pv_asset(text: str) -> str:
+    """Choose a neon icon for private-chat replies based on caption content."""
+    s = (text or '').lower()
+    raw = text or ''
+    rules = [
+        (('بن', 'مسدود', 'ban'), 'user_banned'),
+        (('رفع بن', 'آنبن', 'انبن', 'unban'), 'user_unbanned'),
+        (('اخطار', 'warn'), 'user_warned'),
+        (('سکوت', 'mute'), 'user_muted'),
+        (('حذف سکوت', 'unmute'), 'user_unmuted'),
+        (('اخراج', 'کیک', 'kick'), 'user_kicked'),
+        (('خطا', 'ناموفق', '❌', 'مشکل'), 'operation_error'),
+        (('موفق', '✅', 'ذخیره شد', 'انجام شد'), 'operation_success'),
+        (('صبر', 'پردازش', '⏳', 'در حال'), 'processing'),
+        (('آمار', 'مرکز اطلاعات', 'داشبورد'), 'stats_report'),
+        (('راهنما', 'راهنمای'), 'help'),
+        (('حمایت', 'تومان', 'donate'), 'support'),
+        (('تشکر', 'ممنون'), 'thanks'),
+        (('ویژه', 'vip'), 'vip'),
+        (('تنظیم', 'settings'), 'settings'),
+        (('زمان', 'زمان‌بندی'), 'schedule'),
+        (('همگانی', 'broadcast'), 'broadcast'),
+        (('لیست', 'فهرست', 'امکانات'), 'list_menu'),
+        (('سلام', 'خوش آمد'), 'logo'),
+        (('محدود', '⛔'), 'shield'),
+        (('هدیه', 'تخفیف'), 'gift'),
+        (('تقدیر', 'ستاره'), 'award'),
+    ]
+    for keys, asset in rules:
+        for k in keys:
+            if k.lower() in s or k in raw:
+                return asset
+    return 'logo'
+
+
 
 _SETTINGS_KEY = 'asset_file_ids'
 
@@ -174,6 +205,7 @@ class MessageHub:
                 result = await self.bot.api.send_photo(
                     chat_id, file_id, caption=caption,
                     reply_markup=keyboard, parse_mode=parse_mode,
+                    reply_to=reply_to,
                 )
                 return self.bot._maybe_ephemeral_result(chat_id, result, permanent=permanent)
             except Exception as exc:

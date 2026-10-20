@@ -384,6 +384,27 @@ class MegaBot:
             self._schedule_ephemeral_delete(chat_id, int(mid))
         return result
 
+    
+    async def send_error(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_to: int | None = None,
+        permanent: bool = False,
+    ) -> dict | None:
+        """User-facing error with error asset photo (groups + PV)."""
+        try:
+            return await self.msg.send_event(
+                chat_id, 'operation_error', text,
+                reply_to=reply_to, parse_mode=None, permanent=permanent,
+            )
+        except Exception:
+            return await self.safe_send(
+                chat_id, text, reply_to=reply_to, parse_mode=None,
+                force_text=True, permanent=permanent,
+            )
+
     async def safe_edit(self, chat_id: int, message_id: int, text: str, keyboard: dict | None = None) -> None:
         try:
             await self.api.edit_message(chat_id, message_id, text, keyboard)
@@ -4962,7 +4983,7 @@ class MegaBot:
 
         arg = (text_arg or '').strip()
         if not arg:
-            return None, '', '❓ کاربر هدف مشخص نیست. روی پیامش ریپلای کن یا با @یوزرنیم / آیدی بنویس.'
+            return None, '', '❌ کاربر هدف مشخص نیست.' + chr(10) + 'اول روی پیام کاربر ریپلای کن یا یوزرنیم/آیدی بفرست.' + chr(10) + 'مثال: بن @username'
 
         # 3) @username or bare username / numeric id
         term = arg.lstrip('@').strip()
@@ -5048,7 +5069,11 @@ class MegaBot:
 
         is_admin = await self._has_group_mod_power(chat_id, uid)
         if not is_admin:
-            await self.safe_send(chat_id, '⛔ این دستور فقط برای مدیران گروه یا کاربران ویژه است.', reply_to=msg.get('message_id'), parse_mode=None)
+            await self.send_error(
+                chat_id,
+                '⛔ این دستور فقط برای مدیران گروه یا کاربران ویژه است.',
+                reply_to=msg.get('message_id'),
+            )
             return True
 
         # Clear ALL warns in group — no target needed
@@ -5063,28 +5088,40 @@ class MegaBot:
                 )
             except Exception:
                 log.exception('clear_all_group_warns failed')
-                await self.safe_send(chat_id, '❌ پاک‌سازی اخطارها ناموفق بود.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.send_error(chat_id, '❌ پاک‌سازی اخطارها ناموفق بود.', reply_to=msg.get('message_id'))
             return True
 
         entities = msg.get('entities') or []
         target_uid, target_name, err = await self._resolve_mod_target(chat_id, rest, replied, entities)
         if err or not target_uid:
-            await self.safe_send(chat_id, err or '❓ کاربر هدف پیدا نشد.', reply_to=msg.get('message_id'), parse_mode=None)
+            msg_err = err or (
+                '❌ کاربر هدف مشخص نیست.' + chr(10)
+                + 'روی پیام کاربر ریپلای کن یا یوزرنیم / آیدی عددی بفرست.' + chr(10)
+                + 'مثال: بن @username'
+            )
+            await self.send_error(chat_id, msg_err, reply_to=msg.get('message_id'))
             return True
 
         if self.bot_id and target_uid == self.bot_id:
-            await self.safe_send(
+            await self.send_error(
                 chat_id,
-                '😂 منو می‌خوای بن کنی؟! داداش من خودم رباتم و نمی‌تونم خودمو بن کنم!',
+                '❌ نمی‌توان روی خود ربات عملیات مدیریتی انجام داد.',
                 reply_to=msg.get('message_id'),
-                parse_mode=None,
             )
             return True
         if target_uid == OWNER_ID:
-            await self.safe_send(chat_id, '⛔ مالک ربات قابل مدیریت با این دستور نیست.', reply_to=msg.get('message_id'), parse_mode=None)
+            await self.send_error(
+                chat_id,
+                '⛔ مالک ربات قابل مدیریت با این دستور نیست.',
+                reply_to=msg.get('message_id'),
+            )
             return True
         if target_uid == uid and action in ('ban', 'kick', 'mute', 'warn'):
-            await self.safe_send(chat_id, '🤔 نمی‌تونم این عملیات رو روی خودت انجام بدم!', reply_to=msg.get('message_id'), parse_mode=None)
+            await self.send_error(
+                chat_id,
+                '❌ این عملیات روی خودت قابل انجام نیست.',
+                reply_to=msg.get('message_id'),
+            )
             return True
 
         # Warn ops
@@ -5103,7 +5140,7 @@ class MegaBot:
                     await self._execute_auto_punish(chat_id, target_uid, total, gs.get('moderation') or {})
             except Exception:
                 log.exception('manual warn failed')
-                await self.safe_send(chat_id, '❌ ثبت اخطار ناموفق بود.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.send_error(chat_id, '❌ ثبت اخطار ناموفق بود.', reply_to=msg.get('message_id'))
             return True
 
         if action == 'remove_warn':
@@ -5126,7 +5163,7 @@ class MegaBot:
                 )
             except Exception:
                 log.exception('remove_warn failed')
-                await self.safe_send(chat_id, '❌ حذف اخطار ناموفق بود.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.send_error(chat_id, '❌ حذف اخطار ناموفق بود.', reply_to=msg.get('message_id'))
             return True
 
         # API actions: mute/unmute/ban/unban/kick
@@ -5197,7 +5234,7 @@ class MegaBot:
             else:
                 user_msg = '⚠️ عملیات انجام نشد. دسترسی‌های مدیریتی ربات در گروه را بررسی کن.'
                 log.warning('mod action failed chat=%s action=%s: %s', chat_id, action, type(exc).__name__)
-            await self.safe_send(chat_id, user_msg, reply_to=msg.get('message_id'), parse_mode=None)
+            await self.send_error(chat_id, user_msg, reply_to=msg.get('message_id'))
         return True
 
     LOCK_LABELS: list[tuple[str, str]] = [

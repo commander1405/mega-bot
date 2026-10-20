@@ -23,6 +23,7 @@ ASSETS_DIR = Path(__file__).resolve().parent / 'assets' / 'icons'
 
 # event_key -> icon filename stem (no .png)
 EVENT_ASSETS: dict[str, str] = {
+    # Official MEGA BOT / DarkKnight asset pack (cropped from design sheet)
     'user_banned': 'user_banned',
     'user_unbanned': 'user_unbanned',
     'user_warned': 'user_warned',
@@ -37,18 +38,24 @@ EVENT_ASSETS: dict[str, str] = {
     'stats_report': 'stats_report',
     'list_menu': 'list_menu',
     'help': 'help',
+    'logo': 'logo',
+    'learning_list': 'learning_list',
+    'suggestion': 'suggestion',
     'operation_success': 'operation_success',
     'operation_error': 'operation_error',
     'processing': 'processing',
     'thanks': 'thanks',
     'vip': 'vip',
+    'vip_members': 'vip_members',
     'gift': 'gift',
+    'occasion': 'occasion',
     'award': 'award',
     'support': 'support',
-    'occasion': 'occasion',
-    'shield': 'shield',
-    'logo': 'logo',
+    'brand': 'brand',
+    # aliases
+    'shield': 'user_unmuted',
 }
+
 
 # Events that intentionally stay text-only (documented mapping)
 TEXT_ONLY_EVENTS = frozenset({
@@ -77,6 +84,8 @@ def pick_pv_asset(text: str) -> str:
         (('تنظیم', 'settings'), 'settings'),
         (('زمان', 'زمان‌بندی'), 'schedule'),
         (('همگانی', 'broadcast'), 'broadcast'),
+        (('لیست یادگیری', 'یادگیری'), 'learning_list'),
+        (('پیشنهاد',), 'suggestion'),
         (('لیست', 'فهرست', 'امکانات'), 'list_menu'),
         (('سلام', 'خوش آمد'), 'logo'),
         (('محدود', '⛔'), 'shield'),

@@ -147,7 +147,7 @@ def pick_pv_asset(text: str) -> str:
 
 
 
-_SETTINGS_KEY = 'asset_file_ids_v3'
+_SETTINGS_KEY = 'asset_file_ids_v4'
 
 
 def asset_path(event_key: str) -> Path | None:

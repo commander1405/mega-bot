@@ -151,7 +151,6 @@ def pick_pv_asset(text: str) -> str:
 
 
 
-_SETTINGS_KEY = 'asset_file_ids_v5'
 
 
 def asset_path(event_key: str) -> Path | None:
@@ -184,6 +183,11 @@ def extract_photo_file_id(result: Any) -> str | None:
     return best
 
 
+# Content fingerprint of assets/ PNG pack — changing any icon invalidates cache
+ASSET_PACK_SIG = '7e3f62dc2788'
+_SETTINGS_KEY = f'asset_file_ids_{ASSET_PACK_SIG}'
+
+
 class MessageHub:
     """Send text or event photos with persistent file_id cache."""
 
@@ -191,6 +195,7 @@ class MessageHub:
         self.bot = bot
         self._memory: dict[str, str] = {}  # event_key -> file_id
         self._loaded = False
+        log.info('MessageHub assets dir=%s pack=%s', ASSETS_DIR, ASSET_PACK_SIG)
 
     async def _load_cache(self) -> None:
         if self._loaded:
@@ -201,14 +206,21 @@ class MessageHub:
             if isinstance(raw, str):
                 raw = json.loads(raw)
             if isinstance(raw, dict):
-                self._memory = {str(k): str(v) for k, v in raw.items() if v}
+                # only keep entries for current pack
+                if raw.get('_pack') == ASSET_PACK_SIG:
+                    self._memory = {str(k): str(v) for k, v in raw.items() if k != '_pack' and v}
+                else:
+                    self._memory = {}
+                    log.info('asset cache pack mismatch — will re-upload icons')
         except Exception:
             log.debug('asset file_id cache load failed', exc_info=True)
             self._memory = {}
 
     async def _save_cache(self) -> None:
         try:
-            await self.bot.db.set_setting(_SETTINGS_KEY, self._memory, 0)
+            payload = dict(self._memory)
+            payload['_pack'] = ASSET_PACK_SIG
+            await self.bot.db.set_setting(_SETTINGS_KEY, payload, 0)
         except Exception:
             log.debug('asset file_id cache save failed', exc_info=True)
 
@@ -275,6 +287,7 @@ class MessageHub:
         # 2) Upload bytes once, cache file_id
         try:
             data = path.read_bytes()
+            log.info('asset upload event=%s file=%s bytes=%s pack=%s', event_key, path.name, len(data), ASSET_PACK_SIG)
             result = await self.bot.api.send_photo_bytes(
                 chat_id, data, filename=f'{event_key}.png', caption=caption,
                 reply_markup=keyboard, parse_mode=parse_mode,

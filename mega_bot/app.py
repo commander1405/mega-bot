@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from .bale_api import BaleAPI, BaleAPIError
 from .database import Database
 from .media_tools import convert_media, MAX_INPUT_BYTES
+from .messaging import MessageHub
 from .keyboards import USER_KEYBOARD, inline, menu_page, main_admin_menu, user_actions, url_button, merge_inline
 from . import prices as price_mod
 from . import fun_content
@@ -46,6 +47,7 @@ PERMISSION_LABELS = {
 class MegaBot:
     def __init__(self, api: BaleAPI, db: Database):
         self.api, self.db = api, db
+        self.msg = MessageHub(self)
         self.offset: int | None = None
         self.states: dict[int, dict[str, Any]] = {}
         self.game_cache: dict[str, dict[str, Any]] = {}
@@ -5071,9 +5073,9 @@ class MegaBot:
                 total = await self.db.add_warns(chat_id, target_uid, amount, reason='دستور ادمین')
                 gs = await self.db.get_group_settings(chat_id)
                 limit = int((gs.get('moderation') or {}).get('warn_limit') or gs.get('warn_limit') or 5)
-                await self.safe_send(
-                    chat_id,
-                    f'⚠️ به کاربر {target_name} *{amount}* اخطار داده شد.\nمجموع اخطار: {total}/{limit}',
+                await self.msg.send_event(
+                    chat_id, 'user_warned',
+                    f'⚠️ به کاربر {target_name} {amount} اخطار داده شد.' + chr(10) + f'مجموع اخطار: {total}/{limit}',
                     reply_to=msg.get('message_id'),
                     parse_mode=None,
                 )
@@ -5119,7 +5121,11 @@ class MegaBot:
                         'can_add_web_page_previews': False,
                     },
                 )
-                await self.safe_send(chat_id, f'✅ انجام شد! 🔇 کاربر {target_name} سکوت شد.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.msg.send_event(
+                    chat_id, 'user_muted',
+                    f'🔇 کاربر {target_name} سکوت شد.',
+                    reply_to=msg.get('message_id'), parse_mode=None,
+                )
                 await self.db.log(uid, 'group_mute', 'user', target_uid, {'chat_id': chat_id})
             elif action == 'unmute':
                 await self.api.restrict_chat_member(
@@ -5131,20 +5137,36 @@ class MegaBot:
                         'can_add_web_page_previews': True,
                     },
                 )
-                await self.safe_send(chat_id, f'✅ انجام شد! 🔊 سکوت کاربر {target_name} برداشته شد.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.msg.send_event(
+                    chat_id, 'user_unmuted',
+                    f'🔊 سکوت کاربر {target_name} برداشته شد.',
+                    reply_to=msg.get('message_id'), parse_mode=None,
+                )
                 await self.db.log(uid, 'group_unmute', 'user', target_uid, {'chat_id': chat_id})
             elif action == 'ban':
                 await self.api.ban_chat_member(chat_id, target_uid)
-                await self.safe_send(chat_id, f'✅ کاربر {target_name} از گروه بن شد.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.msg.send_event(
+                    chat_id, 'user_banned',
+                    f'⛔ کاربر {target_name} از گروه بن شد.',
+                    reply_to=msg.get('message_id'), parse_mode=None,
+                )
                 await self.db.log(uid, 'group_ban', 'user', target_uid, {'chat_id': chat_id})
             elif action == 'unban':
                 await self.api.unban_chat_member(chat_id, target_uid)
-                await self.safe_send(chat_id, f'✅ بن کاربر {target_name} برداشته شد.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.msg.send_event(
+                    chat_id, 'user_unbanned',
+                    f'✅ بن کاربر {target_name} برداشته شد.',
+                    reply_to=msg.get('message_id'), parse_mode=None,
+                )
                 await self.db.log(uid, 'group_unban', 'user', target_uid, {'chat_id': chat_id})
             elif action == 'kick':
                 await self.api.ban_chat_member(chat_id, target_uid, int(time.time()) + 45)
                 await self.api.unban_chat_member(chat_id, target_uid)
-                await self.safe_send(chat_id, f'✅ انجام شد! 👢 کاربر {target_name} از گروه اخراج شد.', reply_to=msg.get('message_id'), parse_mode=None)
+                await self.msg.send_event(
+                    chat_id, 'user_kicked',
+                    f'👢 کاربر {target_name} از گروه اخراج شد.',
+                    reply_to=msg.get('message_id'), parse_mode=None,
+                )
                 await self.db.log(uid, 'group_kick', 'user', target_uid, {'chat_id': chat_id})
         except Exception as exc:
             err_l = str(exc).lower()

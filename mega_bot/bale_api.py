@@ -364,12 +364,18 @@ class BaleAPI:
         data: bytes,
         filename: str = 'stats.png',
         caption: str | None = None,
+        reply_markup: dict | None = None,
+        parse_mode: str | None = None,
     ) -> dict:
         session = await self._ensure_session()
         form = aiohttp.FormData()
         form.add_field('chat_id', str(chat_id))
         if caption:
             form.add_field('caption', caption)
+        if parse_mode:
+            form.add_field('parse_mode', parse_mode)
+        if reply_markup is not None:
+            form.add_field('reply_markup', json.dumps(reply_markup, ensure_ascii=False))
         form.add_field('photo', data, filename=filename, content_type='image/png')
         async with session.post(
             self.base + 'sendPhoto',

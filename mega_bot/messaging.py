@@ -10,6 +10,7 @@ same asset is not re-uploaded every time. File IDs are cached in the
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -184,7 +185,19 @@ def extract_photo_file_id(result: Any) -> str | None:
 
 
 # Content fingerprint of assets/ PNG pack — changing any icon invalidates cache
-ASSET_PACK_SIG = '7e3f62dc2788'
+def _compute_pack_sig() -> str:
+    """Fingerprint assets/*.png so any icon change invalidates Bale file_id cache."""
+    h = hashlib.sha256()
+    try:
+        for f in sorted(ASSETS_DIR.glob('*.png')):
+            h.update(f.name.encode())
+            h.update(f.read_bytes())
+    except Exception:
+        h.update(b'fallback')
+    return h.hexdigest()[:12]
+
+
+ASSET_PACK_SIG = _compute_pack_sig()
 _SETTINGS_KEY = f'asset_file_ids_{ASSET_PACK_SIG}'
 
 

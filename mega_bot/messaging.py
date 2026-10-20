@@ -19,42 +19,46 @@ if TYPE_CHECKING:
 
 log = logging.getLogger('mega_bot.messaging')
 
-ASSETS_DIR = Path(__file__).resolve().parent / 'assets' / 'icons'
+ASSETS_DIR = Path(__file__).resolve().parent.parent / 'assets'
 
 # event_key -> icon filename stem (no .png)
 EVENT_ASSETS: dict[str, str] = {
-    # Official MEGA BOT / DarkKnight asset pack (cropped from design sheet)
-    'user_banned': 'user_banned',
-    'user_unbanned': 'user_unbanned',
-    'user_warned': 'user_warned',
-    'user_muted': 'user_muted',
-    'user_unmuted': 'user_unmuted',
-    'user_kicked': 'user_kicked',
-    'user_added': 'user_added',
+    # Root assets/ — official 512 PNG pack (no .png in values; added in asset_path)
+    'user_banned': 'ban',
+    'user_unbanned': 'unban',
+    'user_warned': 'warn',
+    'user_muted': 'mute',
+    'user_unmuted': 'unmute',
+    'user_kicked': 'kick',
+    'user_added': 'add_user',
     'broadcast': 'broadcast',
-    'system_notice': 'system_notice',
+    'system_notice': 'notice',
     'schedule': 'schedule',
     'settings': 'settings',
-    'stats_report': 'stats_report',
-    'list_menu': 'list_menu',
+    'stats_report': 'stats',
+    'list_menu': 'menu',
     'help': 'help',
-    'logo': 'logo',
-    'learning_list': 'learning_list',
-    'suggestion': 'suggestion',
-    'operation_success': 'operation_success',
-    'operation_error': 'operation_error',
+    'logo': 'bot_logo',
+    'learning_list': 'menu',
+    'suggestion': 'info',
+    'operation_success': 'success',
+    'operation_error': 'error',
     'processing': 'processing',
     'thanks': 'thanks',
-    'vip': 'vip',
-    'vip_members': 'vip_members',
+    'vip': 'premium',
+    'vip_members': 'premium',
     'gift': 'gift',
-    'occasion': 'occasion',
-    'award': 'award',
-    'support': 'support',
-    'brand': 'brand',
-    # aliases
-    'shield': 'user_unmuted',
+    'occasion': 'celebration',
+    'award': 'success',
+    'support': 'donation',
+    'brand': 'developers',
+    'shield': 'unmute',
+    'cancel': 'cancel',
+    'welcome': 'welcome',
+    'info': 'info',
+    'notice': 'notice',
 }
+
 
 
 # Events that intentionally stay text-only (documented mapping)
@@ -147,7 +151,7 @@ def pick_pv_asset(text: str) -> str:
 
 
 
-_SETTINGS_KEY = 'asset_file_ids_v4'
+_SETTINGS_KEY = 'asset_file_ids_v5'
 
 
 def asset_path(event_key: str) -> Path | None:

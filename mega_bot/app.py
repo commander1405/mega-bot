@@ -5778,7 +5778,9 @@ class MegaBot:
 
 
     async def _send_group_stats(self, chat_id: int, chat: dict) -> None:
-        """Professional image dashboard for the group (replaces text-only stats)."""
+        """Group stats — text only in groups (no dashboard images in group chats)."""
+        # Policy: never send stats images into groups
+        text_only = True
         title = chat.get('title') or 'گروه'
         try:
             stats = await self.db.group_stats_24h(chat_id)
@@ -5822,33 +5824,24 @@ class MegaBot:
         except Exception:
             log.debug('avatar fetch skipped', exc_info=True)
 
-        try:
-            png = await asyncio.to_thread(
-                dash.render_group_dashboard,
-                title=title,
-                stats=stats,
-                members_count=members_count if isinstance(members_count, int) else None,
-                avatars=avatars or None,
-            )
-            photo_res = await self.api.send_photo_bytes(
-                chat_id,
-                png,
-                filename='group-stats.png',
-                caption=f'📊 داشبورد تحلیلی — {title}',
-            )
-            self._maybe_ephemeral_result(chat_id, photo_res if isinstance(photo_res, dict) else None, permanent=False)
-        except Exception as exc:
-            log.exception('stats dashboard render/send failed')
-            # Fallback minimal text so command never dies silently
-            c = stats.get('counts') or {}
-            await self.safe_send(
-                chat_id,
-                f"📊 آمار گروه (پشتیبان متنی)\n"
-                f"پیام‌ها: {stats.get('total_msgs', 0)} | فعال: {stats.get('active_users', 0)}\n"
-                f"عکس: {c.get('photo_count', 0)} | ویدیو: {c.get('video_count', 0)} | ویس: {c.get('voice_count', 0)}\n"
-                f"❌ تصویر: {self._short(exc)}",
-                parse_mode=None,
-            )
+        c = stats.get('counts') or {}
+        top_lines = []
+        for i, u in enumerate((stats.get('top_users') or [])[:5], 1):
+            nm = u.get('name') or u.get('username') or str(u.get('user_id') or '?')
+            top_lines.append(f"  {i}. {nm} — {u.get('msg_count', 0)} پیام")
+        tops = chr(10).join(top_lines) if top_lines else '  —'
+        members_s = str(members_count) if isinstance(members_count, int) else 'نامشخص'
+        body = (
+            f"📊 *آمار گروه* — {title}" + chr(10)
+            + f"پیام‌ها (۲۴س): {stats.get('total_msgs', 0)}" + chr(10)
+            + f"کاربران فعال: {stats.get('active_users', 0)}" + chr(10)
+            + f"اعضا: {members_s}" + chr(10)
+            + f"رسانه: عکس {c.get('photo_count', 0)} · ویدیو {c.get('video_count', 0)} · ویس {c.get('voice_count', 0)}" + chr(10)
+            + f"استیکر {c.get('sticker_count', 0)} · فایل {c.get('document_count', 0)}" + chr(10)
+            + "کاربران برتر:" + chr(10) + tops
+        )
+        # Groups: text only (no dashboard image). Policy is intentional.
+        await self.safe_send(chat_id, body, parse_mode=None)
 
 
     async def _show_group_panel(self, chat_id: int, uid: int) -> None:

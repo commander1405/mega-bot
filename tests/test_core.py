@@ -348,3 +348,31 @@ class LevelSystemLogicTests(unittest.TestCase):
         self.assertFalse(is_valid_activity_message('   '))
         self.assertTrue(is_valid_activity_message('سلام'))
         self.assertTrue(is_valid_activity_message('', {'photo': [{}]}))
+
+
+class MediaPolicyTests(unittest.TestCase):
+    """Decorative assets must never be sent to groups."""
+
+    def test_allows_decorative_media_private_only(self):
+        from mega_bot.messaging import MessageHub
+
+        class FakeBot:
+            def _is_private_chat_id(self, chat_id: int) -> bool:
+                return int(chat_id) > 0  # simplified: positive = private
+
+        hub = MessageHub(FakeBot())  # type: ignore[arg-type]
+        self.assertTrue(hub.allows_decorative_media(12345))
+        self.assertFalse(hub.allows_decorative_media(-100123))
+        self.assertFalse(hub.allows_decorative_media(-1))
+
+    def test_event_assets_resolve_to_png_files(self):
+        from mega_bot.messaging import EVENT_ASSETS, asset_path
+        for key in ('user_banned', 'operation_error', 'stats_report', 'logo'):
+            path = asset_path(key)
+            self.assertIsNotNone(path, key)
+            self.assertTrue(path.is_file(), key)
+            self.assertGreater(path.stat().st_size, 1000, key)
+
+    def test_bot_version_is_1_1(self):
+        from config import BOT_VERSION
+        self.assertIn('1.1', BOT_VERSION)

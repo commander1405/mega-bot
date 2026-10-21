@@ -76,3 +76,24 @@
 - Social replies no longer invent a zero group count when stats fail to load.
 - Owner panel includes live monitoring counters (`bot_metrics` / daily metrics); numbers start from deployment of that feature.
 - Automated tests: `python -m pytest tests/ -v` (pure logic + schedule lock + regressions).
+
+## Version 1.1.0 — Major stability & group media policy
+
+### Critical change
+- **Group chats never receive decorative asset images** (ban/error/success icons, stats dashboards).
+- Private chats may still show neon asset icons for important menus/operations.
+- User-requested media (e.g. GIF conversion) is unchanged.
+
+### Other
+- Centralized media policy in `mega_bot/messaging.py` (`allows_decorative_media`).
+- Group «آمار» returns a concise text report only.
+- Moderation errors use clear Persian text (and error asset only in PV).
+- Version bumped to `v 1.1.0`.
+
+### Backup
+Before this update: branch `backup/pre-major-update-20261021` on GitHub.
+
+### Tests
+```bash
+python -m pytest tests/ -q
+```

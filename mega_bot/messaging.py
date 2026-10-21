@@ -1,5 +1,8 @@
 """Central messaging helpers for MEGA BOT — optional neon asset images.
 
+POLICY: GROUP CHATS NEVER receive decorative asset photos.
+Only private chats may get icon images. Explicit user media (GIF etc.) is separate.
+
 Ordinary replies stay text-only. Moderation / system events may attach a
 matching icon from ``mega_bot/assets/icons/``.
 
@@ -252,6 +255,14 @@ class MessageHub:
             parse_mode=parse_mode, permanent=permanent,
         )
 
+    def allows_decorative_media(self, chat_id: int) -> bool:
+        """Decorative asset icons only in private chats — never groups/channels."""
+        try:
+            return bool(self.bot._is_private_chat_id(int(chat_id)))
+        except Exception:
+            # Fail closed: if unknown, do not send images
+            return False
+
     async def send_event(
         self,
         chat_id: int,
@@ -264,11 +275,13 @@ class MessageHub:
         permanent: bool = False,
         force_text: bool = False,
     ) -> dict | None:
-        """Send an event message with optional icon.
+        """Send an event message with optional icon (private only).
 
+        Groups and channels always receive plain text — no decorative images.
         Falls back to plain text if the asset is missing or sendPhoto fails.
         """
-        if force_text or event_key in TEXT_ONLY_EVENTS:
+        # Hard policy: never send asset photos outside private chat
+        if force_text or event_key in TEXT_ONLY_EVENTS or not self.allows_decorative_media(chat_id):
             return await self.send_text(
                 chat_id, caption, keyboard=keyboard, reply_to=reply_to,
                 parse_mode=parse_mode, permanent=permanent,

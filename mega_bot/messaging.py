@@ -188,6 +188,8 @@ def extract_photo_file_id(result: Any) -> str | None:
 
 
 # Content fingerprint of assets/ PNG pack — changing any icon invalidates cache
+_CACHE_EPOCH = "20261021-media-policy-v2"
+
 def _compute_pack_sig() -> str:
     """Fingerprint assets/*.png so any icon change invalidates Bale file_id cache."""
     h = hashlib.sha256()
@@ -197,6 +199,7 @@ def _compute_pack_sig() -> str:
             h.update(f.read_bytes())
     except Exception:
         h.update(b'fallback')
+    h.update(_CACHE_EPOCH.encode())
     return h.hexdigest()[:12]
 
 
@@ -256,11 +259,12 @@ class MessageHub:
         )
 
     def allows_decorative_media(self, chat_id: int) -> bool:
-        """Decorative asset icons only in private chats — never groups/channels."""
+        """Decorative asset icons only in known private chats — never groups/channels."""
         try:
+            if hasattr(self.bot, 'is_known_private_chat'):
+                return bool(self.bot.is_known_private_chat(int(chat_id)))
             return bool(self.bot._is_private_chat_id(int(chat_id)))
         except Exception:
-            # Fail closed: if unknown, do not send images
             return False
 
     async def send_event(

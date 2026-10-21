@@ -48,6 +48,8 @@ class MegaBot:
     def __init__(self, api: BaleAPI, db: Database):
         self.api, self.db = api, db
         self.msg = MessageHub(self)
+        # chat_id -> type string from last seen API update (private|group|...)
+        self._chat_kinds: dict[int, str] = {}
         self.offset: int | None = None
         self.states: dict[int, dict[str, Any]] = {}
         self.game_cache: dict[str, dict[str, Any]] = {}
@@ -298,12 +300,57 @@ class MegaBot:
         return t.strip()
 
 
-    def _is_private_chat_id(self, chat_id: int) -> bool:
-        """Bale/Telegram: private chats have positive ids; groups/supergroups negative."""
+
+    def _remember_chat(self, chat: dict | None) -> None:
+        """Store chat type from API payloads for media policy (Bale ids may be positive for groups)."""
+        if not chat or not isinstance(chat, dict):
+            return
         try:
-            return int(chat_id) > 0
+            cid = int(chat.get('id') or 0)
+        except Exception:
+            return
+        if not cid:
+            return
+        t = (chat.get('type') or '').lower().strip()
+        if not t and chat.get('title'):
+            t = 'group'
+        if t:
+            self._chat_kinds[cid] = t
+            # bound memory
+            if len(self._chat_kinds) > 20000:
+                # drop arbitrary half
+                for k in list(self._chat_kinds.keys())[:10000]:
+                    self._chat_kinds.pop(k, None)
+
+    def _is_private_chat_id(self, chat_id: int) -> bool:
+        """Prefer last-seen chat.type. Fallback: negative ids are groups (Telegram-style)."""
+        try:
+            cid = int(chat_id)
         except Exception:
             return True
+        kind = (self._chat_kinds.get(cid) or '').lower()
+        if kind in ('private', 'pv', 'user'):
+            return True
+        if kind in ('group', 'supergroup', 'megagroup', 'chat', 'channel', 'broadcast'):
+            return False
+        if cid < 0:
+            return False
+        # Unknown positive: historically treated as private; media policy is stricter separately
+        return True
+
+    def is_known_private_chat(self, chat_id: int) -> bool:
+        """Strict private check for decorative media — unknown/group => False."""
+        try:
+            cid = int(chat_id)
+        except Exception:
+            return False
+        kind = (self._chat_kinds.get(cid) or '').lower()
+        if kind in ('private', 'pv', 'user'):
+            return True
+        if kind in ('group', 'supergroup', 'megagroup', 'chat', 'channel', 'broadcast'):
+            return False
+        # No type yet: do not send decorative images
+        return False
 
     async def _is_maintenance(self) -> bool:
         now = time.time()
@@ -534,6 +581,7 @@ class MegaBot:
 
     async def on_message(self, msg: dict) -> None:
         chat = msg.get('chat') or {}
+        self._remember_chat(chat)
         chat_id = int(chat.get('id', 0) or 0)
         if not chat_id:
             return
@@ -591,6 +639,7 @@ class MegaBot:
         text = (msg.get('text') or msg.get('caption') or '').strip()
         text = self._normalize_command_text(text)
         chat_type = (chat.get('type') or '')
+        self._remember_chat(chat)
         is_group = self._is_group_chat(chat)
 
         # Log every group message (critical for diagnosing admin-only failures).

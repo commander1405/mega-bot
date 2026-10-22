@@ -453,7 +453,7 @@ class MegaBot:
             self._sched_task = asyncio.create_task(self._schedule_lock_loop(), name='group-lock-sched')
             self._bg_tasks.add(self._sched_task)
             self._sched_task.add_done_callback(self._bg_tasks.discard)
-        log.info('MEGA BOT polling started (target host tapi.bale.ai)')
+        log.info('MEGA BOT polling started (target host tapi.bale.ai) version=%s decorative_media=OFF', BOT_VERSION)
         backoff = 1.0
         while True:
             try:

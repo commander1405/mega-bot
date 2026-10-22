@@ -285,62 +285,8 @@ class MessageHub:
         permanent: bool = False,
         force_text: bool = False,
     ) -> dict | None:
-        """Send an event message with optional icon (private only).
-
-        Groups and channels always receive plain text — no decorative images.
-        Falls back to plain text if the asset is missing or sendPhoto fails.
-        """
-        # Hard policy: decorative photos fully disabled (and never in groups)
-        if (
-            not DECORATIVE_MEDIA_ENABLED
-            or force_text
-            or event_key in TEXT_ONLY_EVENTS
-            or not self.allows_decorative_media(chat_id)
-        ):
-            return await self.send_text(
-                chat_id, caption, keyboard=keyboard, reply_to=reply_to,
-                parse_mode=parse_mode, permanent=permanent,
-            )
-
-        path = asset_path(event_key)
-        if not path:
-            return await self.send_text(
-                chat_id, caption, keyboard=keyboard, reply_to=reply_to,
-                parse_mode=parse_mode, permanent=permanent,
-            )
-
-        await self._load_cache()
-        file_id = self._memory.get(event_key)
-
-        # 1) Try cached file_id (no re-upload)
-        if file_id:
-            try:
-                result = await self.bot.api.send_photo(
-                    chat_id, file_id, caption=caption,
-                    reply_markup=keyboard, parse_mode=parse_mode,
-                    reply_to=reply_to,
-                )
-                return self.bot._maybe_ephemeral_result(chat_id, result, permanent=permanent)
-            except Exception as exc:
-                log.info('asset file_id stale for %s: %s — re-uploading', event_key, type(exc).__name__)
-                self._memory.pop(event_key, None)
-
-        # 2) Upload bytes once, cache file_id
-        try:
-            data = path.read_bytes()
-            log.info('asset upload event=%s file=%s bytes=%s pack=%s', event_key, path.name, len(data), ASSET_PACK_SIG)
-            result = await self.bot.api.send_photo_bytes(
-                chat_id, data, filename=f'{event_key}.png', caption=caption,
-                reply_markup=keyboard, parse_mode=parse_mode,
-            )
-            new_id = extract_photo_file_id(result) or extract_photo_file_id({'result': result})
-            if new_id:
-                self._memory[event_key] = new_id
-                await self._save_cache()
-            return self.bot._maybe_ephemeral_result(chat_id, result, permanent=permanent)
-        except Exception as exc:
-            log.warning('asset photo send failed %s: %s — text fallback', event_key, type(exc).__name__)
-            return await self.send_text(
-                chat_id, caption, keyboard=keyboard, reply_to=reply_to,
-                parse_mode=parse_mode, permanent=permanent,
-            )
+        """Always plain text. Decorative asset photos are permanently disabled."""
+        return await self.send_text(
+            chat_id, caption, keyboard=keyboard, reply_to=reply_to,
+            parse_mode=parse_mode, permanent=permanent,
+        )

@@ -189,27 +189,8 @@ class MegaBot:
         Groups stay text-first; mod actions use MessageHub.send_event explicitly.
         """
         keyboard = await self._with_ad_keyboard(keyboard, skip_ad=skip_ad)
-        # PV: photo only for important menus/results — never for سلام / social / emoji
-        # Groups: never auto-attach photos here (mod actions call msg.send_event explicitly)
-        if (
-            not force_text
-            and self._is_private_chat_id(chat_id)
-            and (text or '').strip()
-            and hasattr(self, 'msg')
-        ):
-            try:
-                from .messaging import pick_pv_asset, should_attach_asset
-                if should_attach_asset(text, event_key):
-                    key = event_key or pick_pv_asset(text)
-                    result = await self.msg.send_event(
-                        chat_id, key, text,
-                        keyboard=keyboard, reply_to=reply_to,
-                        parse_mode=parse_mode, permanent=permanent,
-                    )
-                    if result is not None:
-                        return result
-            except Exception as exc:
-                log.debug('PV asset send failed, text fallback: %s', type(exc).__name__)
+        # Decorative photos fully disabled (PV + group). Text only.
+        # User-requested media (GIF etc.) uses dedicated API paths, not safe_send.
         plain = (text or '').replace('*', '').replace('`', '').replace('_', '')
         # IMPORTANT: try WITHOUT reply_to first — reply_to is a common Bale failure mode
         # and previously caused the whole handler to sit on a long timeout before fallback.

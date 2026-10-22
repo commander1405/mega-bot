@@ -365,10 +365,11 @@ class MediaPolicyTests(unittest.TestCase):
                 return self._chat_kinds.get(int(chat_id)) == 'private'
 
         hub = MessageHub(FakeBot())  # type: ignore[arg-type]
-        self.assertTrue(hub.allows_decorative_media(12345))
+        # Global kill-switch: no decorative media anywhere
+        self.assertFalse(hub.allows_decorative_media(12345))
         self.assertFalse(hub.allows_decorative_media(-100123))
         self.assertFalse(hub.allows_decorative_media(999))
-        self.assertFalse(hub.allows_decorative_media(42))  # unknown => no media
+        self.assertFalse(hub.allows_decorative_media(42))
 
     def test_event_assets_resolve_to_png_files(self):
         from mega_bot.messaging import EVENT_ASSETS, asset_path

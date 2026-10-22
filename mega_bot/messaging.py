@@ -25,6 +25,10 @@ log = logging.getLogger('mega_bot.messaging')
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / 'assets'
 
+# Global kill-switch: no icon/asset photos anywhere (PV or group).
+# Explicit user media (GIF convert, admin broadcast of user files) is separate.
+DECORATIVE_MEDIA_ENABLED = False
+
 # event_key -> icon filename stem (no .png)
 EVENT_ASSETS: dict[str, str] = {
     # Root assets/ — official 512 PNG pack (no .png in values; added in asset_path)
@@ -188,7 +192,7 @@ def extract_photo_file_id(result: Any) -> str | None:
 
 
 # Content fingerprint of assets/ PNG pack — changing any icon invalidates cache
-_CACHE_EPOCH = "20261021-media-policy-v2"
+_CACHE_EPOCH = "20261022-no-images-anywhere"
 
 def _compute_pack_sig() -> str:
     """Fingerprint assets/*.png so any icon change invalidates Bale file_id cache."""
@@ -259,7 +263,9 @@ class MessageHub:
         )
 
     def allows_decorative_media(self, chat_id: int) -> bool:
-        """Decorative asset icons only in known private chats — never groups/channels."""
+        """Decorative asset icons disabled globally (text-only bot replies)."""
+        if not DECORATIVE_MEDIA_ENABLED:
+            return False
         try:
             if hasattr(self.bot, 'is_known_private_chat'):
                 return bool(self.bot.is_known_private_chat(int(chat_id)))
@@ -284,8 +290,13 @@ class MessageHub:
         Groups and channels always receive plain text — no decorative images.
         Falls back to plain text if the asset is missing or sendPhoto fails.
         """
-        # Hard policy: never send asset photos outside private chat
-        if force_text or event_key in TEXT_ONLY_EVENTS or not self.allows_decorative_media(chat_id):
+        # Hard policy: decorative photos fully disabled (and never in groups)
+        if (
+            not DECORATIVE_MEDIA_ENABLED
+            or force_text
+            or event_key in TEXT_ONLY_EVENTS
+            or not self.allows_decorative_media(chat_id)
+        ):
             return await self.send_text(
                 chat_id, caption, keyboard=keyboard, reply_to=reply_to,
                 parse_mode=parse_mode, permanent=permanent,

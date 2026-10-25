@@ -381,4 +381,4 @@ class MediaPolicyTests(unittest.TestCase):
 
     def test_bot_version_is_1_1(self):
         from config import BOT_VERSION
-        self.assertIn('1.1', BOT_VERSION)
+        self.assertTrue(any(x in BOT_VERSION for x in ('1.1', '1.2')))

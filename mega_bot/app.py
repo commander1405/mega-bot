@@ -5854,9 +5854,17 @@ class MegaBot:
 
         avatars: dict = {}
         try:
-            tops = [u for u in (stats.get('top_users') or []) if u.get('user_id')]
+            tops = []
+            for u in (stats.get('top_users') or []):
+                if not u.get('user_id'):
+                    continue
+                tops.append({
+                    'user_id': int(u['user_id']),
+                    'first_name': u.get('name') or u.get('first_name') or u.get('username') or '',
+                    'username': u.get('username') or '',
+                })
             if tops:
-                avatars = await self._fetch_user_avatars(tops)
+                avatars = await self._fetch_user_avatars(tops, limit=5)
         except Exception:
             log.debug('avatar fetch skipped', exc_info=True)
 

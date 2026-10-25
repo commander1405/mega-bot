@@ -1148,11 +1148,12 @@ class MegaBot:
             return
             return
 
-        # ── Group stats
-        if is_group and text in ('آمار', 'امار', 'آمار گروه', 'آمارگروه', 'امار گروه'):
-            if not await self._require_group_admin(chat_id, uid):
-                await self.safe_send(chat_id, '⛔ این بخش مخصوص مدیران گروه است.', parse_mode=None)
-                return
+        # ── Group stats (image dashboard) — exact phrases only
+        _stats_cmds = {
+            'آمار', 'امار', 'آمار گروه', 'آمارگروه', 'امار گروه',
+            'فعالیت', 'فعالیت گروه', 'عملکرد', 'عملکرد گروه',
+        }
+        if is_group and text in _stats_cmds:
             await self._send_group_stats(chat_id, chat)
             return
 
@@ -5808,25 +5809,30 @@ class MegaBot:
 
 
     async def _send_group_stats(self, chat_id: int, chat: dict) -> None:
-        """Group stats — text only in groups (no dashboard images in group chats)."""
-        # Policy: never send stats images into groups
-        text_only = True
-        title = chat.get('title') or 'گروه'
+        """Generate and send one professional statistics image for this group."""
+        title = (chat.get('title') or 'گروه')[:60]
         try:
-            stats = await self.db.group_stats_24h(chat_id)
+            now = time.time()
+            if not hasattr(self, '_stats_cd'):
+                self._stats_cd = {}
+            last = float(self._stats_cd.get(chat_id) or 0)
+            if now - last < 30:
+                await self.safe_send(
+                    chat_id,
+                    f'⏳ آمار هر ۳۰ ثانیه یک‌بار قابل درخواست است. ({int(30 - (now - last))}ث باقی)',
+                    parse_mode=None,
+                )
+                return
+            self._stats_cd[chat_id] = now
         except Exception:
-            log.exception('group_stats_24h failed')
+            pass
+
+        try:
+            stats = await self.db.group_stats_dashboard(chat_id)
+        except Exception:
+            log.exception('group_stats_dashboard failed')
             try:
-                stats = await self.db.group_stats_today(chat_id)
-                # adapt legacy shape
-                stats = {
-                    'counts': stats.get('counts') or {},
-                    'hourly': [],
-                    'top_users': stats.get('top_users') or [],
-                    'active_users': len(stats.get('top_users') or []),
-                    'total_msgs': sum(int(u.get('msg_count') or 0) for u in (stats.get('top_users') or [])),
-                    'window': 'today',
-                }
+                stats = await self.db.group_stats_24h(chat_id)
             except Exception:
                 await self.safe_send(chat_id, '❌ خواندن آمار گروه ممکن نشد.', parse_mode=None)
                 return
@@ -5840,13 +5846,13 @@ class MegaBot:
             if isinstance(cnt, int):
                 members_count = cnt
             elif isinstance(cnt, dict):
-                members_count = cnt.get('result', cnt) if not isinstance(cnt.get('result'), dict) else None
-                if isinstance(members_count, dict):
-                    members_count = None
+                r = cnt.get('result', cnt)
+                if isinstance(r, int):
+                    members_count = r
         except Exception:
             pass
 
-        avatars = {}
+        avatars: dict = {}
         try:
             tops = [u for u in (stats.get('top_users') or []) if u.get('user_id')]
             if tops:
@@ -5854,24 +5860,51 @@ class MegaBot:
         except Exception:
             log.debug('avatar fetch skipped', exc_info=True)
 
-        c = stats.get('counts') or {}
-        top_lines = []
-        for i, u in enumerate((stats.get('top_users') or [])[:5], 1):
-            nm = u.get('name') or u.get('username') or str(u.get('user_id') or '?')
-            top_lines.append(f"  {i}. {nm} — {u.get('msg_count', 0)} پیام")
-        tops = chr(10).join(top_lines) if top_lines else '  —'
-        members_s = str(members_count) if isinstance(members_count, int) else 'نامشخص'
-        body = (
-            f"📊 *آمار گروه* — {title}" + chr(10)
-            + f"پیام‌ها (۲۴س): {stats.get('total_msgs', 0)}" + chr(10)
-            + f"کاربران فعال: {stats.get('active_users', 0)}" + chr(10)
-            + f"اعضا: {members_s}" + chr(10)
-            + f"رسانه: عکس {c.get('photo_count', 0)} · ویدیو {c.get('video_count', 0)} · ویس {c.get('voice_count', 0)}" + chr(10)
-            + f"استیکر {c.get('sticker_count', 0)} · فایل {c.get('document_count', 0)}" + chr(10)
-            + "کاربران برتر:" + chr(10) + tops
-        )
-        # Groups: text only (no dashboard image). Policy is intentional.
-        await self.safe_send(chat_id, body, parse_mode=None)
+        try:
+            png = await asyncio.to_thread(
+                dash.render_group_dashboard,
+                title=title,
+                stats=stats,
+                members_count=members_count,
+                avatars=avatars,
+                chat_id=chat_id,
+            )
+        except TypeError:
+            # Older signature without chat_id
+            try:
+                png = await asyncio.to_thread(
+                    dash.render_group_dashboard,
+                    title=title,
+                    stats=stats,
+                    members_count=members_count,
+                    avatars=avatars,
+                )
+            except Exception:
+                log.exception('stats image render failed')
+                png = None
+        except Exception:
+            log.exception('stats image render failed')
+            png = None
+
+        if not png:
+            c = stats.get('counts') or {}
+            body = (
+                f"📊 آمار گروه — {title}\n"
+                f"پیام‌ها (۲۴س): {stats.get('total_msgs', 0)}\n"
+                f"کاربران فعال: {stats.get('active_users', 0)}\n"
+                f"۷روز: {stats.get('total_msgs_7', '—')} · ۳۰روز: {stats.get('total_msgs_30', '—')}"
+            )
+            await self.safe_send(chat_id, body, parse_mode=None)
+            return
+
+        try:
+            await self.api.send_photo_bytes(
+                chat_id, png, filename='mega-stats.png',
+                caption=f'📊 آمار گروه «{title}»',
+            )
+        except Exception:
+            log.exception('stats photo send failed')
+            await self.safe_send(chat_id, '❌ ارسال تصویر آمار ممکن نشد. لطفاً بعداً تلاش کنید.', parse_mode=None)
 
 
     async def _show_group_panel(self, chat_id: int, uid: int) -> None:

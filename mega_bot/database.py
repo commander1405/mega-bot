@@ -960,8 +960,13 @@ class Database:
 
     async def record_group_message(self, chat_id: int, user_id: int | None, msg: dict) -> None:
         """Increment daily counters based on message content type."""
-        from datetime import date
-        day = date.today()
+        from datetime import datetime
+        try:
+            from zoneinfo import ZoneInfo
+            day = datetime.now(ZoneInfo('Asia/Tehran')).date()
+        except Exception:
+            from datetime import date
+            day = date.today()
         col = 'text_count'
         if msg.get('photo'):
             col = 'photo_count'
@@ -1002,21 +1007,31 @@ class Database:
             )
 
     async def record_member_join(self, chat_id: int, count: int = 1) -> None:
-        from datetime import date
+        from datetime import datetime, date
+        try:
+            from zoneinfo import ZoneInfo
+            day = datetime.now(ZoneInfo('Asia/Tehran')).date()
+        except Exception:
+            day = date.today()
         async with self._pool().acquire() as c:
             await c.execute(
                 """INSERT INTO group_stats_daily(chat_id,day,joined) VALUES($1,$2,$3)
                    ON CONFLICT(chat_id,day) DO UPDATE SET joined=group_stats_daily.joined+EXCLUDED.joined""",
-                int(chat_id), date.today(), count,
+                int(chat_id), day, count,
             )
 
     async def record_member_left(self, chat_id: int, count: int = 1) -> None:
-        from datetime import date
+        from datetime import datetime, date
+        try:
+            from zoneinfo import ZoneInfo
+            day = datetime.now(ZoneInfo('Asia/Tehran')).date()
+        except Exception:
+            day = date.today()
         async with self._pool().acquire() as c:
             await c.execute(
                 """INSERT INTO group_stats_daily(chat_id,day,left_count) VALUES($1,$2,$3)
                    ON CONFLICT(chat_id,day) DO UPDATE SET left_count=group_stats_daily.left_count+EXCLUDED.left_count""",
-                int(chat_id), date.today(), count,
+                int(chat_id), day, count,
             )
 
     async def record_bot_delete(self, chat_id: int) -> None:
@@ -1121,6 +1136,135 @@ class Database:
             'top_users': top_users,
             'active_users': int(active_users or 0),
             'total_msgs': int(total_msgs or 0),
+            'window': '24h',
+        }
+
+    async def group_stats_dashboard(self, chat_id: int) -> dict:
+        """Rich stats for image dashboard: 24h + 7d trend + media + top users.
+
+        All numbers come from recorded aggregates only — never fabricated.
+        """
+        from datetime import datetime, date, timedelta
+        try:
+            from zoneinfo import ZoneInfo
+            today = datetime.now(ZoneInfo('Asia/Tehran')).date()
+        except Exception:
+            today = date.today()
+        chat_id = int(chat_id)
+        days7 = [today - timedelta(days=i) for i in range(7)]
+        days2 = days7[:2]
+        days30 = [today - timedelta(days=i) for i in range(30)]
+        async with self._pool().acquire() as c:
+            # Daily rows for 7 days
+            rows7 = await c.fetch(
+                'SELECT * FROM group_stats_daily WHERE chat_id=$1 AND day = ANY($2::date[])',
+                chat_id, days7,
+            )
+            by_day = {r['day']: dict(r) for r in rows7}
+            daily_series = []
+            for d in reversed(days7):  # oldest → newest for chart
+                r = by_day.get(d) or {}
+                media = sum(int(r.get(k) or 0) for k in (
+                    'text_count','photo_count','video_count','voice_count','audio_count',
+                    'animation_count','sticker_count','document_count',
+                ))
+                # Prefer user msg sum for that day
+                um = await c.fetchval(
+                    'SELECT COALESCE(SUM(msg_count),0) FROM group_user_msgs WHERE chat_id=$1 AND day=$2',
+                    chat_id, d,
+                )
+                daily_series.append({
+                    'day': d.isoformat(),
+                    'label': d.strftime('%m/%d'),
+                    'count': int(um or media or 0),
+                })
+
+            totals = {
+                'joined': 0, 'left_count': 0, 'text_count': 0, 'photo_count': 0, 'video_count': 0,
+                'voice_count': 0, 'audio_count': 0, 'animation_count': 0, 'sticker_count': 0,
+                'document_count': 0, 'deleted_by_bot': 0,
+            }
+            for d in days2:
+                r = by_day.get(d) or {}
+                for k in totals:
+                    totals[k] += int(r.get(k) or 0)
+
+            # Hourly last 24h
+            hourly = await c.fetch(
+                """SELECT hour_start, msg_count FROM group_hourly_stats
+                   WHERE chat_id=$1 AND hour_start >= (NOW() - INTERVAL '24 hours')
+                   ORDER BY hour_start ASC""",
+                chat_id,
+            )
+            hours = []
+            for h in hourly:
+                hs = h['hour_start']
+                hours.append({
+                    'hour': hs.hour if hasattr(hs, 'hour') else 0,
+                    'count': int(h['msg_count'] or 0),
+                })
+
+            top = await c.fetch(
+                """SELECT m.user_id, SUM(m.msg_count)::int AS msg_count,
+                          MAX(u.first_name) AS first_name, MAX(u.username) AS username
+                   FROM group_user_msgs m
+                   LEFT JOIN users u ON u.user_id = m.user_id
+                   WHERE m.chat_id=$1 AND m.day = ANY($2::date[])
+                   GROUP BY m.user_id
+                   ORDER BY msg_count DESC
+                   LIMIT 5""",
+                chat_id, days2,
+            )
+            active_users = await c.fetchval(
+                """SELECT COUNT(DISTINCT user_id) FROM group_user_msgs
+                   WHERE chat_id=$1 AND day = ANY($2::date[])""",
+                chat_id, days2,
+            )
+            total_msgs_24 = await c.fetchval(
+                """SELECT COALESCE(SUM(msg_count),0) FROM group_user_msgs
+                   WHERE chat_id=$1 AND day = ANY($2::date[])""",
+                chat_id, days2,
+            )
+            total_msgs_7 = await c.fetchval(
+                """SELECT COALESCE(SUM(msg_count),0) FROM group_user_msgs
+                   WHERE chat_id=$1 AND day = ANY($2::date[])""",
+                chat_id, days7,
+            )
+            total_msgs_30 = await c.fetchval(
+                """SELECT COALESCE(SUM(msg_count),0) FROM group_user_msgs
+                   WHERE chat_id=$1 AND day = ANY($2::date[])""",
+                chat_id, days30,
+            )
+            warn_total = await c.fetchval(
+                'SELECT COALESCE(SUM(warn_count),0) FROM group_warns WHERE chat_id=$1',
+                chat_id,
+            )
+            tracking_start = await c.fetchval(
+                'SELECT MIN(day) FROM group_stats_daily WHERE chat_id=$1',
+                chat_id,
+            )
+            if tracking_start is None:
+                tracking_start = await c.fetchval(
+                    'SELECT MIN(day) FROM group_user_msgs WHERE chat_id=$1',
+                    chat_id,
+                )
+
+        top_users = [dict(r) for r in top]
+        for u in top_users:
+            u['msg_count'] = int(u.get('msg_count') or 0)
+            u['user_id'] = int(u['user_id'])
+            u['name'] = (u.get('first_name') or u.get('username') or 'کاربر')
+        return {
+            'counts': totals,
+            'hourly': hours,
+            'daily_7': daily_series,
+            'top_users': top_users,
+            'active_users': int(active_users or 0),
+            'total_msgs': int(total_msgs_24 or 0),
+            'total_msgs_7': int(total_msgs_7 or 0),
+            'total_msgs_30': int(total_msgs_30 or 0),
+            'warn_total': int(warn_total or 0),
+            'tracking_start': tracking_start.isoformat() if tracking_start else None,
             'window': '24h',
         }
 

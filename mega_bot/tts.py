@@ -136,8 +136,10 @@ def _finalize_mp3_dir(paths: list[str], td: str) -> bytes:
 
 async def synthesize_gtts(text: str, lang: str) -> bytes:
     from gtts import gTTS
+    import socket
 
     def _run() -> bytes:
+        socket.setdefaulttimeout(25)
         with tempfile.TemporaryDirectory(prefix='mega-gtts-') as td:
             chunks = _chunk_text(text, GTTS_CHUNK)
             paths: list[str] = []

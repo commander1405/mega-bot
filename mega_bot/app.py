@@ -526,7 +526,7 @@ class MegaBot:
                 self._update_sem = asyncio.Semaphore(8)
                 sem = self._update_sem
             async with sem:
-                await asyncio.wait_for(self._dispatch_update(update), timeout=15.0)
+                await asyncio.wait_for(self._dispatch_update(update), timeout=90.0)
         except asyncio.TimeoutError:
             log.error('Update %s timed out (15s) — skipped', uid)
         except Exception:
@@ -3256,11 +3256,18 @@ class MegaBot:
 
 
     async def _cmd_voice_tts(self, chat_id: int, uid: int, text: str, msg: dict) -> None:
-        """Free offline TTS: «ویس متن…» or reply+«ویس». Supports long text."""
-        body = text[3:].strip() if text.startswith('ویس') else ''
-        # Exact «ویس تست» keeps legacy short test
-        if text.strip() == 'ویس تست':
+        """«ویس متن…» or reply+«ویس». Runs synthesis in background (not killed by update timeout)."""
+        raw = (text or '').strip()
+        body = ''
+        if raw == 'ویس تست':
             body = 'تست'
+        elif raw == 'ویس':
+            body = ''
+        elif raw.startswith('ویس ') or raw.startswith('ویس\n'):
+            body = raw[3:].strip()
+        elif raw.startswith('ویس'):
+            body = raw[3:].strip()
+
         if not body:
             replied = msg.get('reply_to_message') or {}
             body = (replied.get('text') or replied.get('caption') or '').strip()
@@ -3279,64 +3286,72 @@ class MegaBot:
         if not body:
             await self.safe_send(chat_id, '❌ متن خالی است.', reply_to=msg.get('message_id'), parse_mode=None)
             return
+        note = ''
         if len(body) > tts_mod.MAX_CHARS:
             body = body[: tts_mod.MAX_CHARS]
-            note = f' (متن خیلی بلند بود؛ تا {tts_mod.MAX_CHARS} کاراکتر پردازش شد)'
-        else:
-            note = ''
+            note = f' (تا {tts_mod.MAX_CHARS} کاراکتر)'
 
         est = tts_mod.estimate_duration_sec(body)
+        reply_to = msg.get('message_id')
         await self.safe_send(
             chat_id,
-            f'🎙 در حال ساخت ویس… حدود {est} ثانیه{note}',
-            reply_to=msg.get('message_id'),
+            f'🎙 در حال ساخت ویس… حدود {est} ثانیه{note}\nلطفاً چند لحظه صبر کن.',
+            reply_to=reply_to,
             parse_mode=None,
         )
-        try:
-            # Long texts need generous timeout (chunked synthesis)
-            timeout = min(600.0, 30.0 + len(body) / 8.0)
-            data, filename = await asyncio.wait_for(
-                tts_mod.synthesize_persian(body), timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            await self.safe_send(
-                chat_id,
-                '❌ ساخت ویس زمان‌بر شد. متن را کوتاه‌تر کن یا دوباره تلاش کن.',
-                reply_to=msg.get('message_id'),
-                parse_mode=None,
-            )
-            return
-        except Exception as exc:
-            log.exception('TTS synthesize failed')
-            await self.safe_send(
-                chat_id,
-                f'❌ ساخت ویس ناموفق بود: {self._short(exc)}',
-                reply_to=msg.get('message_id'),
-                parse_mode=None,
-            )
-            return
 
-        caption = '🎤 ویس MEGA BOT'
-        try:
-            # Long audio: prefer sendAudio (more reliable for multi-minute)
-            if len(data) > 900_000 or est >= 60:
-                await self.api.send_audio_bytes(chat_id, data, filename=filename, caption=caption)
-            else:
-                await self.api.send_voice_bytes(
-                    chat_id, data, filename=filename, caption=caption, duration=est,
-                )
-        except Exception as exc:
-            log.exception('send voice failed')
+        async def _job() -> None:
             try:
-                await self.api.send_audio_bytes(chat_id, data, filename=filename or 'voice.ogg', caption=caption)
-            except Exception as exc2:
-                log.exception('send audio fallback failed')
+                timeout = min(300.0, 45.0 + len(body) / 10.0)
+                data, filename = await asyncio.wait_for(
+                    tts_mod.synthesize_persian(body), timeout=timeout,
+                )
+                if not data or len(data) < 50:
+                    await self.safe_send(chat_id, '❌ فایل صوتی خالی بود.', reply_to=reply_to, parse_mode=None)
+                    return
+                caption = '🎤 ویس MEGA BOT'
+                try:
+                    if len(data) > 900_000 or est >= 60:
+                        await self.api.send_audio_bytes(chat_id, data, filename=filename, caption=caption)
+                    else:
+                        await self.api.send_voice_bytes(
+                            chat_id, data, filename=filename, caption=caption, duration=est,
+                        )
+                except Exception as send_exc:
+                    log.warning('send_voice failed, try audio: %s', type(send_exc).__name__)
+                    try:
+                        await self.api.send_audio_bytes(
+                            chat_id, data, filename=filename or 'voice.mp3', caption=caption,
+                        )
+                    except Exception as send2:
+                        log.exception('send audio failed')
+                        await self.safe_send(
+                            chat_id,
+                            f'❌ ارسال ویس ممکن نشد: {self._short(send2)}',
+                            reply_to=reply_to,
+                            parse_mode=None,
+                        )
+            except asyncio.TimeoutError:
                 await self.safe_send(
                     chat_id,
-                    f'❌ ارسال ویس ناموفق بود: {self._short(exc2)}',
-                    reply_to=msg.get('message_id'),
+                    '❌ ساخت ویس بیش از حد طول کشید. متن کوتاه‌تر بفرست.',
+                    reply_to=reply_to,
                     parse_mode=None,
                 )
+            except Exception as exc:
+                log.exception('TTS job failed')
+                await self.safe_send(
+                    chat_id,
+                    f'❌ ساخت ویس ناموفق بود: {self._short(exc)}',
+                    reply_to=reply_to,
+                    parse_mode=None,
+                )
+
+        task = asyncio.create_task(_job(), name=f'tts-{chat_id}')
+        if not hasattr(self, '_bg_tasks'):
+            self._bg_tasks = set()
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
 
     async def _cmd_level_profile(

@@ -1,43 +1,34 @@
-"""TTS for MEGA BOT — HuggingFace MMS-TTS (not Piper / not edge).
+"""TTS for MEGA BOT — primary: gTTS (famous free Google Text-to-Speech library).
 
-Primary: Facebook MMS-TTS via HuggingFace Inference API
-  - Persian: facebook/mms-tts-fas
-  - English: facebook/mms-tts-eng
-Free public endpoint; optional HF_TOKEN for higher limits.
+Not Piper / not edge-tts / not HuggingFace MMS.
 
-Fallbacks: Google Translate TTS → gTTS → espeak-ng.
-Long text is sentence-chunked and merged with ffmpeg.
+Order:
+  1) gTTS  — well-known free Python library (FA + EN), chunked for long text
+  2) Google translate_tts HTTP — same family, alternate client path
+  3) espeak-ng — offline last resort
+
+Soft ceiling: TTS_MAX_CHARS (default 100000). No product word-limit.
 """
 from __future__ import annotations
 
 import asyncio
-import base64
-import io
-import json
 import logging
 import os
 import re
 import shutil
-import struct
 import subprocess
 import tempfile
-import urllib.error
 import urllib.parse
 import urllib.request
-import wave
 from typing import Optional
 
 log = logging.getLogger(__name__)
 
 DEFAULT_TEXT = 'تست'
 MAX_CHARS = int(os.getenv('TTS_MAX_CHARS', '100000'))
+GTTS_CHUNK = int(os.getenv('TTS_GTTS_CHUNK', '500'))
 GOOGLE_CHUNK = int(os.getenv('TTS_GOOGLE_CHUNK', '180'))
 GOOGLE_PARALLEL = int(os.getenv('TTS_GOOGLE_PARALLEL', '5'))
-HF_CHUNK = int(os.getenv('TTS_HF_CHUNK', '400'))
-HF_TOKEN = (os.getenv('HF_TOKEN') or os.getenv('HUGGINGFACE_TOKEN') or '').strip()
-HF_FA_MODEL = os.getenv('TTS_HF_FA_MODEL', 'facebook/mms-tts-fas')
-HF_EN_MODEL = os.getenv('TTS_HF_EN_MODEL', 'facebook/mms-tts-eng')
-HF_API = os.getenv('TTS_HF_API', 'https://api-inference.huggingface.co/models')
 
 
 def _which(cmd: str) -> Optional[str]:
@@ -96,12 +87,11 @@ def _ffmpeg_to_ogg(src: str, dst: str) -> None:
     ff = _which('ffmpeg')
     if not ff:
         raise RuntimeError('ffmpeg not found')
-    cmd = [
-        ff, '-y', '-i', src,
-        '-c:a', 'libopus', '-b:a', '48k', '-vbr', 'on',
-        '-application', 'voip', dst,
-    ]
-    subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+    subprocess.run(
+        [ff, '-y', '-i', src, '-c:a', 'libopus', '-b:a', '48k', '-vbr', 'on',
+         '-application', 'voip', dst],
+        check=True, capture_output=True, timeout=300,
+    )
 
 
 def _concat_audio_files(paths: list[str], out_path: str) -> None:
@@ -109,193 +99,100 @@ def _concat_audio_files(paths: list[str], out_path: str) -> None:
     if not ff:
         with open(out_path, 'wb') as out:
             for p in paths:
-                with open(p, 'rb') as f:
-                    out.write(f.read())
+                out.write(open(p, 'rb').read())
         return
     lst = out_path + '.txt'
     with open(lst, 'w', encoding='utf-8') as f:
         for p in paths:
             f.write(f"file '{p}'\n")
-    cmd = [ff, '-y', '-f', 'concat', '-safe', '0', '-i', lst, '-c', 'copy', out_path]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+        subprocess.run(
+            [ff, '-y', '-f', 'concat', '-safe', '0', '-i', lst, '-c', 'copy', out_path],
+            check=True, capture_output=True, timeout=300,
+        )
     except Exception:
-        cmd2 = [
-            ff, '-y', '-f', 'concat', '-safe', '0', '-i', lst,
-            '-c:a', 'libmp3lame', '-q:a', '4', out_path,
-        ]
-        subprocess.run(cmd2, check=True, capture_output=True, timeout=300)
+        subprocess.run(
+            [ff, '-y', '-f', 'concat', '-safe', '0', '-i', lst,
+             '-c:a', 'libmp3lame', '-q:a', '4', out_path],
+            check=True, capture_output=True, timeout=300,
+        )
 
 
-def _float_array_to_wav(floats: list[float], rate: int = 16000) -> bytes:
-    """PCM float32 samples -1..1 → WAV bytes."""
-    buf = io.BytesIO()
-    with wave.open(buf, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(rate)
-        frames = bytearray()
-        for x in floats:
-            s = max(-1.0, min(1.0, float(x)))
-            frames += struct.pack('<h', int(s * 32767))
-        wf.writeframes(frames)
-    return buf.getvalue()
-
-
-# ── HuggingFace MMS-TTS ─────────────────────────────────────────────────
-
-def _hf_headers() -> dict:
-    h = {
-        'Content-Type': 'application/json',
-        'User-Agent': 'MEGA-BOT/1.2',
-        'Accept': 'application/json, audio/wav, audio/flac, audio/mpeg, */*',
-    }
-    if HF_TOKEN:
-        h['Authorization'] = f'Bearer {HF_TOKEN}'
-    return h
-
-
-def _hf_parse_response(raw: bytes, content_type: str) -> bytes:
-    ct = (content_type or '').lower()
-    if 'audio' in ct or raw[:4] == b'RIFF' or raw[:4] == b'fLaC' or raw[:3] == b'ID3':
-        return raw
-    # JSON: {audio: base64|list, sampling_rate: N}
+def _finalize_mp3_dir(paths: list[str], td: str) -> bytes:
+    merged = os.path.join(td, 'm.mp3')
+    if len(paths) == 1:
+        shutil.copy(paths[0], merged)
+    else:
+        _concat_audio_files(paths, merged)
+    ogg = os.path.join(td, 'o.ogg')
     try:
-        payload = json.loads(raw.decode('utf-8', errors='replace'))
-    except Exception as exc:
-        if len(raw) > 200:
-            return raw  # binary unknown
-        raise RuntimeError(f'HF bad payload: {exc}') from exc
-    if isinstance(payload, dict) and payload.get('error'):
-        raise RuntimeError(str(payload.get('error')))
-    rate = 16000
-    audio = None
-    if isinstance(payload, dict):
-        rate = int(payload.get('sampling_rate') or payload.get('sample_rate') or 16000)
-        audio = payload.get('audio') or payload.get('wav') or payload.get('data')
-    if isinstance(audio, str):
-        try:
-            return base64.b64decode(audio)
-        except Exception:
-            pass
-    if isinstance(audio, list) and audio and isinstance(audio[0], (int, float)):
-        return _float_array_to_wav([float(x) for x in audio], rate)
-    if isinstance(payload, list) and payload and isinstance(payload[0], (int, float)):
-        return _float_array_to_wav([float(x) for x in payload], rate)
-    raise RuntimeError('HF audio missing in response')
+        _ffmpeg_to_ogg(merged, ogg)
+        return open(ogg, 'rb').read()
+    except Exception:
+        return open(merged, 'rb').read()
 
 
-async def _hf_one_chunk(text: str, model: str) -> bytes:
-    url = f'{HF_API.rstrip("/")}/{model}'
-    body = json.dumps({'inputs': text}).encode('utf-8')
+# ── 1) gTTS (famous free library) ───────────────────────────────────────
 
-    def _fetch() -> bytes:
-        req = urllib.request.Request(url, data=body, headers=_hf_headers(), method='POST')
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                raw = resp.read()
-                ct = resp.headers.get('Content-Type', '')
-                return _hf_parse_response(raw, ct)
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode('utf-8', errors='replace')[:300]
-            # model loading
-            if e.code in (503, 529) or 'loading' in err_body.lower():
-                raise RuntimeError(f'HF model loading: {err_body}') from e
-            raise RuntimeError(f'HF HTTP {e.code}: {err_body}') from e
+async def synthesize_gtts(text: str, lang: str) -> bytes:
+    from gtts import gTTS
 
-    # retry while model loads
-    last = None
-    for attempt in range(5):
-        try:
-            data = await asyncio.to_thread(_fetch)
-            if data and len(data) > 100:
-                return data
-            last = RuntimeError('HF empty')
-        except Exception as exc:
-            last = exc
-            msg = str(exc).lower()
-            wait = 3.0 + attempt * 2.5
-            if 'loading' in msg or '503' in msg:
-                wait = 8.0 + attempt * 4.0
-            await asyncio.sleep(wait)
-    raise last or RuntimeError('HF failed')
-
-
-async def synthesize_hf(text: str, lang: str) -> bytes:
-    model = HF_FA_MODEL if lang == 'fa' else HF_EN_MODEL
-    chunks = _chunk_text(text, HF_CHUNK)
-    with tempfile.TemporaryDirectory(prefix='mega-hf-') as td:
-        paths: list[str] = []
-        for i, ch in enumerate(chunks):
-            raw = await _hf_one_chunk(ch, model)
-            # normalize each chunk to wav/mp3 file
-            ext = 'wav'
-            if raw[:4] == b'RIFF':
-                ext = 'wav'
-            elif raw[:3] == b'ID3' or raw[:2] == b'\xff\xfb':
-                ext = 'mp3'
-            elif raw[:4] == b'fLaC':
-                ext = 'flac'
-            path = os.path.join(td, f'{i:04d}.{ext}')
-            with open(path, 'wb') as f:
-                f.write(raw)
-            # convert to wav for stable concat
-            wav = os.path.join(td, f'{i:04d}.wav')
-            ff = _which('ffmpeg')
-            if ff and ext != 'wav':
-                subprocess.run(
-                    [ff, '-y', '-i', path, wav],
-                    check=True, capture_output=True, timeout=120,
-                )
-                paths.append(wav)
-            else:
+    def _run() -> bytes:
+        with tempfile.TemporaryDirectory(prefix='mega-gtts-') as td:
+            chunks = _chunk_text(text, GTTS_CHUNK)
+            paths: list[str] = []
+            for i, ch in enumerate(chunks):
+                path = os.path.join(td, f'{i:04d}.mp3')
+                # tld=com — standard endpoint
+                tts = gTTS(text=ch, lang=lang, slow=False, lang_check=False)
+                tts.save(path)
+                if os.path.getsize(path) < 50:
+                    raise RuntimeError('gTTS empty chunk')
                 paths.append(path)
-        merged = os.path.join(td, 'm.wav')
-        if len(paths) == 1:
-            shutil.copy(paths[0], merged)
-        else:
-            _concat_audio_files(paths, merged)
-        ogg = os.path.join(td, 'o.ogg')
-        try:
-            _ffmpeg_to_ogg(merged, ogg)
-            with open(ogg, 'rb') as f:
-                return f.read()
-        except Exception:
-            with open(merged, 'rb') as f:
-                return f.read()
+            return _finalize_mp3_dir(paths, td)
+
+    return await asyncio.to_thread(_run)
 
 
-# ── Google fallback ─────────────────────────────────────────────────────
+# ── 2) Google translate_tts HTTP ────────────────────────────────────────
 
 async def _google_one_chunk(text: str, lang: str) -> bytes:
     q = urllib.parse.quote(text)
-    url = (
-        f'https://translate.google.com/translate_tts'
-        f'?ie=UTF-8&client=tw-ob&q={q}&tl={lang}'
-    )
+    # alternate host sometimes works when translate.google.com is flaky
+    urls = [
+        f'https://translate.googleapis.com/translate_tts?ie=UTF-8&client=gtx&q={q}&tl={lang}',
+        f'https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&q={q}&tl={lang}',
+    ]
 
     def _fetch() -> bytes:
-        req = urllib.request.Request(
-            url,
-            headers={
-                'User-Agent': (
-                    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
-                    '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-                ),
-                'Referer': 'https://translate.google.com/',
-            },
-        )
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            data = resp.read()
-        if not data or len(data) < 50:
-            raise RuntimeError('google empty')
-        return data
+        last = None
+        for url in urls:
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        'User-Agent': (
+                            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+                            '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+                        ),
+                        'Referer': 'https://translate.google.com/',
+                        'Accept': '*/*',
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    data = resp.read()
+                if data and len(data) >= 50:
+                    return data
+                last = RuntimeError('empty')
+            except Exception as exc:
+                last = exc
+        raise last or RuntimeError('google failed')
 
     return await asyncio.to_thread(_fetch)
 
 
 async def synthesize_google(text: str, lang: str) -> bytes:
-    chunks = _chunk_text(text[:MAX_CHARS], GOOGLE_CHUNK)
+    chunks = _chunk_text(text, GOOGLE_CHUNK)
     sem = asyncio.Semaphore(max(1, GOOGLE_PARALLEL))
 
     async def fetch(i: int, ch: str) -> tuple[int, bytes]:
@@ -311,50 +208,16 @@ async def synthesize_google(text: str, lang: str) -> bytes:
 
     results = await asyncio.gather(*[fetch(i, ch) for i, ch in enumerate(chunks)])
     results.sort(key=lambda x: x[0])
-    with tempfile.TemporaryDirectory(prefix='mega-gtts-') as td:
+    with tempfile.TemporaryDirectory(prefix='mega-ghttp-') as td:
         paths = []
         for i, data in results:
             p = os.path.join(td, f'{i:04d}.mp3')
             open(p, 'wb').write(data)
             paths.append(p)
-        merged = os.path.join(td, 'm.mp3')
-        if len(paths) == 1:
-            shutil.copy(paths[0], merged)
-        else:
-            _concat_audio_files(paths, merged)
-        ogg = os.path.join(td, 'o.ogg')
-        try:
-            _ffmpeg_to_ogg(merged, ogg)
-            return open(ogg, 'rb').read()
-        except Exception:
-            return open(merged, 'rb').read()
+        return _finalize_mp3_dir(paths, td)
 
 
-async def synthesize_gtts_lib(text: str, lang: str) -> bytes:
-    from gtts import gTTS
-
-    def _run() -> bytes:
-        with tempfile.TemporaryDirectory(prefix='mega-gtts2-') as td:
-            chunks = _chunk_text(text, 500)
-            paths = []
-            for i, ch in enumerate(chunks):
-                p = os.path.join(td, f'{i:04d}.mp3')
-                gTTS(text=ch, lang=lang, slow=False).save(p)
-                paths.append(p)
-            merged = os.path.join(td, 'm.mp3')
-            if len(paths) == 1:
-                shutil.copy(paths[0], merged)
-            else:
-                _concat_audio_files(paths, merged)
-            ogg = os.path.join(td, 'o.ogg')
-            try:
-                _ffmpeg_to_ogg(merged, ogg)
-                return open(ogg, 'rb').read()
-            except Exception:
-                return open(merged, 'rb').read()
-
-    return await asyncio.to_thread(_run)
-
+# ── 3) espeak ───────────────────────────────────────────────────────────
 
 async def synthesize_espeak(text: str, lang: str) -> bytes:
     es = _which('espeak-ng') or _which('espeak')
@@ -392,40 +255,29 @@ async def synthesize_persian(text: str = DEFAULT_TEXT) -> tuple[bytes, str]:
     lang = detect_lang(text)
     errors: list[str] = []
 
-    # 1) HuggingFace MMS-TTS (new platform — not Piper, not edge)
+    # 1) gTTS — famous free TTS library
     try:
-        data = await synthesize_hf(text, lang)
+        data = await synthesize_gtts(text, lang)
         if data and len(data) > 100:
-            ext = 'ogg' if data[:4] == b'OggS' else ('wav' if data[:4] == b'RIFF' else 'mp3')
-            log.info('TTS engine=hf-mms-%s bytes=%s chars=%s', lang, len(data), len(text))
+            ext = 'ogg' if data[:4] == b'OggS' else 'mp3'
+            log.info('TTS engine=gTTS-%s bytes=%s chars=%s', lang, len(data), len(text))
             return data, f'voice.{ext}'
     except Exception as exc:
-        errors.append(f'hf:{type(exc).__name__}')
-        log.warning('HF MMS-TTS failed (%s): %s', lang, exp if False else exc)
+        errors.append(f'gTTS:{type(exc).__name__}')
+        log.warning('gTTS failed (%s): %s', lang, exc)
 
-    # 2) Google
+    # 2) Google HTTP
     try:
         data = await synthesize_google(text, lang)
         if data and len(data) > 100:
             ext = 'ogg' if data[:4] == b'OggS' else 'mp3'
-            log.info('TTS engine=google-%s bytes=%s', lang, len(data))
+            log.info('TTS engine=google-http-%s bytes=%s', lang, len(data))
             return data, f'voice.{ext}'
     except Exception as exc:
         errors.append(f'google:{type(exc).__name__}')
-        log.warning('google failed: %s', exc)
+        log.warning('google-http failed: %s', exp if False else exc)
 
-    # 3) gTTS
-    try:
-        data = await synthesize_gtts_lib(text, lang)
-        if data and len(data) > 100:
-            ext = 'ogg' if data[:4] == b'OggS' else 'mp3'
-            log.info('TTS engine=gtts-%s bytes=%s', lang, len(data))
-            return data, f'voice.{ext}'
-    except Exception as exc:
-        errors.append(f'gtts:{type(exc).__name__}')
-        log.warning('gtts failed: %s', exc)
-
-    # 4) espeak
+    # 3) espeak
     try:
         data = await synthesize_espeak(text, lang)
         if data and len(data) > 50:

@@ -1,1 +1,1 @@
-redeploy-2026-10-27-text-stats-no-edge
+2026-10-27 piper-tts primary no-edge

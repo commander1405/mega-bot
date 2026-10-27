@@ -1,7 +1,8 @@
-"""TTS for MEGA BOT — Google Translate TTS (FA+EN), no edge-tts.
+"""TTS for MEGA BOT — no edge-tts.
 
-Long text is chunked and merged with ffmpeg. Soft ceiling TTS_MAX_CHARS.
-Fallback: gTTS library, then espeak-ng if available.
+Persian primary: Piper neural offline (fa_IR-amir-medium) — free, unlimited, no API.
+English primary: Google Translate TTS (chunked).
+Fallbacks: gTTS, espeak-ng.
 """
 from __future__ import annotations
 
@@ -14,6 +15,8 @@ import subprocess
 import tempfile
 import urllib.parse
 import urllib.request
+import wave
+from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -22,6 +25,20 @@ DEFAULT_TEXT = 'تست'
 MAX_CHARS = int(os.getenv('TTS_MAX_CHARS', '100000'))
 GOOGLE_CHUNK = int(os.getenv('TTS_GOOGLE_CHUNK', '180'))
 GOOGLE_PARALLEL = int(os.getenv('TTS_GOOGLE_PARALLEL', '5'))
+PIPER_CHUNK = int(os.getenv('TTS_PIPER_CHUNK', '700'))
+
+PIPER_MODEL_NAME = os.getenv('TTS_PIPER_MODEL', 'fa_IR-amir-medium')
+PIPER_BASE = os.getenv(
+    'TTS_PIPER_BASE',
+    'https://huggingface.co/rhasspy/piper-voices/resolve/main/fa/fa_IR/amir/medium',
+)
+PIPER_DIR = Path(os.getenv('TTS_PIPER_DIR', '/tmp/mega_piper'))
+PIPER_LENGTH_SCALE = float(os.getenv('TTS_PIPER_LENGTH', '1.35'))
+PIPER_NOISE_SCALE = float(os.getenv('TTS_PIPER_NOISE', '0.4'))
+PIPER_NOISE_W = float(os.getenv('TTS_PIPER_NOISE_W', '0.6'))
+
+_piper_voice = None
+_piper_lock = asyncio.Lock()
 
 
 def _which(cmd: str) -> Optional[str]:
@@ -104,9 +121,105 @@ def _concat_audio_files(paths: list[str], out_path: str) -> None:
     try:
         subprocess.run(cmd, check=True, capture_output=True, timeout=300)
     except Exception:
-        cmd2 = [ff, '-y', '-f', 'concat', '-safe', '0', '-i', lst, '-c:a', 'libmp3lame', '-q:a', '4', out_path]
+        cmd2 = [
+            ff, '-y', '-f', 'concat', '-safe', '0', '-i', lst,
+            '-c:a', 'libmp3lame', '-q:a', '4', out_path,
+        ]
         subprocess.run(cmd2, check=True, capture_output=True, timeout=300)
 
+
+# ── Piper (Persian offline neural) ──────────────────────────────────────
+
+def _ensure_piper_files() -> Path:
+    PIPER_DIR.mkdir(parents=True, exist_ok=True)
+    name = PIPER_MODEL_NAME
+    onnx = PIPER_DIR / f'{name}.onnx'
+    conf = PIPER_DIR / f'{name}.onnx.json'
+    if onnx.is_file() and onnx.stat().st_size > 1000 and conf.is_file():
+        return onnx
+    for suffix, dest in (('.onnx', onnx), ('.onnx.json', conf)):
+        url = f'{PIPER_BASE}/{name}{suffix}'
+        log.info('Downloading Piper model %s', url)
+        req = urllib.request.Request(url, headers={'User-Agent': 'MEGA-BOT/1.0'})
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            dest.write_bytes(resp.read())
+    if not onnx.is_file() or onnx.stat().st_size < 1000:
+        raise RuntimeError('piper model download failed')
+    return onnx
+
+
+def _load_piper():
+    global _piper_voice
+    if _piper_voice is not None:
+        return _piper_voice
+    from piper import PiperVoice  # type: ignore
+    model = _ensure_piper_files()
+    _piper_voice = PiperVoice.load(str(model))
+    return _piper_voice
+
+
+def _piper_syn_config():
+    try:
+        from piper.config import SynthesisConfig  # type: ignore
+        return SynthesisConfig(
+            length_scale=PIPER_LENGTH_SCALE,
+            noise_scale=PIPER_NOISE_SCALE,
+            noise_w_scale=PIPER_NOISE_W,
+        )
+    except Exception:
+        return None
+
+
+def _piper_synthesize_sync(text: str) -> bytes:
+    voice = _load_piper()
+    chunks = _chunk_text(text, PIPER_CHUNK)
+    syn = _piper_syn_config()
+    with tempfile.TemporaryDirectory(prefix='mega-piper-') as td:
+        wav_parts: list[str] = []
+        for i, ch in enumerate(chunks):
+            path = os.path.join(td, f'{i:04d}.wav')
+            with wave.open(path, 'wb') as wf:
+                if syn is not None:
+                    voice.synthesize_wav(ch, wf, syn_config=syn)
+                else:
+                    voice.synthesize_wav(ch, wf)
+            wav_parts.append(path)
+        merged = os.path.join(td, 'm.wav')
+        if len(wav_parts) == 1:
+            shutil.copy(wav_parts[0], merged)
+        else:
+            # wav concat via ffmpeg
+            ff = _which('ffmpeg')
+            if ff and len(wav_parts) > 1:
+                lst = os.path.join(td, 'list.txt')
+                with open(lst, 'w') as f:
+                    for p in wav_parts:
+                        f.write(f"file '{p}'\n")
+                subprocess.run(
+                    [ff, '-y', '-f', 'concat', '-safe', '0', '-i', lst, '-c', 'copy', merged],
+                    check=True, capture_output=True, timeout=300,
+                )
+            else:
+                shutil.copy(wav_parts[0], merged)
+        ogg = os.path.join(td, 'o.ogg')
+        try:
+            _ffmpeg_to_ogg(merged, ogg)
+            with open(ogg, 'rb') as f:
+                data = f.read()
+        except Exception:
+            with open(merged, 'rb') as f:
+                data = f.read()
+    if len(data) < 50:
+        raise RuntimeError('piper empty')
+    return data
+
+
+async def synthesize_piper_fa(text: str) -> bytes:
+    async with _piper_lock:
+        return await asyncio.to_thread(_piper_synthesize_sync, text)
+
+
+# ── Google Translate TTS ────────────────────────────────────────────────
 
 async def _google_one_chunk(text: str, lang: str) -> bytes:
     q = urllib.parse.quote(text)
@@ -147,20 +260,17 @@ async def synthesize_google(text: str, lang: str) -> bytes:
             last = None
             for attempt in range(4):
                 try:
-                    data = await _google_one_chunk(ch, lang)
-                    return i, data
+                    return i, await _google_one_chunk(ch, lang)
                 except Exception as exc:
                     last = exc
-                    await asyncio.sleep(0.6 * (attempt + 1))
+                    await asyncio.sleep(0.5 * (attempt + 1))
             raise last or RuntimeError('google failed')
 
     results = await asyncio.gather(*[fetch(i, ch) for i, ch in enumerate(chunks)])
     results.sort(key=lambda x: x[0])
-    mp3_parts = [d for _, d in results]
-
     with tempfile.TemporaryDirectory(prefix='mega-gtts-') as td:
-        paths: list[str] = []
-        for i, data in enumerate(mp3_parts):
+        paths = []
+        for i, data in results:
             path = os.path.join(td, f'{i:04d}.mp3')
             with open(path, 'wb') as f:
                 f.write(data)
@@ -181,12 +291,10 @@ async def synthesize_google(text: str, lang: str) -> bytes:
 
 
 async def synthesize_gtts_lib(text: str, lang: str) -> bytes:
-    """Fallback via gTTS package (also Google under the hood)."""
     from gtts import gTTS
 
     def _run() -> bytes:
         with tempfile.TemporaryDirectory(prefix='mega-gtts2-') as td:
-            # gTTS handles internal chunking poorly for very long; we chunk ourselves
             chunks = _chunk_text(text, 500)
             paths = []
             for i, ch in enumerate(chunks):
@@ -216,8 +324,6 @@ async def synthesize_espeak(text: str, lang: str) -> bytes:
         raise RuntimeError('espeak not found')
     voice = 'fa' if lang == 'fa' else 'en'
     with tempfile.TemporaryDirectory(prefix='mega-esp-') as td:
-        wav = os.path.join(td, 'a.wav')
-        # espeak struggles with huge text; chunk
         chunks = _chunk_text(text, 800)
         wavs = []
         for i, ch in enumerate(chunks):
@@ -249,7 +355,17 @@ async def synthesize_persian(text: str = DEFAULT_TEXT) -> tuple[bytes, str]:
     lang = detect_lang(text)
     errors: list[str] = []
 
-    # 1) Direct Google translate_tts (no edge)
+    if lang == 'fa':
+        # Piper offline neural — independent platform, no edge, no cloud quota
+        try:
+            data = await synthesize_piper_fa(text)
+            log.info('TTS engine=piper-amir bytes=%s chars=%s', len(data), len(text))
+            return data, 'voice.ogg'
+        except Exception as exc:
+            errors.append(f'piper:{type(exc).__name__}')
+            log.warning('piper-fa failed: %s', exc)
+
+    # EN primary, and FA fallback: Google
     try:
         data = await synthesize_google(text, lang)
         if data and len(data) > 100:
@@ -260,18 +376,16 @@ async def synthesize_persian(text: str = DEFAULT_TEXT) -> tuple[bytes, str]:
         errors.append(f'google:{type(exc).__name__}')
         log.warning('google-tts failed (%s): %s', lang, exc)
 
-    # 2) gTTS library
     try:
         data = await synthesize_gtts_lib(text, lang)
         if data and len(data) > 100:
             ext = 'ogg' if data[:4] == b'OggS' else 'mp3'
-            log.info('TTS engine=gtts-%s bytes=%s chars=%s', lang, len(data), len(text))
+            log.info('TTS engine=gtts-%s bytes=%s', lang, len(data))
             return data, f'voice.{ext}'
     except Exception as exc:
         errors.append(f'gtts:{type(exc).__name__}')
-        log.warning('gtts failed (%s): %s', lang, exc)
+        log.warning('gtts failed: %s', exc)
 
-    # 3) espeak
     try:
         data = await synthesize_espeak(text, lang)
         if data and len(data) > 50:

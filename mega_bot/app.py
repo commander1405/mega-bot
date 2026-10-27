@@ -5926,7 +5926,7 @@ class MegaBot:
             lines.append(f'ℹ️ ثبت آمار از: {tracking}')
         else:
             lines.append('ℹ️ فقط پیام‌های پس از فعال‌شدن ربات شمرده می‌شوند.')
-        lines.append('📌 اعداد ساختگی نیستند؛ از شمارنده‌های واقعی دیتابیس خوانده شده‌اند.')
+        lines.append('📌 اعداد واقعی از دیتابیس · نسخه متنی آمار v1.2.2')
 
         await self.safe_send(chat_id, '\n'.join(lines), parse_mode=None)
 

@@ -3293,7 +3293,19 @@ class MegaBot:
             parse_mode=None,
         )
         try:
-            data, filename = await tts_mod.synthesize_persian(body)
+            # Long texts need generous timeout (chunked synthesis)
+            timeout = min(600.0, 30.0 + len(body) / 8.0)
+            data, filename = await asyncio.wait_for(
+                tts_mod.synthesize_persian(body), timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            await self.safe_send(
+                chat_id,
+                '❌ ساخت ویس زمان‌بر شد. متن را کوتاه‌تر کن یا دوباره تلاش کن.',
+                reply_to=msg.get('message_id'),
+                parse_mode=None,
+            )
+            return
         except Exception as exc:
             log.exception('TTS synthesize failed')
             await self.safe_send(
@@ -5809,17 +5821,17 @@ class MegaBot:
 
 
     async def _send_group_stats(self, chat_id: int, chat: dict) -> None:
-        """Generate and send one professional statistics image for this group."""
+        """Accurate 24h group stats as plain text (image path disabled — unstable on Bale)."""
         title = (chat.get('title') or 'گروه')[:60]
         try:
             now = time.time()
             if not hasattr(self, '_stats_cd'):
                 self._stats_cd = {}
             last = float(self._stats_cd.get(chat_id) or 0)
-            if now - last < 30:
+            if now - last < 20:
                 await self.safe_send(
                     chat_id,
-                    f'⏳ آمار هر ۳۰ ثانیه یک‌بار قابل درخواست است. ({int(30 - (now - last))}ث باقی)',
+                    f'⏳ آمار هر ۲۰ ثانیه یک‌بار. ({int(20 - (now - last))}ث)',
                     parse_mode=None,
                 )
                 return
@@ -5852,67 +5864,71 @@ class MegaBot:
         except Exception:
             pass
 
-        avatars: dict = {}
-        try:
-            tops = []
-            for u in (stats.get('top_users') or []):
-                if not u.get('user_id'):
-                    continue
-                tops.append({
-                    'user_id': int(u['user_id']),
-                    'first_name': u.get('name') or u.get('first_name') or u.get('username') or '',
-                    'username': u.get('username') or '',
-                })
-            if tops:
-                avatars = await self._fetch_user_avatars(tops, limit=5)
-        except Exception:
-            log.debug('avatar fetch skipped', exc_info=True)
+        c = stats.get('counts') or {}
+        total = int(stats.get('total_msgs') or 0)
+        active = int(stats.get('active_users') or 0)
+        joined = int(c.get('joined') or 0)
+        left = int(c.get('left_count') or 0)
+        net = joined - left
+        t7 = stats.get('total_msgs_7')
+        t30 = stats.get('total_msgs_30')
+        warns = int(stats.get('warn_total') or 0)
+        tracking = stats.get('tracking_start')
+        tops = stats.get('top_users') or []
 
-        try:
-            png = await asyncio.to_thread(
-                dash.render_group_dashboard,
-                title=title,
-                stats=stats,
-                members_count=members_count,
-                avatars=avatars,
-                chat_id=chat_id,
-            )
-        except TypeError:
-            # Older signature without chat_id
+        # Period chips from hourly
+        hourly = stats.get('hourly') or []
+        by_h = {int(h.get('hour') or 0): int(h.get('count') or 0) for h in hourly}
+        series = [by_h.get(h, 0) for h in range(24)]
+        night = sum(series[0:6])
+        morning = sum(series[6:12])
+        noon = sum(series[12:18])
+        evening = sum(series[18:24])
+
+        def n(v):
             try:
-                png = await asyncio.to_thread(
-                    dash.render_group_dashboard,
-                    title=title,
-                    stats=stats,
-                    members_count=members_count,
-                    avatars=avatars,
-                )
+                return f'{int(v):,}'.replace(',', '٬')
             except Exception:
-                log.exception('stats image render failed')
-                png = None
-        except Exception:
-            log.exception('stats image render failed')
-            png = None
+                return str(v)
 
-        if not png:
-            c = stats.get('counts') or {}
-            body = (
-                f"📊 آمار گروه — {title}\n"
-                f"پیام‌ها (۲۴س): {stats.get('total_msgs', 0)}\n"
-                f"کاربران فعال: {stats.get('active_users', 0)}\n"
-                f"۷روز: {stats.get('total_msgs_7', '—')} · ۳۰روز: {stats.get('total_msgs_30', '—')}"
-            )
-            await self.safe_send(chat_id, body, parse_mode=None)
-            return
+        mem_s = n(members_count) if isinstance(members_count, int) else 'نامشخص'
+        lines = [
+            f'📊 آمار گروه — {title}',
+            f'🆔 شناسه: `{chat_id}`',
+            f'👥 اعضا: {mem_s}',
+            '',
+            '⏱ بازه: ۲۴ ساعت اخیر (داده‌های ثبت‌شده)',
+            f'💬 پیام‌ها: {n(total)}',
+            f'👤 کاربران فعال: {n(active)}',
+            f'🟢 ورود: {n(joined)}  |  🔴 خروج: {n(left)}  |  رشد خالص: {n(net)}',
+            f'⚠️ اخطارهای ثبت‌شده: {n(warns)}',
+            '',
+            '🕐 تراکم پیام در شبانه‌روز:',
+            f'  شب ۰–۶: {n(night)}  ·  صبح ۶–۱۲: {n(morning)}',
+            f'  ظهر ۱۲–۱۸: {n(noon)}  ·  عصر ۱۸–۲۴: {n(evening)}',
+            '',
+            '📎 تفکیک رسانه (۲۴س):',
+            f'  متن {n(c.get("text_count", 0))} · عکس {n(c.get("photo_count", 0))} · ویدیو {n(c.get("video_count", 0))}',
+            f'  استیکر {n(c.get("sticker_count", 0))} · گیف {n(c.get("animation_count", 0))} · ویس {n(c.get("voice_count", 0))}',
+            f'  موزیک {n(c.get("audio_count", 0))} · فایل {n(c.get("document_count", 0))}',
+        ]
+        if t7 is not None or t30 is not None:
+            lines.append('')
+            lines.append(f'📈 ۷ روز: {n(t7) if t7 is not None else "—"}  ·  ۳۰ روز: {n(t30) if t30 is not None else "—"}')
+        if tops:
+            lines.append('')
+            lines.append('🏆 کاربران برتر (۲۴س):')
+            for i, u in enumerate(tops[:5], 1):
+                nm = u.get('name') or u.get('first_name') or u.get('username') or str(u.get('user_id'))
+                lines.append(f'  {i}. {nm} — {n(u.get("msg_count", 0))} پیام')
+        lines.append('')
+        if tracking:
+            lines.append(f'ℹ️ ثبت آمار از: {tracking}')
+        else:
+            lines.append('ℹ️ فقط پیام‌های پس از فعال‌شدن ربات شمرده می‌شوند.')
+        lines.append('📌 اعداد ساختگی نیستند؛ از شمارنده‌های واقعی دیتابیس خوانده شده‌اند.')
 
-        try:
-            await self.api.send_photo_bytes(
-                chat_id, png, filename='mega-stats.png',
-                caption=f'📊 آمار گروه «{title}»',
-            )
-        except Exception:
-            log.exception('stats photo send failed')
-            await self.safe_send(chat_id, '❌ ارسال تصویر آمار ممکن نشد. لطفاً بعداً تلاش کنید.', parse_mode=None)
+        await self.safe_send(chat_id, '\n'.join(lines), parse_mode=None)
 
 
     async def _show_group_panel(self, chat_id: int, uid: int) -> None:

@@ -11,7 +11,7 @@ from .messaging import MessageHub
 from .keyboards import USER_KEYBOARD, inline, menu_page, main_admin_menu, user_actions, url_button, merge_inline
 from . import prices as price_mod
 from . import fun_content
-from .profanity import contains_profanity
+from .profanity import contains_profanity, extract_urls, text_similarity, collapse_for_match
 from . import schedule_lock as schlock
 from . import levels as level_mod
 from . import tts as tts_mod
@@ -5514,17 +5514,33 @@ class MegaBot:
         if not reason and sec.get('antirepeat') and body:
             rk = f'repeat:{chat_id}:{uid}'
             prev = self.game_cache.get(rk)
-            if prev and prev.get('text') == body and (time.time() - prev.get('ts', 0)) < 30:
-                reason = 'پیام تکراری'
-            self.game_cache[rk] = {'text': body, 'ts': time.time()}
+            now_ts = time.time()
+            if prev and (now_ts - float(prev.get('ts') or 0)) < 45:
+                prev_text = prev.get('text') or ''
+                if prev_text == body or text_similarity(prev_text, body) >= 0.92:
+                    reason = 'پیام تکراری'
+            self.game_cache[rk] = {'text': body, 'ts': now_ts}
         if not reason and sec.get('antispam') and body:
-            # Heavy spam heuristics (not ordinary chat)
-            if len(body) > 1200 or body.count('\n') > 20:
+            # Multi-layer spam heuristics (ordinary chat should pass)
+            if len(body) > 1200 or body.count(chr(10)) > 20:
                 reason = 'اسپم'
             elif len(set(body)) <= 3 and len(body) >= 30:
                 reason = 'اسپم کاراکتر تکراری'
             elif re.search(r'(.)\1{12,}', body):
                 reason = 'اسپم کاراکتر تکراری'
+            else:
+                # short burst of near-identical messages
+                sk = f'spamsim:{chat_id}:{uid}'
+                hist = self.game_cache.get(sk) or []
+                now_ts = time.time()
+                hist = [h for h in hist if now_ts - float(h.get('ts') or 0) < 20]
+                near = sum(1 for h in hist if text_similarity(h.get('text') or '', body) >= 0.88)
+                hist.append({'text': body, 'ts': now_ts})
+                self.game_cache[sk] = hist[-12:]
+                if near >= 3:
+                    reason = 'اسپم پیام‌های مشابه'
+                elif extract_urls(body) and len(extract_urls(body)) >= 3:
+                    reason = 'اسپم لینک'
 
         if not reason:
             return False
@@ -5573,7 +5589,9 @@ class MegaBot:
         return True
 
     @staticmethod
+    @staticmethod
     def _message_has_link(body: str, entities: list | None) -> bool:
+        """Strict link detection: entities + extract_urls (domains, invites, www)."""
         if entities:
             for e in entities:
                 t = (e.get('type') or '').lower()
@@ -5581,12 +5599,9 @@ class MegaBot:
                     return True
         if not body:
             return False
-        # Real URL patterns — avoid treating "file.txt" as link
-        if re.search(r'(https?://|www\.)\S+', body, re.I):
-            return True
-        if re.search(r'(?:^|[\s(])(?:ble\.ir|t\.me|telegram\.me)/\S+', body, re.I):
-            return True
-        return False
+        urls = extract_urls(body)
+        return bool(urls)
+
 
     @staticmethod
     def _count_mentions(body: str, entities: list | None) -> int:

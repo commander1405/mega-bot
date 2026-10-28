@@ -1,1 +1,1 @@
-2026-10-27 tts background job fix
+2026-10-28 anti-abuse security upgrade

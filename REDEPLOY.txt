@@ -1,1 +1,1 @@
-2026-10-29 drop pending updates + active groups only
+2026-10-29 ban notice once in groups

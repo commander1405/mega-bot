@@ -849,24 +849,30 @@ class MegaBot:
             and not text.startswith('/admin')
             and not text.startswith('/owner')
         ):
-            # Only notify in private chat, at most once per hour — never spam groups
-            if (not is_group) and self._is_private_chat_id(chat_id):
-                if not hasattr(self, '_ban_notice_ts'):
-                    self._ban_notice_ts = {}
-                last = float(self._ban_notice_ts.get(uid) or 0)
-                if time.time() - last >= 3600:
-                    self._ban_notice_ts[uid] = time.time()
-                    code = restricted_user.get('case_code') or '?'
-                    notice = (
-                        '*⛔ دسترسی تو به قابلیت‌های MEGA BOT محدود شده است.*'
-                        + chr(10)
-                        + f'کد پیگیری: `#{code}`'
-                        + chr(10)
-                        + 'برای بررسی دلیل و مدت، بخش *پرونده من* را باز کن.'
-                    )
+            # Block features. Notify policy:
+            # - Group: only ONCE per (group, user)
+            # - PV: every time the banned user interacts
+            code = restricted_user.get('case_code') or '?'
+            notice = (
+                '*⛔ دسترسی تو به قابلیت‌های MEGA BOT محدود شده است.*'
+                + chr(10)
+                + f'کد پیگیری: `#{code}`'
+                + chr(10)
+                + 'برای بررسی دلیل و مدت، بخش *پرونده من* را باز کن.'
+            )
+            if not hasattr(self, '_user_ban_notice_keys'):
+                self._user_ban_notice_keys = set()
+            if is_group:
+                key = (int(chat_id), int(uid))
+                if key not in self._user_ban_notice_keys:
+                    self._user_ban_notice_keys.add(key)
                     await self.safe_send(
-                        chat_id, notice, USER_KEYBOARD, permanent=True,
+                        chat_id, notice, reply_to=msg.get('message_id'), permanent=True,
                     )
+            else:
+                await self.safe_send(
+                    chat_id, notice, USER_KEYBOARD, permanent=True,
+                )
             return
 
         # Keep group-level restriction enforced for bot features.
@@ -878,8 +884,20 @@ class MegaBot:
                 restricted_group = None
             feature_request = text.startswith('/') or text in ('دوز','بازی دوز','شیر یا خط','قوانین','پین','لیست ویژه ها','خوبی','چخبر','خدافظ','شب خوش','سلام ربات') or text.startswith(('اکو ','تنظیم قوانین ','هرکی تک')) or ('ربات' in text.lower())
             if restricted_group and feature_request and not self._is_admin_identity(uid):
-                await self.safe_send(chat_id, f"*⛔ این گروه توسط مدیریت محدود شده است.*\nکد پیگیری: `#{restricted_group['case_code']}`", reply_to=msg.get('message_id'))
+                # Notify once per banned group, then stay silent; commands stay blocked
+                if not hasattr(self, '_group_ban_notice_keys'):
+                    self._group_ban_notice_keys = set()
+                gk = int(chat_id)
+                if gk not in self._group_ban_notice_keys:
+                    self._group_ban_notice_keys.add(gk)
+                    code = restricted_group.get('case_code') or '?'
+                    await self.safe_send(
+                        chat_id,
+                        f"*⛔ این گروه توسط مدیریت محدود شده است.*\nکد پیگیری: `#{code}`",
+                        reply_to=msg.get('message_id'),
+                    )
                 return
+
         if text.startswith('/start'):
             await self.safe_send(chat_id, '*سلام؛ به MEGA BOT خوش آمدی* 🌑\nاز کیبورد پایین، بخش موردنظرت را انتخاب کن.', USER_KEYBOARD)
             if not is_group:
@@ -1463,10 +1481,16 @@ class MegaBot:
             except Exception:
                 restricted = None
             if restricted:
-                await self.safe_send(
-                    chat_id,
-                    f"*⛔ این گروه توسط مدیریت محدود شده است.*\nکد پیگیری: `#{restricted['case_code']}`",
-                )
+                if not hasattr(self, '_group_ban_notice_keys'):
+                    self._group_ban_notice_keys = set()
+                gk = int(chat_id)
+                if gk not in self._group_ban_notice_keys:
+                    self._group_ban_notice_keys.add(gk)
+                    code = (restricted.get('case_code') if isinstance(restricted, dict) else None) or '?'
+                    await self.safe_send(
+                        chat_id,
+                        f"*⛔ این گروه توسط مدیریت محدود شده است.*\nکد پیگیری: `#{code}`",
+                    )
                 return
 
         if data.startswith('ui:'):

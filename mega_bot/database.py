@@ -13,9 +13,11 @@ CREATE INDEX IF NOT EXISTS users_username_idx ON users (LOWER(username));
 CREATE TABLE IF NOT EXISTS groups_seen (
   chat_id BIGINT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', username TEXT,
   first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  messages_count BIGINT NOT NULL DEFAULT 0
+  messages_count BIGINT NOT NULL DEFAULT 0,
+  bot_status TEXT NOT NULL DEFAULT 'member'
 );
 CREATE INDEX IF NOT EXISTS groups_username_idx ON groups_seen (LOWER(username));
+ALTER TABLE groups_seen ADD COLUMN IF NOT EXISTS bot_status TEXT NOT NULL DEFAULT 'member';
 CREATE TABLE IF NOT EXISTS admins (
   user_id BIGINT PRIMARY KEY, username TEXT, display_name TEXT NOT NULL DEFAULT '',
   permissions JSONB NOT NULL DEFAULT '{"stats":true,"search":true,"case_lookup":true,"unban_user":true,"unban_group":true,"ban_user":false,"ban_group":false,"edit_about":false,"edit_team":false,"manage_admins":false,"settings":false}'::jsonb,
@@ -196,6 +198,15 @@ CREATE TABLE IF NOT EXISTS group_user_msgs (
   PRIMARY KEY (chat_id, user_id, day)
 );
 CREATE INDEX IF NOT EXISTS group_user_msgs_top_idx ON group_user_msgs(chat_id, day, msg_count DESC);
+CREATE TABLE IF NOT EXISTS group_user_hourly (
+  chat_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  hour_start TIMESTAMPTZ NOT NULL,
+  msg_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (chat_id, user_id, hour_start)
+);
+CREATE INDEX IF NOT EXISTS group_user_hourly_window_idx
+  ON group_user_hourly (chat_id, hour_start DESC);
 CREATE TABLE IF NOT EXISTS group_warns (
   chat_id BIGINT NOT NULL,
   user_id BIGINT NOT NULL,
@@ -325,6 +336,7 @@ class Database:
             await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS goodbye_enabled BOOLEAN NOT NULL DEFAULT TRUE")
             await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS goodbye_text TEXT")
             await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS goodbye_varied BOOLEAN NOT NULL DEFAULT TRUE")
+            await conn.execute("ALTER TABLE groups_seen ADD COLUMN IF NOT EXISTS bot_status TEXT NOT NULL DEFAULT 'member'")
             await conn.execute("INSERT INTO settings(key,value) VALUES('about', to_jsonb($1::text)) ON CONFLICT(key) DO NOTHING", "MEGA BOT یک ربات اجتماعی برای بله است.")
             await conn.execute("INSERT INTO settings(key,value) VALUES('donations_total', '0'::jsonb) ON CONFLICT(key) DO NOTHING")
             defaults = {
@@ -355,14 +367,24 @@ class Database:
               ON CONFLICT(user_id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name, last_seen=NOW()""",
               int(uid), user.get('username'), user.get('first_name') or user.get('name') or '')
 
-    async def upsert_group(self, chat: dict[str, Any]) -> None:
+    async def upsert_group(self, chat: dict[str, Any], bot_status: str | None = 'member') -> None:
         cid = chat.get('id')
         if not cid:
             return
+        st = (bot_status or 'member').lower().strip() or 'member'
         async with self._pool().acquire() as c:
-            await c.execute("""INSERT INTO groups_seen(chat_id,title,username) VALUES($1,$2,$3)
-              ON CONFLICT(chat_id) DO UPDATE SET title=EXCLUDED.title, username=EXCLUDED.username, last_seen=NOW()""",
-              int(cid), chat.get('title') or chat.get('name') or '', chat.get('username'))
+            await c.execute(
+                """INSERT INTO groups_seen(chat_id,title,username,bot_status) VALUES($1,$2,$3,$4)
+              ON CONFLICT(chat_id) DO UPDATE SET
+                title=EXCLUDED.title,
+                username=EXCLUDED.username,
+                last_seen=NOW(),
+                bot_status=EXCLUDED.bot_status""",
+                int(cid),
+                chat.get('title') or chat.get('name') or '',
+                chat.get('username'),
+                st,
+            )
 
     async def get_setting(self, key: str, default: Any = None) -> Any:
         async with self._pool().acquire() as c:
@@ -456,7 +478,7 @@ class Database:
                 'new_today': int(new_today),
                 'new_month': int(new_month),
                 'active_month': int(active_month),
-                'groups': await c.fetchval('SELECT COUNT(*) FROM groups_seen') or 0,
+                'groups': await c.fetchval("SELECT COUNT(*) FROM groups_seen WHERE COALESCE(bot_status, 'member') NOT IN ('left', 'kicked')") or 0,
                 'group_users': await c.fetchval(
                     "SELECT COUNT(DISTINCT user_id) FROM usage_events "
                     "WHERE chat_type IN ('group','supergroup') AND user_id IS NOT NULL"
@@ -472,7 +494,7 @@ class Database:
                 'donations': await c.fetchval(
                     "SELECT COALESCE((value #>> '{}')::bigint,0) FROM settings WHERE key='donations_total'"
                 ) or 0,
-                'groups_registered': await c.fetchval('SELECT COUNT(*) FROM groups_seen') or 0,
+                'groups_registered': await c.fetchval("SELECT COUNT(*) FROM groups_seen WHERE COALESCE(bot_status, 'member') NOT IN ('left', 'kicked')") or 0,
             }
 
 
@@ -996,7 +1018,14 @@ class Database:
                        ON CONFLICT(chat_id,user_id,day) DO UPDATE SET msg_count=group_user_msgs.msg_count+1""",
                     int(chat_id), int(user_id), day,
                 )
-            # Hourly bucket (Tehran wall-clock hour) for dashboard chart
+                await c.execute(
+                    """INSERT INTO group_user_hourly(chat_id,user_id,hour_start,msg_count)
+                       VALUES($1,$2,date_trunc('hour', NOW()),1)
+                       ON CONFLICT(chat_id,user_id,hour_start)
+                       DO UPDATE SET msg_count=group_user_hourly.msg_count+1""",
+                    int(chat_id), int(user_id),
+                )
+            # Hourly bucket for dashboard chart + media (true rolling window)
             await c.execute(
                 f"""INSERT INTO group_hourly_stats(chat_id, hour_start, msg_count, {col})
                     VALUES($1, date_trunc('hour', NOW()), 1, 1)
@@ -1140,9 +1169,10 @@ class Database:
         }
 
     async def group_stats_dashboard(self, chat_id: int) -> dict:
-        """Rich stats for image dashboard: 24h + 7d trend + media + top users.
+        """True rolling 24-hour stats from hourly tables (Tehran-aware display).
 
-        All numbers come from recorded aggregates only — never fabricated.
+        Aggregates come from group_hourly_stats + group_user_hourly for the last
+        24 hours only — not calendar-day approximations.
         """
         from datetime import datetime, date, timedelta
         try:
@@ -1152,44 +1182,63 @@ class Database:
             today = date.today()
         chat_id = int(chat_id)
         days7 = [today - timedelta(days=i) for i in range(7)]
-        days2 = days7[:2]
         days30 = [today - timedelta(days=i) for i in range(30)]
         async with self._pool().acquire() as c:
-            # Daily rows for 7 days
-            rows7 = await c.fetch(
-                'SELECT * FROM group_stats_daily WHERE chat_id=$1 AND day = ANY($2::date[])',
-                chat_id, days7,
+            # Ensure hourly user table exists (idempotent)
+            await c.execute(
+                """CREATE TABLE IF NOT EXISTS group_user_hourly (
+                     chat_id BIGINT NOT NULL,
+                     user_id BIGINT NOT NULL,
+                     hour_start TIMESTAMPTZ NOT NULL,
+                     msg_count INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (chat_id, user_id, hour_start)
+                   )"""
             )
-            by_day = {r['day']: dict(r) for r in rows7}
-            daily_series = []
-            for d in reversed(days7):  # oldest → newest for chart
-                r = by_day.get(d) or {}
-                media = sum(int(r.get(k) or 0) for k in (
-                    'text_count','photo_count','video_count','voice_count','audio_count',
-                    'animation_count','sticker_count','document_count',
-                ))
-                # Prefer user msg sum for that day
-                um = await c.fetchval(
-                    'SELECT COALESCE(SUM(msg_count),0) FROM group_user_msgs WHERE chat_id=$1 AND day=$2',
-                    chat_id, d,
-                )
-                daily_series.append({
-                    'day': d.isoformat(),
-                    'label': d.strftime('%m/%d'),
-                    'count': int(um or media or 0),
-                })
+            await c.execute(
+                """CREATE INDEX IF NOT EXISTS group_user_hourly_window_idx
+                   ON group_user_hourly (chat_id, hour_start DESC)"""
+            )
 
+            # ── True last 24 hours from hourly aggregates ──
+            row = await c.fetchrow(
+                """SELECT
+                     COALESCE(SUM(msg_count),0)::int AS total_msgs,
+                     COALESCE(SUM(text_count),0)::int AS text_count,
+                     COALESCE(SUM(photo_count),0)::int AS photo_count,
+                     COALESCE(SUM(video_count),0)::int AS video_count,
+                     COALESCE(SUM(voice_count),0)::int AS voice_count,
+                     COALESCE(SUM(audio_count),0)::int AS audio_count,
+                     COALESCE(SUM(animation_count),0)::int AS animation_count,
+                     COALESCE(SUM(sticker_count),0)::int AS sticker_count,
+                     COALESCE(SUM(document_count),0)::int AS document_count
+                   FROM group_hourly_stats
+                   WHERE chat_id=$1 AND hour_start >= (NOW() - INTERVAL '24 hours')""",
+                chat_id,
+            )
             totals = {
-                'joined': 0, 'left_count': 0, 'text_count': 0, 'photo_count': 0, 'video_count': 0,
-                'voice_count': 0, 'audio_count': 0, 'animation_count': 0, 'sticker_count': 0,
-                'document_count': 0, 'deleted_by_bot': 0,
+                'joined': 0, 'left_count': 0,
+                'text_count': int(row['text_count'] or 0) if row else 0,
+                'photo_count': int(row['photo_count'] or 0) if row else 0,
+                'video_count': int(row['video_count'] or 0) if row else 0,
+                'voice_count': int(row['voice_count'] or 0) if row else 0,
+                'audio_count': int(row['audio_count'] or 0) if row else 0,
+                'animation_count': int(row['animation_count'] or 0) if row else 0,
+                'sticker_count': int(row['sticker_count'] or 0) if row else 0,
+                'document_count': int(row['document_count'] or 0) if row else 0,
+                'deleted_by_bot': 0,
             }
-            for d in days2:
-                r = by_day.get(d) or {}
-                for k in totals:
-                    totals[k] += int(r.get(k) or 0)
+            total_msgs_24 = int(row['total_msgs'] or 0) if row else 0
 
-            # Hourly last 24h
+            # joins/leaves still day-granular (event-based); take last 2 Tehran days as cover
+            days2 = [today - timedelta(days=i) for i in range(2)]
+            jrows = await c.fetch(
+                'SELECT joined, left_count FROM group_stats_daily WHERE chat_id=$1 AND day = ANY($2::date[])',
+                chat_id, days2,
+            )
+            for jr in jrows:
+                totals['joined'] += int(jr['joined'] or 0)
+                totals['left_count'] += int(jr['left_count'] or 0)
+
             hourly = await c.fetch(
                 """SELECT hour_start, msg_count FROM group_hourly_stats
                    WHERE chat_id=$1 AND hour_start >= (NOW() - INTERVAL '24 hours')
@@ -1202,29 +1251,55 @@ class Database:
                 hours.append({
                     'hour': hs.hour if hasattr(hs, 'hour') else 0,
                     'count': int(h['msg_count'] or 0),
+                    'ts': hs,
                 })
 
+            # Top users — true 24h from group_user_hourly; fallback to 2-day msgs
             top = await c.fetch(
                 """SELECT m.user_id, SUM(m.msg_count)::int AS msg_count,
                           MAX(u.first_name) AS first_name, MAX(u.username) AS username
-                   FROM group_user_msgs m
+                   FROM group_user_hourly m
                    LEFT JOIN users u ON u.user_id = m.user_id
-                   WHERE m.chat_id=$1 AND m.day = ANY($2::date[])
+                   WHERE m.chat_id=$1 AND m.hour_start >= (NOW() - INTERVAL '24 hours')
                    GROUP BY m.user_id
                    ORDER BY msg_count DESC
                    LIMIT 5""",
-                chat_id, days2,
+                chat_id,
             )
+            if not top:
+                top = await c.fetch(
+                    """SELECT m.user_id, SUM(m.msg_count)::int AS msg_count,
+                              MAX(u.first_name) AS first_name, MAX(u.username) AS username
+                       FROM group_user_msgs m
+                       LEFT JOIN users u ON u.user_id = m.user_id
+                       WHERE m.chat_id=$1 AND m.day = ANY($2::date[])
+                       GROUP BY m.user_id
+                       ORDER BY msg_count DESC
+                       LIMIT 5""",
+                    chat_id, days2,
+                )
+
             active_users = await c.fetchval(
-                """SELECT COUNT(DISTINCT user_id) FROM group_user_msgs
-                   WHERE chat_id=$1 AND day = ANY($2::date[])""",
-                chat_id, days2,
+                """SELECT COUNT(DISTINCT user_id) FROM group_user_hourly
+                   WHERE chat_id=$1 AND hour_start >= (NOW() - INTERVAL '24 hours')""",
+                chat_id,
             )
-            total_msgs_24 = await c.fetchval(
-                """SELECT COALESCE(SUM(msg_count),0) FROM group_user_msgs
-                   WHERE chat_id=$1 AND day = ANY($2::date[])""",
-                chat_id, days2,
-            )
+            if not active_users:
+                active_users = await c.fetchval(
+                    """SELECT COUNT(DISTINCT user_id) FROM group_user_msgs
+                       WHERE chat_id=$1 AND day = ANY($2::date[])""",
+                    chat_id, days2,
+                )
+
+            # 7-day series for optional charts
+            daily_series = []
+            for d in reversed(days7):
+                um = await c.fetchval(
+                    'SELECT COALESCE(SUM(msg_count),0) FROM group_user_msgs WHERE chat_id=$1 AND day=$2',
+                    chat_id, d,
+                )
+                daily_series.append({'day': d.isoformat(), 'label': d.strftime('%m/%d'), 'count': int(um or 0)})
+
             total_msgs_7 = await c.fetchval(
                 """SELECT COALESCE(SUM(msg_count),0) FROM group_user_msgs
                    WHERE chat_id=$1 AND day = ANY($2::date[])""",
@@ -1240,14 +1315,9 @@ class Database:
                 chat_id,
             )
             tracking_start = await c.fetchval(
-                'SELECT MIN(day) FROM group_stats_daily WHERE chat_id=$1',
+                'SELECT MIN(hour_start) FROM group_hourly_stats WHERE chat_id=$1',
                 chat_id,
             )
-            if tracking_start is None:
-                tracking_start = await c.fetchval(
-                    'SELECT MIN(day) FROM group_user_msgs WHERE chat_id=$1',
-                    chat_id,
-                )
 
         top_users = [dict(r) for r in top]
         for u in top_users:
@@ -1264,9 +1334,10 @@ class Database:
             'total_msgs_7': int(total_msgs_7 or 0),
             'total_msgs_30': int(total_msgs_30 or 0),
             'warn_total': int(warn_total or 0),
-            'tracking_start': tracking_start.isoformat() if tracking_start else None,
+            'tracking_start': tracking_start.isoformat() if hasattr(tracking_start, 'isoformat') and tracking_start else (str(tracking_start) if tracking_start else None),
             'window': '24h',
         }
+
 
 
     async def add_warn(self, chat_id: int, user_id: int, reason: str = '', message_id: int | None = None) -> int:
@@ -1622,13 +1693,13 @@ class Database:
     async def activity_stats(self) -> dict:
         """Real activity windows from usage_events + groups_seen/users."""
         async with self._pool().acquire() as c:
-            groups_total = await c.fetchval('SELECT COUNT(*) FROM groups_seen') or 0
+            groups_total = await c.fetchval("SELECT COUNT(*) FROM groups_seen WHERE COALESCE(bot_status, 'member') NOT IN ('left', 'kicked')") or 0
             users_total = await c.fetchval('SELECT COUNT(*) FROM users') or 0
             groups_24h = await c.fetchval(
-                "SELECT COUNT(*) FROM groups_seen WHERE last_seen >= NOW() - INTERVAL '24 hours'"
+                "SELECT COUNT(*) FROM groups_seen WHERE COALESCE(bot_status,'member') NOT IN ('left','kicked') AND last_seen >= NOW() - INTERVAL '24 hours'"
             ) or 0
             groups_7d = await c.fetchval(
-                "SELECT COUNT(*) FROM groups_seen WHERE last_seen >= NOW() - INTERVAL '7 days'"
+                "SELECT COUNT(*) FROM groups_seen WHERE COALESCE(bot_status,'member') NOT IN ('left','kicked') AND last_seen >= NOW() - INTERVAL '7 days'"
             ) or 0
             users_24h = await c.fetchval(
                 "SELECT COUNT(DISTINCT user_id) FROM usage_events WHERE user_id IS NOT NULL AND created_at >= NOW() - INTERVAL '24 hours'"
@@ -1955,15 +2026,22 @@ class Database:
 
     # ── Owner panel: known groups & users ───────────────────────────────
     async def count_known_groups(self) -> int:
+        """Groups where the bot is currently a member (not left/kicked)."""
         async with self._pool().acquire() as c:
-            return int(await c.fetchval('SELECT COUNT(*) FROM groups_seen') or 0)
+            return int(await c.fetchval(
+                """SELECT COUNT(*) FROM groups_seen WHERE COALESCE(bot_status, 'member') NOT IN ('left', 'kicked')
+                   WHERE COALESCE(bot_status, 'member') NOT IN ('left', 'kicked')"""
+            ) or 0)
 
     async def list_known_groups(self, limit: int = 5, offset: int = 0) -> list[dict]:
+        """List groups the bot is still in (exclude left/kicked)."""
         async with self._pool().acquire() as c:
             rows = await c.fetch(
-                'SELECT chat_id, title, username, first_seen, last_seen, messages_count '
-                'FROM groups_seen ORDER BY last_seen DESC NULLS LAST, chat_id '
-                'LIMIT $1 OFFSET $2',
+                """SELECT chat_id, title, username, first_seen, last_seen, messages_count, bot_status
+                   FROM groups_seen
+                   WHERE COALESCE(bot_status, 'member') NOT IN ('left', 'kicked')
+                   ORDER BY last_seen DESC NULLS LAST, chat_id
+                   LIMIT $1 OFFSET $2""",
                 int(limit), int(offset),
             )
         return [dict(r) for r in rows]

@@ -483,6 +483,38 @@ class MegaBot:
                 backoff = min(backoff * 2, 60.0)
 
 
+
+    async def _discard_pending_updates(self) -> None:
+        """Advance offset past all currently queued updates without handling them.
+
+        Called once at startup so the bot only answers messages that arrive
+        *after* this process is up. Safe if the queue is already empty.
+        """
+        offset: int | None = self.offset
+        discarded = 0
+        for _ in range(40):
+            try:
+                batch = await asyncio.wait_for(
+                    self.api.get_updates(offset, timeout=0),
+                    timeout=12.0,
+                )
+            except Exception as exc:
+                log.warning('drain getUpdates: %s', type(exc).__name__)
+                break
+            if not batch:
+                break
+            max_id = max(int(u.get('update_id') or 0) for u in batch)
+            offset = max_id + 1
+            discarded += len(batch)
+            if len(batch) < 50:
+                # likely last page; do one more empty poll below
+                pass
+        self.offset = offset
+        if discarded:
+            log.info('startup: discarded %s pending update(s); offset=%s', discarded, offset)
+        else:
+            log.info('startup: no pending updates (offset=%s)', offset)
+
     async def _startup_checks(self) -> None:
         """Best-effort startup probes — never block polling for long.
 
@@ -494,7 +526,7 @@ class MegaBot:
         # Single attempt each, short overall budget.
         try:
             await asyncio.wait_for(
-                self.api.call('deleteWebhook', {'drop_pending_updates': False}, retries=0),
+                self.api.call('deleteWebhook', {'drop_pending_updates': True}, retries=0),
                 timeout=8.0,
             )
             log.info('deleteWebhook ok')
@@ -516,6 +548,12 @@ class MegaBot:
                 'Railway cannot reach tapi.bale.ai (use Iran VPS or a proxy).',
                 type(exc).__name__,
             )
+        # Drop any backlog left in the getUpdates queue so restart does not
+        # flood-reply to messages received while the bot was offline.
+        try:
+            await self._discard_pending_updates()
+        except Exception as exc:
+            log.warning('discard pending updates failed: %s', type(exc).__name__)
 
 
     async def _handle_update_safe(self, update: dict) -> None:
@@ -745,7 +783,7 @@ class MegaBot:
 
         if self._is_group_chat(chat):
             try:
-                await asyncio.wait_for(self.db.upsert_group(chat), timeout=2.0)
+                await asyncio.wait_for(self.db.upsert_group(chat, bot_status='member'), timeout=2.0)
             except Exception:
                 log.warning('upsert_group skipped for %s', chat_id)
         try:
@@ -1946,7 +1984,7 @@ class MegaBot:
                 for k in [k for k in list(self._admin_cache.keys()) if k[0] == chat_id]:
                     self._admin_cache.pop(k, None)
                 try:
-                    await asyncio.wait_for(self.db.upsert_group(chat), timeout=3.0)
+                    await asyncio.wait_for(self.db.upsert_group(chat, bot_status=status), timeout=3.0)
                 except Exception:
                     log.warning('upsert_group on my_chat_member skipped for %s', chat_id)
         except Exception:

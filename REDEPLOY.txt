@@ -1,1 +1,1 @@
-2026-10-28 anti-abuse security upgrade
+2026-10-29 drop pending updates + active groups only

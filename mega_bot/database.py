@@ -313,6 +313,20 @@ CREATE TABLE IF NOT EXISTS joke_usage (
   times_used INTEGER NOT NULL DEFAULT 0,
   last_used_at TIMESTAMPTZ
 );
+
+CREATE TABLE IF NOT EXISTS group_auto_messages (
+  id BIGSERIAL PRIMARY KEY,
+  chat_id BIGINT NOT NULL,
+  body TEXT NOT NULL,
+  interval_seconds INTEGER NOT NULL CHECK (interval_seconds >= 60),
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  last_sent_at TIMESTAMPTZ,
+  created_by BIGINT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS group_auto_messages_chat_idx
+  ON group_auto_messages (chat_id, enabled);
+
 """
 
 class Database:
@@ -336,6 +350,17 @@ class Database:
             await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS goodbye_enabled BOOLEAN NOT NULL DEFAULT TRUE")
             await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS goodbye_text TEXT")
             await conn.execute("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS goodbye_varied BOOLEAN NOT NULL DEFAULT TRUE")
+            await conn.execute('''CREATE TABLE IF NOT EXISTS group_auto_messages (
+  id BIGSERIAL PRIMARY KEY,
+  chat_id BIGINT NOT NULL,
+  body TEXT NOT NULL,
+  interval_seconds INTEGER NOT NULL CHECK (interval_seconds >= 60),
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  last_sent_at TIMESTAMPTZ,
+  created_by BIGINT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)''')
+            await conn.execute('CREATE INDEX IF NOT EXISTS group_auto_messages_chat_idx ON group_auto_messages (chat_id, enabled)')
             await conn.execute("ALTER TABLE groups_seen ADD COLUMN IF NOT EXISTS bot_status TEXT NOT NULL DEFAULT 'member'")
             await conn.execute("INSERT INTO settings(key,value) VALUES('about', to_jsonb($1::text)) ON CONFLICT(key) DO NOTHING", "MEGA BOT یک ربات اجتماعی برای بله است.")
             await conn.execute("INSERT INTO settings(key,value) VALUES('donations_total', '0'::jsonb) ON CONFLICT(key) DO NOTHING")
@@ -2160,3 +2185,77 @@ class Database:
                 int(user_id), set_name,
             )
         return r != 'DELETE 0'
+
+    # ── Group auto-repeat messages ──────────────────────────────────────
+    async def add_auto_message(self, chat_id: int, body: str, interval_seconds: int, created_by: int | None) -> int:
+        interval_seconds = max(60, int(interval_seconds))
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow(
+                """INSERT INTO group_auto_messages(chat_id, body, interval_seconds, created_by)
+                   VALUES($1,$2,$3,$4) RETURNING id""",
+                int(chat_id), body, interval_seconds, created_by,
+            )
+        return int(row['id'])
+
+    async def list_auto_messages(self, chat_id: int) -> list[dict]:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                """SELECT id, chat_id, body, interval_seconds, enabled, last_sent_at, created_by, created_at
+                   FROM group_auto_messages WHERE chat_id=$1 ORDER BY id""",
+                int(chat_id),
+            )
+        return [dict(r) for r in rows]
+
+    async def delete_auto_message(self, chat_id: int, auto_id: int) -> bool:
+        async with self._pool().acquire() as c:
+            tag = await c.execute(
+                'DELETE FROM group_auto_messages WHERE id=$1 AND chat_id=$2',
+                int(auto_id), int(chat_id),
+            )
+        return bool(tag and tag != 'DELETE 0')
+
+    async def clear_auto_messages(self, chat_id: int) -> int:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                'DELETE FROM group_auto_messages WHERE chat_id=$1 RETURNING id',
+                int(chat_id),
+            )
+        return len(rows)
+
+    async def list_due_auto_messages(self) -> list[dict]:
+        """Enabled jobs that are due to send (or never sent)."""
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                """SELECT id, chat_id, body, interval_seconds, last_sent_at
+                   FROM group_auto_messages
+                   WHERE enabled=TRUE
+                     AND (
+                       last_sent_at IS NULL
+                       OR last_sent_at + (interval_seconds || ' seconds')::interval <= NOW()
+                     )
+                   ORDER BY id
+                   LIMIT 50"""
+            )
+        return [dict(r) for r in rows]
+
+    async def touch_auto_message(self, auto_id: int) -> None:
+        async with self._pool().acquire() as c:
+            await c.execute(
+                'UPDATE group_auto_messages SET last_sent_at=NOW() WHERE id=$1',
+                int(auto_id),
+            )
+
+    async def channel_chat_ids(self) -> list[int]:
+        """Best-effort: chats known as channels (negative ids often channels/groups on Bale).
+        We store all non-private chats in groups_seen; filter by active membership."""
+        async with self._pool().acquire() as c:
+            try:
+                rows = await c.fetch(
+                    """SELECT chat_id FROM groups_seen
+                       WHERE COALESCE(bot_status, 'member') NOT IN ('left', 'kicked')
+                       ORDER BY chat_id"""
+                )
+            except Exception:
+                rows = await c.fetch('SELECT chat_id FROM groups_seen ORDER BY chat_id')
+        return [int(r['chat_id']) for r in rows]
+

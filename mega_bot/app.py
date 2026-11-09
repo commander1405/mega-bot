@@ -453,6 +453,10 @@ class MegaBot:
             self._sched_task = asyncio.create_task(self._schedule_lock_loop(), name='group-lock-sched')
             self._bg_tasks.add(self._sched_task)
             self._sched_task.add_done_callback(self._bg_tasks.discard)
+        if not getattr(self, '_auto_msg_task', None) or self._auto_msg_task.done():
+            self._auto_msg_task = asyncio.create_task(self._auto_message_loop(), name='group-auto-msg')
+            self._bg_tasks.add(self._auto_msg_task)
+            self._auto_msg_task.add_done_callback(self._bg_tasks.discard)
         log.info('MEGA BOT polling started (target host tapi.bale.ai) version=%s decorative_media=OFF', BOT_VERSION)
         backoff = 1.0
         while True:
@@ -1125,6 +1129,17 @@ class MegaBot:
         if is_group and text.strip() == 'تگ':
             await self._cmd_tag_start(chat_id, uid, msg)
             return
+
+        
+        # Auto-repeat / automation (group admins + owner)
+        if is_group and re.match(r'^(ریپیت|تکرار|اتو|اتوماسیون|لیست ریپیت|لیست تکرار|لیست اتو|لیست اتوماسیون|توقف ریپیت|توقف تکرار|توقف اتو|توقف اتوماسیون|حذف ریپیت|حذف اتو|حذف تکرار)', text):
+            try:
+                if await self._handle_auto_message_command(chat_id, uid, text, msg):
+                    return
+            except Exception:
+                log.exception('auto message command failed')
+                await self.safe_send(chat_id, '❌ ثبت اتوماسیون ناموفق بود.', reply_to=msg.get('message_id'))
+                return
 
         if is_group and text in ('قفل', 'قفل ها', 'قفل‌ها', 'ضد اسپم', 'ضداسپم', 'پنل قفل'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
@@ -2902,7 +2917,18 @@ class MegaBot:
          '• ⏰ قفل زمان‌بندی‌شده گروه (ساعت شروع/پایان و روزها)\n'
          'هر گروه مستقل است. ربات باید حذف پیام و محدودسازی عضو داشته باشد.\n'
          'دسترسی: فقط ادمین گروه / مالک'),
-                ('📢 تگ گروه',
+                ('⏰ ریپیت / اتوماسیون (گروه)',
+         'دستورات: `ریپیت` / `تکرار` / `اتو` / `اتوماسیون`\n'
+         'مثال:\n'
+         '• `ریپیت سلام به همه ۵د` — هر ۵ دقیقه\n'
+         '• `اتو متن اطلاعیه ۳س` — هر ۳ ساعت\n'
+         'واحدها: `د`=دقیقه، `س`=ساعت، `ث`=ثانیه (حداقل ۱ دقیقه)\n'
+         '• `لیست ریپیت` — مشاهده\n'
+         '• `حذف ریپیت ۱۲` — حذف یک مورد\n'
+         '• `توقف ریپیت` — حذف همه\n'
+         'پیام‌ها دائمی‌اند و خودکار پاک نمی‌شوند.\n'
+         'دسترسی: ادمین همان گروه یا مالک ربات'),
+        ('📢 تگ گروه',
          'دستور: `تگ` (فقط در گروه)\n'
          '• تأیید با دکمه، سپس یکی از:\n'
          '  👥 تگ افراد فعال در ۲۴ ساعت گذشته\n'
@@ -3179,58 +3205,106 @@ class MegaBot:
         await self.safe_edit(
             chat_id,
             message_id,
-            f'✅ حمایت `#{donation_id}` تأیید شد ({amount:,} تومان).\n⏳ در حال ارسال اعلام به کاربران…',
+            f'✅ حمایت `#{donation_id}` تأیید شد ({amount:,} تومان).\n'
+            f'⏳ همگانی در پس‌زمینه به پیوی، گروه‌ها و کانال‌ها ارسال می‌شود…',
             None,
         )
+        # Fire-and-forget so callback does not timeout / appear stuck
+        asyncio.create_task(
+            self._broadcast_donation_announcement(donation_id, donation, chat_id, message_id, amount),
+            name=f'donation-bc-{donation_id}',
+        )
 
+    async def _broadcast_donation_announcement(
+        self,
+        donation_id: int,
+        donation: dict,
+        owner_chat_id: int,
+        owner_message_id: int,
+        amount: int,
+    ) -> None:
+        """Send approved donation notice to PVs, groups, and announce channel."""
         announcement = self.build_donation_announcement(donation)
         keyboard = self.donation_broadcast_keyboard()
         sent = failed = 0
         channel_ok = False
-        # Public post to studio channel (not private DMs)
         channel_target = self._donation_announce_channel()
-        try:
-            await self.api.send_message(
-                channel_target,
-                announcement,
-                reply_markup=keyboard,
-                parse_mode='Markdown',
-            )
-            channel_ok = True
-            log.info('donation #%s announced to channel %s', donation_id, channel_target)
-        except Exception as exc:
-            log.warning(
-                'donation channel announce failed target=%s: %s',
-                channel_target, self._short(exc),
-            )
-            # retry without keyboard / parse_mode
-            try:
-                await self.api.send_message(channel_target, announcement, parse_mode=None)
-                channel_ok = True
-            except Exception as exc2:
-                log.warning('donation channel announce retry failed: %s', self._short(exc2))
 
-        try:
-            targets = await self.db.private_user_ids()
-        except Exception:
-            log.exception('private_user_ids failed')
-            targets = []
-
-        for target_id in targets:
+        async def _one(target, *, is_channel: bool = False) -> bool:
+            nonlocal sent, failed
             try:
-                await self.api.send_message(
-                    target_id,
+                await self.safe_send(
+                    target,
                     announcement,
-                    reply_markup=keyboard,
+                    keyboard=keyboard,
                     parse_mode='Markdown',
+                    permanent=True,
+                    skip_ad=True,
                 )
                 sent += 1
+                return True
             except Exception as exc:
-                failed += 1
-                log.debug('Donation announcement DM failed for %s: %s', target_id, type(exc).__name__)
-            # light yield only; no long cooldown
-            if (sent + failed) % 30 == 0:
+                # retry plain text
+                try:
+                    await self.safe_send(
+                        target,
+                        announcement,
+                        parse_mode=None,
+                        permanent=True,
+                        skip_ad=True,
+                    )
+                    sent += 1
+                    return True
+                except Exception as exc2:
+                    failed += 1
+                    log.debug(
+                        'donation bc fail target=%s channel=%s: %s/%s',
+                        target, is_channel, type(exc).__name__, type(exc2).__name__,
+                    )
+                    return False
+
+        # 1) Dedicated announce channel first
+        try:
+            ok = await _one(channel_target, is_channel=True)
+            channel_ok = ok
+            if ok:
+                log.info('donation #%s announced to channel %s', donation_id, channel_target)
+        except Exception as exc:
+            log.warning('donation channel announce failed: %s', type(exc).__name__)
+
+        # 2) Private users
+        try:
+            pv_targets = await self.db.private_user_ids()
+        except Exception:
+            log.exception('private_user_ids failed')
+            pv_targets = []
+        for target_id in pv_targets:
+            await _one(int(target_id))
+            if (sent + failed) % 25 == 0:
                 await asyncio.sleep(0.05)
+
+        # 3) Groups / known chats (including channels the bot is in)
+        try:
+            group_targets = await self.db.channel_chat_ids()
+        except Exception:
+            try:
+                group_targets = await self.db.group_chat_ids()
+            except Exception:
+                log.exception('group/channel ids failed')
+                group_targets = []
+        # Avoid double-send to same id / numeric form of announce channel
+        seen = set(int(x) for x in pv_targets if str(x).lstrip('-').isdigit())
+        for gid in group_targets:
+            try:
+                gi = int(gid)
+            except Exception:
+                continue
+            if gi in seen:
+                continue
+            seen.add(gi)
+            await _one(gi)
+            if (sent + failed) % 20 == 0:
+                await asyncio.sleep(0.08)
 
         try:
             await self.db.set_donation_broadcast_counts(donation_id, sent, failed)
@@ -3238,24 +3312,29 @@ class MegaBot:
         except Exception:
             log.exception('set_donation_broadcast_counts failed')
 
-        await self.safe_edit(
-            chat_id,
-            message_id,
+        summary = (
             f'✅ حمایت `#{donation_id}` تأیید شد.\n'
             f'مبلغ {amount:,} تومان به آمار اضافه شد.\n'
-            f'ارسال خصوصی: {sent} موفق، {failed} ناموفق.\n'
-            f'کانال همگانی ({channel_target}): {"✅ ارسال شد" if channel_ok else "❌ ناموفق — ربات باید در کانال ادمین باشد"}.',
-            None,
+            f'ارسال همگانی: {sent} موفق، {failed} ناموفق.\n'
+            f'کانال ({channel_target}): {"✅" if channel_ok else "❌ ربات باید در کانال عضو/ادمین باشد"}.'
         )
-        # Always notify the donor on successful approval.
+        try:
+            await self.safe_edit(owner_chat_id, owner_message_id, summary, None)
+        except Exception:
+            try:
+                await self.safe_send(owner_chat_id, summary, permanent=True)
+            except Exception:
+                pass
         try:
             await self.safe_send(
                 int(donation['user_id']),
                 '💚 حمایت مالی‌ات تأیید شد و مبلغ به آمار ربات اضافه شد! از همراهی‌ت ممنونیم 🌱😊',
                 USER_KEYBOARD,
+                permanent=True,
             )
         except Exception as exc:
             log.debug('Donor success notice failed for %s: %s', donation.get('user_id'), type(exc).__name__)
+
 
     def stats_text(self, s: dict) -> str:
         users = s.get('users', 0)

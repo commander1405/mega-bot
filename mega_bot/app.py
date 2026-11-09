@@ -1132,13 +1132,31 @@ class MegaBot:
 
         
         # Auto-repeat / automation (group admins + owner)
-        if is_group and re.match(r'^(ریپیت|تکرار|اتو|اتوماسیون|لیست ریپیت|لیست تکرار|لیست اتو|لیست اتوماسیون|توقف ریپیت|توقف تکرار|توقف اتو|توقف اتوماسیون|حذف ریپیت|حذف اتو|حذف تکرار)', text):
+        _auto_txt = (text or '').replace('\u200c', '').replace('\u200f', '').replace('\u200e', '').strip()
+        if is_group and re.match(
+            r'^(ریپیت|تکرار|اتو|اتوماسیون|لیست\s*ریپیت|لیست\s*تکرار|لیست\s*اتو|لیست\s*اتوماسیون|توقف\s*ریپیت|توقف\s*تکرار|توقف\s*اتو|توقف\s*اتوماسیون|حذف\s*ریپیت|حذف\s*اتو|حذف\s*تکرار)',
+            _auto_txt,
+        ):
             try:
-                if await self._handle_auto_message_command(chat_id, uid, text, msg):
+                handled = await self._handle_auto_message_command(chat_id, uid, _auto_txt, msg)
+                if handled:
                     return
+                await self.safe_send(
+                    chat_id,
+                    '❓ دستور ریپیت فهمیده نشد. بنویس: `ریپیت` برای لیست یا `ریپیت متن ۵د` برای ثبت.',
+                    reply_to=msg.get('message_id'), permanent=True,
+                )
+                return
             except Exception:
-                log.exception('auto message command failed')
-                await self.safe_send(chat_id, '❌ ثبت اتوماسیون ناموفق بود.', reply_to=msg.get('message_id'))
+                log.exception('auto message command failed chat=%s', chat_id)
+                try:
+                    await self.safe_send(
+                        chat_id,
+                        '❌ خطای داخلی اتوماسیون. لاگ سرور را ببین یا دوباره تلاش کن.',
+                        reply_to=msg.get('message_id'), permanent=True,
+                    )
+                except Exception:
+                    pass
                 return
 
         if is_group and text in ('قفل', 'قفل ها', 'قفل‌ها', 'ضد اسپم', 'ضداسپم', 'پنل قفل'):
@@ -1638,6 +1656,9 @@ class MegaBot:
             return
         if data.startswith('one:'):
             await self.handle_one_callback(query, data)
+            return
+        if data.startswith('auto:'):
+            await self._handle_auto_callback(uid, chat_id, message_id, data)
             return
         if data.startswith('donate:'):
             await self.handle_donation_callback(uid, chat_id, message_id, data, user)
@@ -6883,6 +6904,280 @@ class MegaBot:
         except Exception as exc:
             log.warning('setChatPermissions failed chat=%s reason=%s: %s', chat_id, reason, type(exc).__name__)
             # Enforcement continues via message deletion path
+
+
+    # ── Group auto-repeat (ریپیت / اتو / اتوماسیون) ───────────────────────
+    @staticmethod
+    def _fa_digits_to_int(s: str) -> int:
+        trans = str.maketrans('۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩', '01234567890123456789')
+        return int((s or '0').translate(trans).strip() or '0')
+
+    def _parse_auto_interval(self, num_s: str, unit: str | None) -> int | None:
+        try:
+            n = self._fa_digits_to_int(num_s)
+        except Exception:
+            return None
+        if n <= 0:
+            return None
+        u = (unit or 'د').strip()
+        if u in ('ث', 'ثانیه'):
+            sec = n
+        elif u in ('د', 'دقیقه'):
+            sec = n * 60
+        elif u in ('س', 'ساعت'):
+            sec = n * 3600
+        else:
+            sec = n * 60
+        return max(60, int(sec))
+
+    def _format_interval(self, seconds: int) -> str:
+        seconds = int(seconds or 0)
+        if seconds >= 3600 and seconds % 3600 == 0:
+            return f'{seconds // 3600} ساعت'
+        if seconds >= 60 and seconds % 60 == 0:
+            return f'{seconds // 60} دقیقه'
+        return f'{seconds} ثانیه'
+
+    async def _auto_message_loop(self) -> None:
+        await asyncio.sleep(8)
+        while True:
+            try:
+                due = await self.db.list_due_auto_messages()
+            except Exception:
+                log.exception('list_due_auto_messages failed')
+                due = []
+            for job in due or []:
+                try:
+                    chat_id = int(job['chat_id'])
+                    body = (job.get('body') or '').strip()
+                    if not body:
+                        continue
+                    await self.safe_send(
+                        chat_id, body, parse_mode=None, permanent=True, skip_ad=True,
+                    )
+                    await self.db.touch_auto_message(int(job['id']))
+                    log.info('auto-msg sent id=%s chat=%s', job['id'], chat_id)
+                except Exception as exc:
+                    log.warning(
+                        'auto-msg fail id=%s chat=%s: %s',
+                        job.get('id'), job.get('chat_id'), type(exc).__name__,
+                    )
+                    try:
+                        await self.db.touch_auto_message(int(job['id']))
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.35)
+            await asyncio.sleep(20)
+
+    async def _show_auto_list_buttons(self, chat_id: int, uid: int, reply_to: int | None = None, edit_mid: int | None = None) -> None:
+        rows = await self.db.list_auto_messages(chat_id)
+        if not rows:
+            text = (
+                'ℹ️ هیچ اتوماسیون روشنی برای این گروه نیست.\n\n'
+                'ثبت جدید:\n`ریپیت متن پیام ۵د`\n`اتو سلام ۳س`\n'
+                '• د=دقیقه  • س=ساعت  • حداقل ۱ دقیقه'
+            )
+            kb = None
+        else:
+            text = (
+                f'📋 *اتوماسیون‌های فعال این گروه* ({len(rows)})\n'
+                'روی هر دکمه بزن تا همان مورد *حذف* شود.'
+            )
+            kb_rows = []
+            for r in rows:
+                prev = (r.get('body') or '').replace('\n', ' ').strip()[:28]
+                if len((r.get('body') or '')) > 28:
+                    prev += '…'
+                label = f"🗑 #{r['id']} | {self._format_interval(int(r['interval_seconds']))} | {prev}"
+                kb_rows.append([(label, f"auto:del:{int(r['id'])}:{int(chat_id)}")])
+            kb_rows.append([('🛑 توقف همه', f'auto:clear:{int(chat_id)}'), ('✖️ بستن', 'close')])
+            kb = inline(kb_rows)
+        if edit_mid:
+            await self.safe_edit(chat_id, edit_mid, text, kb)
+        else:
+            await self.safe_send(chat_id, text, keyboard=kb, reply_to=reply_to, permanent=True)
+
+    async def _handle_auto_message_command(self, chat_id: int, uid: int, text: str, msg: dict) -> bool:
+        """Always returns True once matched so the user always gets feedback."""
+        raw = (text or '').strip()
+        if not raw:
+            return False
+
+        # Normalize Arabic/Persian yeh/kaf variants lightly
+        norm = raw.replace('ي', 'ی').replace('ك', 'ک')
+
+        is_mod = (uid == OWNER_ID) or await self._has_group_mod_power(chat_id, uid)
+
+        # Bare command → show list as delete buttons
+        if norm in ('ریپیت', 'تکرار', 'اتو', 'اتوماسیون',
+                    'لیست ریپیت', 'لیست تکرار', 'لیست اتو', 'لیست اتوماسیون'):
+            if not is_mod:
+                await self.safe_send(
+                    chat_id, '⛔ فقط *ادمین گروه* یا *مالک ربات* به اتوماسیون دسترسی دارد.',
+                    reply_to=msg.get('message_id'), permanent=True,
+                )
+                return True
+            await self._show_auto_list_buttons(chat_id, uid, reply_to=msg.get('message_id'))
+            return True
+
+        if norm in ('توقف ریپیت', 'توقف تکرار', 'توقف اتو', 'توقف اتوماسیون',
+                    'حذف همه ریپیت', 'حذف همه اتو'):
+            if not is_mod:
+                await self.safe_send(chat_id, '⛔ فقط ادمین گروه یا مالک ربات.', reply_to=msg.get('message_id'), permanent=True)
+                return True
+            n = await self.db.clear_auto_messages(chat_id)
+            await self.safe_send(
+                chat_id, f'🗑️ همه اتوماسیون‌ها حذف شدند ({n} مورد).',
+                reply_to=msg.get('message_id'), permanent=True,
+            )
+            return True
+
+        mdel = re.match(r'^(?:حذف ریپیت|حذف اتو|حذف تکرار)\s+#?([\d۰-۹]+)\s*$', norm)
+        if mdel:
+            if not is_mod:
+                await self.safe_send(chat_id, '⛔ فقط ادمین گروه یا مالک ربات.', reply_to=msg.get('message_id'), permanent=True)
+                return True
+            aid = self._fa_digits_to_int(mdel.group(1))
+            ok = await self.db.delete_auto_message(chat_id, aid)
+            await self.safe_send(
+                chat_id,
+                f'🗑️ ریپیت `#{aid}` حذف شد.' if ok else f'❌ ریپیت `#{aid}` پیدا نشد.',
+                reply_to=msg.get('message_id'), permanent=True,
+            )
+            return True
+
+        # ریپیت متن ۵د   OR   ریپیت ۵د متن
+        m = re.match(
+            r'^(?P<cmd>ریپیت|تکرار|اتو|اتوماسیون)\s+(?P<body>.+?)\s+(?P<num>[\d۰-۹]+)\s*(?P<unit>س|د|ث|ساعت|دقیقه|ثانیه)?\s*$',
+            norm,
+        )
+        if not m:
+            m = re.match(
+                r'^(?P<cmd>ریپیت|تکرار|اتو|اتوماسیون)\s+(?P<num>[\d۰-۹]+)\s*(?P<unit>س|د|ث|ساعت|دقیقه|ثانیه)\s+(?P<body>.+?)\s*$',
+                norm,
+            )
+        if not m:
+            if re.match(r'^(ریپیت|تکرار|اتو|اتوماسیون)\b', norm):
+                if not is_mod:
+                    await self.safe_send(chat_id, '⛔ فقط ادمین گروه یا مالک ربات.', reply_to=msg.get('message_id'), permanent=True)
+                    return True
+                await self.safe_send(
+                    chat_id,
+                    '📝 *فرمت اتوماسیون*\n\n'
+                    '`ریپیت متن پیام ۵د`\n'
+                    '`اتو سلام دوستان ۳س`\n\n'
+                    '• `د` = دقیقه • `س` = ساعت • `ث` = ثانیه\n'
+                    '• حداقل بازه: ۱ دقیقه\n'
+                    '• فقط `ریپیت` → لیست دکمه‌ای برای حذف\n'
+                    '• `توقف ریپیت` → حذف همه',
+                    reply_to=msg.get('message_id'), permanent=True,
+                )
+                return True
+            return False
+
+        if not is_mod:
+            await self.safe_send(
+                chat_id, '⛔ فقط *ادمین گروه* یا *مالک ربات* می‌تواند اتوماسیون بسازد.',
+                reply_to=msg.get('message_id'), permanent=True,
+            )
+            return True
+
+        body = (m.group('body') or '').strip()
+        sec = self._parse_auto_interval(m.group('num'), m.groupdict().get('unit'))
+        if not body:
+            await self.safe_send(chat_id, '❌ متن پیام خالی است.', reply_to=msg.get('message_id'), permanent=True)
+            return True
+        if sec is None:
+            await self.safe_send(chat_id, '❌ عدد/واحد زمان نامعتبر است. مثال: `۵د` یا `۳س`', reply_to=msg.get('message_id'), permanent=True)
+            return True
+        if len(body) > 3500:
+            await self.safe_send(chat_id, '❌ متن خیلی طولانی است.', reply_to=msg.get('message_id'), permanent=True)
+            return True
+
+        try:
+            aid = await self.db.add_auto_message(chat_id, body, sec, uid)
+        except Exception:
+            log.exception('add_auto_message failed chat=%s', chat_id)
+            await self.safe_send(
+                chat_id,
+                '❌ ذخیره در دیتابیس ناموفق بود. اگر تازه دپلوی شده، چند ثانیه بعد دوباره تلاش کن.',
+                reply_to=msg.get('message_id'), permanent=True,
+            )
+            return True
+
+        await self.safe_send(
+            chat_id,
+            f'✅ اتوماسیون `#{aid}` ثبت شد.\n'
+            f'هر *{self._format_interval(sec)}* در این گروه ارسال می‌شود.\n'
+            f'پیام‌ها دائمی هستند.\n'
+            f'مدیریت: دستور `ریپیت` (لیست دکمه‌ای)',
+            reply_to=msg.get('message_id'), permanent=True,
+        )
+        try:
+            await self.safe_send(chat_id, body, parse_mode=None, permanent=True, skip_ad=True)
+            await self.db.touch_auto_message(aid)
+        except Exception:
+            log.debug('first auto send failed', exc_info=True)
+        return True
+
+    async def _handle_auto_callback(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
+        """auto:del:ID:CHAT  |  auto:clear:CHAT"""
+        parts = data.split(':')
+        try:
+            action = parts[1]
+            if action == 'del':
+                auto_id = int(parts[2])
+                target_chat = int(parts[3])
+            elif action == 'clear':
+                target_chat = int(parts[2])
+                auto_id = None
+            else:
+                return
+        except Exception:
+            await self.safe_edit(chat_id, message_id, '❌ داده دکمه نامعتبر.', None)
+            return
+        # Must operate in the same group (or owner DM reviewing — still require mod power on target)
+        if int(chat_id) != int(target_chat) and uid != OWNER_ID:
+            await self.safe_edit(chat_id, message_id, '⛔ این دکمه فقط در همان گروه معتبر است.', None)
+            return
+        if not (uid == OWNER_ID or await self._has_group_mod_power(target_chat, uid)):
+            await self.safe_edit(chat_id, message_id, '⛔ فقط ادمین گروه یا مالک ربات.', None)
+            return
+        if action == 'clear':
+            n = await self.db.clear_auto_messages(target_chat)
+            await self.safe_edit(chat_id, message_id, f'🗑️ همه اتوماسیون‌ها حذف شدند ({n}).', None)
+            return
+        ok = await self.db.delete_auto_message(target_chat, auto_id)
+        if not ok:
+            await self.safe_edit(chat_id, message_id, f'❌ مورد `#{auto_id}` پیدا نشد (شاید قبلاً حذف شده).', None)
+            # refresh list
+            try:
+                await self._show_auto_list_buttons(target_chat, uid, edit_mid=None)
+            except Exception:
+                pass
+            return
+        # Refresh list in place
+        rows = await self.db.list_auto_messages(target_chat)
+        if not rows:
+            await self.safe_edit(
+                chat_id, message_id,
+                f'🗑️ `#{auto_id}` حذف شد.\nℹ️ دیگر اتوماسیونی باقی نمانده.',
+                None,
+            )
+            return
+        text = (
+            f'🗑️ `#{auto_id}` حذف شد.\n'
+            f'📋 باقی‌مانده ({len(rows)}) — روی دکمه بزن تا حذف شود:'
+        )
+        kb_rows = []
+        for r in rows:
+            prev = (r.get('body') or '').replace('\n', ' ').strip()[:28]
+            if len((r.get('body') or '')) > 28:
+                prev += '…'
+            label = f"🗑 #{r['id']} | {self._format_interval(int(r['interval_seconds']))} | {prev}"
+            kb_rows.append([(label, f"auto:del:{int(r['id'])}:{int(target_chat)}")])
+        kb_rows.append([('🛑 توقف همه', f'auto:clear:{int(target_chat)}'), ('✖️ بستن', 'close')])
+        await self.safe_edit(chat_id, message_id, text, inline(kb_rows))
 
     async def _schedule_lock_loop(self) -> None:
         """One global loop: every ~30s evaluate schedules and sync permissions."""
